@@ -1,0 +1,129 @@
+<mxfile host="app.diagrams.net" modified="2026-04-30T00:00:00.000Z" agent="Codex" version="26.0.11">
+  <diagram id="coarse-to-fine-flow" name="粗召回到细比对执行流程图" compressed="false">
+    <mxGraphModel dx="1752" dy="1092" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2200" pageHeight="1700" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="2" value="粗召回 -&gt; 候选现切 -&gt; 细比对 执行流程图&lt;br&gt;&lt;font style=&quot;font-size:12px;color:#666666;&quot;&gt;把“先缩圈，再精看”的服务执行链路说清楚&lt;/font&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=22;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1600" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="10" value="开始" style="ellipse;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="980" y="110" width="140" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="11" value="接收 query_text / subtitle_text" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=15;" vertex="1" parent="1">
+          <mxGeometry x="890" y="210" width="320" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="12" value="查询标准化&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;统一空白、换行、标点噪声&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=15;" vertex="1" parent="1">
+          <mxGeometry x="890" y="320" width="320" height="85" as="geometry" />
+        </mxCell>
+
+        <mxCell id="13" value="抽取全部 query 3-gram" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=15;" vertex="1" parent="1">
+          <mxGeometry x="890" y="445" width="320" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="14" value="按 fts5vocab 查文档频次" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=15;" vertex="1" parent="1">
+          <mxGeometry x="890" y="555" width="320" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="15" value="选最稀有的 seed 3-gram&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;当前默认 seed_term_count=12&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="890" y="665" width="320" height="85" as="geometry" />
+        </mxCell>
+
+        <mxCell id="16" value="并行命中多个 canonical 索引" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=15;" vertex="1" parent="1">
+          <mxGeometry x="890" y="790" width="320" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="17" value="候选缩圈&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;按 seed_hit_count + seed_hit_weight 先拿一批章级候选&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=15;" vertex="1" parent="1">
+          <mxGeometry x="890" y="900" width="320" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="18" value="章级重排&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;coarse_score + 3-gram overlap -&gt; final_score&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=15;" vertex="1" parent="1">
+          <mxGeometry x="890" y="1030" width="320" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="19" value="取 topK 候选章节" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=15;" vertex="1" parent="1">
+          <mxGeometry x="890" y="1160" width="320" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="20" value="读取候选章节正文" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=15;" vertex="1" parent="1">
+          <mxGeometry x="890" y="1270" width="320" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="21" value="候选章节现切&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;切 150-300 字证据窗，保留 offset&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=15;" vertex="1" parent="1">
+          <mxGeometry x="890" y="1380" width="320" height="85" as="geometry" />
+        </mxCell>
+
+        <mxCell id="22" value="query 片段 vs 候选窗细比对" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="890" y="1505" width="320" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="23" value="输出结果&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;书名 / 章节 / 数据集 / 命中证据 / 分数&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="890" y="1615" width="320" height="85" as="geometry" />
+        </mxCell>
+
+        <mxCell id="24" value="结束" style="ellipse;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="980" y="1740" width="140" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="30" value="为什么不直接全量滑窗召回？&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;因为章级缩圈更省资源。证据窗更适合放在细比对阶段，而不是一上来就全库检索。&lt;/font&gt;" style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1300" y="930" width="520" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="31" value="为什么现切而不是全量落表？&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;因为 topK 候选章节通常很少，现切更灵活，也更适合后面切窗参数继续调。&lt;/font&gt;" style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1300" y="1365" width="520" height="100" as="geometry" />
+        </mxCell>
+
+        <mxCell id="32" value="为什么先 exact dedup？&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;完全重复正文会制造伪负样本和重复候选，先折叠成 canonical 可以减少召回噪声。&lt;/font&gt;" style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="280" y="790" width="520" height="100" as="geometry" />
+        </mxCell>
+
+        <mxCell id="100" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="10" target="11">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="101" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="11" target="12">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="102" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="12" target="13">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="103" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="13" target="14">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="104" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="14" target="15">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="105" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="15" target="16">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="106" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="16" target="17">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="107" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="17" target="18">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="108" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="18" target="19">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="109" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="19" target="20">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="110" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="20" target="21">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="111" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="21" target="22">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="112" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="22" target="23">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="113" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="23" target="24">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

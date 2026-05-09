@@ -1,0 +1,171 @@
+<mxfile host="app.diagrams.net" modified="2026-04-30T00:00:00.000Z" agent="Codex" version="26.0.11">
+  <diagram id="global-retrieval-architecture" name="全库统一检索架构图" compressed="false">
+    <mxGraphModel dx="1752" dy="1092" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2200" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="2" value="小说库相似度比对服务&lt;br&gt;&lt;font style=&quot;font-size:12px;color:#666666;&quot;&gt;分数据集建 canonical 索引，查询时全库统一召回，再合并重排&lt;/font&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=22;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1600" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="10" value="数据管理层" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=18;fontStyle=1;align=left;spacingLeft=16;spacingTop=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="120" width="920" height="1040" as="geometry" />
+        </mxCell>
+
+        <mxCell id="11" value="统一检索层" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=18;fontStyle=1;align=left;spacingLeft=16;spacingTop=10;" vertex="1" parent="1">
+          <mxGeometry x="1010" y="120" width="1110" height="1040" as="geometry" />
+        </mxCell>
+
+        <mxCell id="20" value="self_short_novels&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;自有短篇数据集&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=16;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="90" y="190" width="240" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="21" value="online_owned_novels&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;线上自有小说数据集&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=16;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="90" y="330" width="240" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="22" value="manifest / 原始 txt / 元数据&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;分批接收，分批留档，分批排错&lt;/font&gt;" style="shape=cylinder;whiteSpace=wrap;html=1;boundedLbl=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="420" y="210" width="220" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="23" value="正文清洗 / 标准化&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;统一换行、空白、清洗 retrieval 文本&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="420" y="350" width="220" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="24" value="exact dedup&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;按 content_sha256 建重复组，保留 canonical 章节&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="420" y="500" width="220" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="25" value="canonical 映射表&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;chapter_exact_dedup_groups / members&lt;/font&gt;" style="shape=cylinder;whiteSpace=wrap;html=1;boundedLbl=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="730" y="500" width="180" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="26" value="short canonical FTS&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;chapter_fts_v2_canonical&lt;/font&gt;" style="shape=cylinder;whiteSpace=wrap;html=1;boundedLbl=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="120" y="680" width="220" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="27" value="online canonical FTS&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;chapter_fts_online_owned_canonical_v1&lt;/font&gt;" style="shape=cylinder;whiteSpace=wrap;html=1;boundedLbl=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="120" y="830" width="220" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="28" value="标准化正文库&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;chapter_contents / evidence_windows&lt;/font&gt;" style="shape=cylinder;whiteSpace=wrap;html=1;boundedLbl=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="420" y="800" width="220" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="29" value="备注&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;入库和排错按数据集隔离；索引也按数据集分开建，但都只吃 canonical 章节，避免完全重复正文放大召回噪声&lt;/font&gt;" style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="120" y="980" width="790" height="120" as="geometry" />
+        </mxCell>
+
+        <mxCell id="40" value="字幕 / 查询文本" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=16;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1080" y="220" width="220" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="41" value="查询标准化&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;统一空白、清除噪声、抽取 3-gram&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1380" y="220" width="220" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="42" value="并行查询 short canonical FTS" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1380" y="400" width="220" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="43" value="并行查询 online canonical FTS" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1380" y="530" width="220" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="44" value="各自取 topN 候选&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;先在各自索引内缩圈&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1680" y="455" width="190" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="45" value="全库候选合并器&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;合并两个数据集候选，保留来源 dataset_key&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1920" y="455" width="180" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="46" value="统一重排&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;3-gram overlap / 细比对分数 / 规则分数&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1520" y="700" width="220" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="47" value="候选章节现切&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;只对入围章节切 150-300 字证据窗&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1820" y="700" width="220" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="48" value="细比对 / 证据定位&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;输出命中片段、offset、相似分、来源书籍&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1520" y="860" width="220" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="49" value="统一结果输出&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;候选章节 + 数据集来源 + 命中文本证据&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1820" y="860" width="220" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="50" value="核心原则&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;看起来像一套全库检索服务，但底层仍保留“分数据集、分索引、分排错”的工程边界&lt;/font&gt;" style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1110" y="1000" width="930" height="100" as="geometry" />
+        </mxCell>
+
+        <mxCell id="100" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="20" target="22">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="101" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="21" target="22">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="102" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="22" target="23">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="103" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="23" target="24">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="104" value="写入映射" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#9673a6;" edge="1" parent="1" source="24" target="25">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="105" value="canonical only" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#6c8ebf;" edge="1" parent="1" source="24" target="26">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="106" value="canonical only" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#6c8ebf;" edge="1" parent="1" source="24" target="27">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="107" value="正文 / 滑窗" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#82b366;" edge="1" parent="1" source="23" target="28">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="110" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="40" target="41">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="111" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#82b366;" edge="1" parent="1" source="41" target="42">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="112" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#82b366;" edge="1" parent="1" source="41" target="43">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="113" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#6c8ebf;" edge="1" parent="1" source="26" target="42">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="114" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#6c8ebf;" edge="1" parent="1" source="27" target="43">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="115" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#6c8ebf;" edge="1" parent="1" source="42" target="44">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="116" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#6c8ebf;" edge="1" parent="1" source="43" target="44">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="117" value="合并" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="44" target="45">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="118" value="全库统一排序" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#9673a6;" edge="1" parent="1" source="45" target="46">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="119" value="读取正文" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#82b366;" edge="1" parent="1" source="28" target="47">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="120" value="候选章节" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#82b366;" edge="1" parent="1" source="46" target="47">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="121" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#82b366;" edge="1" parent="1" source="47" target="48">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="122" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#b85450;" edge="1" parent="1" source="48" target="49">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

@@ -1,0 +1,166 @@
+<mxfile host="app.diagrams.net" modified="2026-04-30T00:00:00.000Z" agent="Codex" version="26.0.11">
+  <diagram id="global-retrieval-sequence" name="全库统一检索时序图" compressed="false">
+    <mxGraphModel dx="1752" dy="1092" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2200" pageHeight="1600" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="2" value="全库统一检索时序图&lt;br&gt;&lt;font style=&quot;font-size:12px;color:#666666;&quot;&gt;查询时并行命中多个 canonical 索引，最后统一合并重排与证据定位&lt;/font&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=22;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1500" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="10" value="调用方&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;字幕 / 文本查询&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="80" y="110" width="160" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="11" value="查询服务&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;normalize + route&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="350" y="110" width="170" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="12" value="short canonical FTS" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="680" y="110" width="170" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="13" value="online canonical FTS" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="980" y="110" width="180" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="14" value="候选合并器" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1300" y="110" width="160" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="15" value="细比对服务" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1590" y="110" width="160" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="16" value="结果输出" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1870" y="110" width="150" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="20" value="" style="shape=line;strokeColor=#999999;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="160" y="220" width="1" height="1180" as="geometry" />
+        </mxCell>
+        <mxCell id="21" value="" style="shape=line;strokeColor=#999999;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="435" y="220" width="1" height="1180" as="geometry" />
+        </mxCell>
+        <mxCell id="22" value="" style="shape=line;strokeColor=#999999;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="765" y="220" width="1" height="1180" as="geometry" />
+        </mxCell>
+        <mxCell id="23" value="" style="shape=line;strokeColor=#999999;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="1070" y="220" width="1" height="1180" as="geometry" />
+        </mxCell>
+        <mxCell id="24" value="" style="shape=line;strokeColor=#999999;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="1380" y="220" width="1" height="1180" as="geometry" />
+        </mxCell>
+        <mxCell id="25" value="" style="shape=line;strokeColor=#999999;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="1670" y="220" width="1" height="1180" as="geometry" />
+        </mxCell>
+        <mxCell id="26" value="" style="shape=line;strokeColor=#999999;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="1945" y="220" width="1" height="1180" as="geometry" />
+        </mxCell>
+
+        <mxCell id="30" value="1. 提交 query_text / subtitle_text" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="70" y="250" width="250" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="31" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="10" target="11">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="240" y="265" />
+              <mxPoint x="350" y="265" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="32" value="2. 标准化 query，抽取稀有 3-gram" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="320" y="320" width="320" height="30" as="geometry" />
+        </mxCell>
+
+        <mxCell id="33" value="3. 并行查 short canonical 索引" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="420" y="390" width="280" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="34" value="4. 并行查 online canonical 索引" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="420" y="470" width="300" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="35" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#6c8ebf;" edge="1" parent="1" source="11" target="12">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="520" y="405" />
+              <mxPoint x="680" y="405" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="36" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#6c8ebf;" edge="1" parent="1" source="11" target="13">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="520" y="485" />
+              <mxPoint x="980" y="485" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="37" value="5. 各自返回 topN 章级候选" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="820" y="580" width="270" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="38" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#6c8ebf;" edge="1" parent="1" source="12" target="14">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="850" y="600" />
+              <mxPoint x="1300" y="600" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="39" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#6c8ebf;" edge="1" parent="1" source="13" target="14">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1160" y="630" />
+              <mxPoint x="1300" y="630" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="40" value="6. 统一合并，保留 dataset_key / chapter_uid" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="700" width="360" height="30" as="geometry" />
+        </mxCell>
+
+        <mxCell id="41" value="7. 初步重排&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;coarse score + overlap score&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1270" y="760" width="220" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="42" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#666666;" edge="1" parent="1" source="14" target="41">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="43" value="8. 读取候选章节正文" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1450" y="880" width="240" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="44" value="9. 现切 150-300 字证据窗" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1450" y="950" width="250" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="45" value="10. query 片段 vs 候选窗做细比对" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1450" y="1020" width="290" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="46" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#9673a6;" edge="1" parent="1" source="41" target="15">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="47" value="11. 输出候选书/章/证据窗/相似分/来源数据集" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1710" y="1120" width="360" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="48" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#b85450;" edge="1" parent="1" source="15" target="16">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1750" y="1135" />
+              <mxPoint x="1870" y="1135" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="49" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#b85450;" edge="1" parent="1" source="16" target="10">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2020" y="1200" />
+              <mxPoint x="2020" y="1320" />
+              <mxPoint x="160" y="1320" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="50" value="关键点&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#666666;&quot;&gt;虽然底层有多套索引，但调用方只看到一个“全库统一检索服务”。多数据集的复杂度被封装在查询服务内部。&lt;/font&gt;" style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="70" y="1380" width="1950" height="90" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
