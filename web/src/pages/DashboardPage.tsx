@@ -5,6 +5,7 @@ import { getSystemStatus, listResults, listTasks } from "../api";
 import { formatConfidenceLabel, formatDetectionModeLabel, formatReviewLabel, formatRuntimeStateLabel, formatSystemCardLabel, formatSystemHint, formatTaskTypeLabel } from "../displayText";
 import { Icon } from "../icons";
 import { StatusState } from "../StatusState";
+import { formatTaskEta, formatTaskProgressDetail } from "../taskProgress";
 import { buildReviewPath, isHighRiskReviewLabel } from "../workflowLinks";
 
 function toPercent(task: Record<string, any>): number {
@@ -224,7 +225,7 @@ export function DashboardPage() {
                     <td>
                       <div className="progress-inline">
                         <div className="progress-bar"><span style={{ width: `${toPercent(task)}%` }} /></div>
-                        <span>{toPercent(task)}%</span>
+                        <span>{task.status === "running" ? `${formatTaskProgressDetail(task)} · ${formatTaskEta(task)}` : `${toPercent(task)}%`}</span>
                       </div>
                     </td>
                     <td>{task.created_at}</td>

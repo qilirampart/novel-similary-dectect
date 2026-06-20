@@ -1,5 +1,31 @@
 export type DetectionMode = "reuse" | "rewrite";
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+const LONG_REQUEST_TIMEOUT_MS = 60_000;
+const DOWNLOAD_REQUEST_TIMEOUT_MS = 120_000;
+
+function normalizeBasePath(path: string): string {
+  const trimmed = (path || "").trim();
+  if (!trimmed) return "/api";
+  const withLeadingSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return withLeadingSlash.endsWith("/") && withLeadingSlash !== "/"
+    ? withLeadingSlash.slice(0, -1)
+    : withLeadingSlash;
+}
+
+const API_BASE_PATH = normalizeBasePath(import.meta.env.VITE_API_BASE_PATH || "/api");
+
+function resolveApiPath(path: string): string {
+  if (!path) return API_BASE_PATH;
+  if (path.startsWith("/api/")) {
+    return `${API_BASE_PATH}${path.slice(4)}`;
+  }
+  if (path === "/api") {
+    return API_BASE_PATH;
+  }
+  return path;
+}
+
 function parseErrorDetail(errorText: string, fallback: string): string {
   if (!errorText) return fallback;
   try {
@@ -32,10 +58,11 @@ function parseDownloadFilename(contentDisposition: string | null, fallback: stri
 
 type RequestOptions = RequestInit & {
   query?: Record<string, string | number | undefined>;
+  timeoutMs?: number;
 };
 
 async function requestJson<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const url = new URL(path, window.location.origin);
+  const url = new URL(resolveApiPath(path), window.location.origin);
   if (options.query) {
     for (const [key, value] of Object.entries(options.query)) {
       if (value === undefined || value === null || value === "") continue;
@@ -43,13 +70,31 @@ async function requestJson<T>(path: string, options: RequestOptions = {}): Promi
     }
   }
 
-  const response = await fetch(url.toString(), {
-    ...options,
-    headers: {
-      ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
-      ...(options.headers ?? {})
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(
+    () => controller.abort(),
+    Math.max(Number(options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS), 1)
+  );
+
+  let response: Response;
+  try {
+    response = await fetch(url.toString(), {
+      ...options,
+      credentials: "include",
+      signal: controller.signal,
+      headers: {
+        ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
+        ...(options.headers ?? {})
+      }
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("请求超时，请稍后重试");
     }
-  });
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
 
   if (!response.ok) {
     let detail = response.statusText;
@@ -65,6 +110,24 @@ async function requestJson<T>(path: string, options: RequestOptions = {}): Promi
   return (await response.json()) as T;
 }
 
+async function fetchWithTimeout(input: string, init: RequestInit = {}, timeoutMs = DOWNLOAD_REQUEST_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), Math.max(timeoutMs, 1));
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("请求超时，请稍后重试");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
 export type ComparePayload = Record<string, any>;
 export type CompareSingleResponse = {
   request_id: string;
@@ -78,11 +141,19 @@ export type TaskListResponse = {
   offset: number;
 };
 
+export type BulkTaskDeleteResponse = {
+  status: string;
+  affected_count: number;
+  message: string;
+};
+
 export type TaskDetailResponse = {
   task: Record<string, any>;
   items: Record<string, any>[];
   item_limit: number;
   item_offset: number;
+  item_total: number;
+  result_stats: Record<string, number>;
 };
 
 export type TaskCreateResponse = {
@@ -90,6 +161,21 @@ export type TaskCreateResponse = {
   status: string;
   detection_mode: string;
   source_file_name: string;
+};
+
+export type UserProfile = {
+  user_id: number;
+  username: string;
+  display_name: string;
+  role: string;
+  is_active: boolean;
+  created_at?: string | null;
+  updated_at?: string | null;
+  last_login_at?: string | null;
+};
+
+export type UserProfileResponse = {
+  user: UserProfile;
 };
 
 export type BasicTaskResponse = {
@@ -104,6 +190,14 @@ export type ResultListResponse = {
   items: Record<string, any>[];
   limit: number;
   offset: number;
+  total?: number | null;
+  stats?: Record<string, number> | null;
+};
+
+export type BulkActionResponse = {
+  status: string;
+  affected_count: number;
+  message: string;
 };
 
 export type SystemStatusResponse = {
@@ -125,6 +219,7 @@ export function compareSingle(params: {
 }): Promise<CompareSingleResponse> {
   return requestJson<CompareSingleResponse>("/api/v1/compare/single", {
     method: "POST",
+    timeoutMs: LONG_REQUEST_TIMEOUT_MS,
     body: JSON.stringify({
       query_text: params.queryText,
       detection_mode: params.detectionMode,
@@ -142,8 +237,6 @@ export function createCompareTask(params: {
   topK?: number;
   compareTopK?: number;
   mergedTopK?: number;
-  candidateDisplayScoreThreshold?: number;
-  createdBy?: string;
 }): Promise<TaskCreateResponse> {
   const formData = new FormData();
   formData.append("file", params.file);
@@ -151,13 +244,10 @@ export function createCompareTask(params: {
   if (params.topK !== undefined) formData.append("top_k", String(params.topK));
   if (params.compareTopK !== undefined) formData.append("compare_top_k", String(params.compareTopK));
   if (params.mergedTopK !== undefined) formData.append("merged_top_k", String(params.mergedTopK));
-  if (params.candidateDisplayScoreThreshold !== undefined) {
-    formData.append("candidate_display_score_threshold", String(params.candidateDisplayScoreThreshold));
-  }
-  if (params.createdBy) formData.append("created_by", params.createdBy);
 
   return requestJson<TaskCreateResponse>("/api/v1/tasks", {
     method: "POST",
+    timeoutMs: LONG_REQUEST_TIMEOUT_MS,
     body: formData
   });
 }
@@ -180,6 +270,24 @@ export function cancelTask(taskId: string): Promise<BasicTaskResponse> {
   });
 }
 
+export function pauseTask(taskId: string): Promise<BasicTaskResponse> {
+  return requestJson<BasicTaskResponse>(`/api/v1/tasks/${encodeURIComponent(taskId)}/pause`, {
+    method: "POST"
+  });
+}
+
+export function resumeTask(taskId: string): Promise<BasicTaskResponse> {
+  return requestJson<BasicTaskResponse>(`/api/v1/tasks/${encodeURIComponent(taskId)}/resume`, {
+    method: "POST"
+  });
+}
+
+export function deleteTask(taskId: string): Promise<BasicTaskResponse> {
+  return requestJson<BasicTaskResponse>(`/api/v1/tasks/${encodeURIComponent(taskId)}`, {
+    method: "DELETE"
+  });
+}
+
 export function retryTask(taskId: string): Promise<TaskCreateResponse> {
   return requestJson<TaskCreateResponse>(`/api/v1/tasks/${encodeURIComponent(taskId)}/retry`, {
     method: "POST"
@@ -193,6 +301,10 @@ export function listResults(params: {
   status?: string;
   reviewStatus?: string;
   sortBy?: string;
+  dedupeLatest?: boolean;
+  q?: string;
+  excludeCleared?: boolean;
+  candidateScoreThreshold?: number;
 } = {}): Promise<ResultListResponse> {
   return requestJson<ResultListResponse>("/api/v1/results", {
     query: {
@@ -201,7 +313,11 @@ export function listResults(params: {
       task_id: params.taskId,
       status: params.status,
       review_status: params.reviewStatus,
-      sort_by: params.sortBy
+      sort_by: params.sortBy,
+      dedupe_latest: params.dedupeLatest ? "true" : undefined,
+      q: params.q,
+      exclude_cleared: params.excludeCleared ? "true" : undefined,
+      candidate_score_threshold: params.candidateScoreThreshold
     }
   });
 }
@@ -212,29 +328,144 @@ export function getResultDetail(resultId: number): Promise<TaskResultResponse> {
 
 export function saveReview(resultId: number, params: {
   reviewStatus: string;
-  reviewerName?: string;
   reviewNote?: string;
 }): Promise<TaskResultResponse> {
   return requestJson<TaskResultResponse>(`/api/v1/results/${resultId}/review`, {
     method: "POST",
     body: JSON.stringify({
       review_status: params.reviewStatus,
-      reviewer_name: params.reviewerName ?? "",
       review_note: params.reviewNote ?? ""
     })
   });
 }
 
+export function clearPendingReviewResults(): Promise<BulkActionResponse> {
+  return requestJson<BulkActionResponse>("/api/v1/results/clear-pending", {
+    method: "POST"
+  });
+}
+
+export function reviewExportUrl(params: {
+  taskId?: string;
+  status?: string;
+  reviewStatus?: string;
+  sortBy?: string;
+  dedupeLatest?: boolean;
+  q?: string;
+  candidateScoreThreshold?: number;
+} = {}): string {
+  const url = new URL(resolveApiPath("/api/v1/results/exports/review-xlsx"), window.location.origin);
+  if (params.taskId) url.searchParams.set("task_id", params.taskId);
+  if (params.status) url.searchParams.set("status", params.status);
+  if (params.reviewStatus) url.searchParams.set("review_status", params.reviewStatus);
+  if (params.sortBy) url.searchParams.set("sort_by", params.sortBy);
+  if (params.dedupeLatest) url.searchParams.set("dedupe_latest", "true");
+  if (params.q) url.searchParams.set("q", params.q);
+  if (params.candidateScoreThreshold !== undefined) {
+    url.searchParams.set("candidate_score_threshold", String(params.candidateScoreThreshold));
+  }
+  return url.toString();
+}
+
+export async function downloadReviewExport(params: {
+  taskId?: string;
+  status?: string;
+  reviewStatus?: string;
+  sortBy?: string;
+  dedupeLatest?: boolean;
+  q?: string;
+  candidateScoreThreshold?: number;
+} = {}): Promise<string> {
+  const response = await fetchWithTimeout(reviewExportUrl(params), {
+    credentials: "include"
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(parseErrorDetail(errorText, response.statusText || `Request failed: ${response.status}`));
+  }
+
+  const fileName = parseDownloadFilename(
+    response.headers.get("content-disposition"),
+    "复核结果导出.xlsx"
+  );
+  const blob = await response.blob();
+  const blobUrl = window.URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = blobUrl;
+  anchor.download = fileName;
+  anchor.rel = "noopener";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => window.URL.revokeObjectURL(blobUrl), 1000);
+  return fileName;
+}
+
+export async function deleteTasks(taskIds: string[]): Promise<BulkTaskDeleteResponse> {
+  const normalizedTaskIds = Array.from(
+    new Set(taskIds.map((taskId) => String(taskId || "").trim()).filter(Boolean))
+  );
+  const settled = await Promise.allSettled(
+    normalizedTaskIds.map(async (taskId) => {
+      await deleteTask(taskId);
+      return taskId;
+    })
+  );
+
+  const affectedCount = settled.filter((item) => item.status === "fulfilled").length;
+  const failedCount = settled.length - affectedCount;
+
+  if (affectedCount <= 0 && failedCount > 0) {
+    const firstFailure = settled.find((item) => item.status === "rejected");
+    const reason = firstFailure && firstFailure.status === "rejected" ? firstFailure.reason : null;
+    throw reason instanceof Error ? reason : new Error("删除任务失败");
+  }
+
+  return {
+    status: "ok",
+    affected_count: affectedCount,
+    message:
+      failedCount > 0
+        ? `deleted ${affectedCount} tasks, ${failedCount} failed`
+        : `deleted ${affectedCount} tasks`
+  };
+}
+
+export function login(username: string, password: string): Promise<UserProfileResponse> {
+  return requestJson<UserProfileResponse>("/api/v1/auth/login", {
+    method: "POST",
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+    body: JSON.stringify({ username, password })
+  });
+}
+
+export function logout(): Promise<{ status: string }> {
+  return requestJson<{ status: string }>("/api/v1/auth/logout", {
+    method: "POST",
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+  });
+}
+
+export function getCurrentUser(): Promise<UserProfileResponse> {
+  return requestJson<UserProfileResponse>("/api/v1/auth/me", {
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+  });
+}
+
 export function getSystemStatus(): Promise<SystemStatusResponse> {
-  return requestJson<SystemStatusResponse>("/api/v1/system/status");
+  return requestJson<SystemStatusResponse>("/api/v1/system/status", {
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+  });
 }
 
 export function exportTaskUrl(taskId: string, kind: "summary" | "review" | "json"): string {
-  return `/api/v1/tasks/${encodeURIComponent(taskId)}/exports/${kind}`;
+  return resolveApiPath(`/api/v1/tasks/${encodeURIComponent(taskId)}/exports/${kind}`);
 }
 
 export async function downloadTaskExport(taskId: string, kind: "summary" | "review" | "json"): Promise<string> {
-  const response = await fetch(exportTaskUrl(taskId, kind));
+  const response = await fetchWithTimeout(exportTaskUrl(taskId, kind), {
+    credentials: "include"
+  });
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(parseErrorDetail(errorText, response.statusText || `Request failed: ${response.status}`));

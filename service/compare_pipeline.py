@@ -15,6 +15,15 @@ from service.semantic_retrieval import (
 )
 
 
+SEMANTIC_DISABLED_BACKENDS = {"", "0", "false", "off", "none", "disabled"}
+
+
+def _semantic_backend_enabled(config: SemanticRetrievalConfig | None) -> bool:
+    if config is None:
+        return False
+    return str(config.backend or "").strip().lower() not in SEMANTIC_DISABLED_BACKENDS
+
+
 @dataclass(frozen=True)
 class ComparePipelineRequest:
     db_path: str
@@ -168,7 +177,13 @@ def run_compare_pipeline(request: ComparePipelineRequest) -> dict[str, Any]:
     semantic_recall_message = "Semantic recall is currently disabled."
     semantic_recall_runtime_enabled = False
 
-    if preset.semantic_recall_enabled and not request.disable_semantic_recall and request.semantic_config is not None:
+    if preset.semantic_recall_enabled and request.disable_semantic_recall:
+        semantic_recall_status = "disabled"
+        semantic_recall_message = "Semantic recall is disabled by the current request."
+    elif preset.semantic_recall_enabled and not _semantic_backend_enabled(request.semantic_config):
+        semantic_recall_status = "disabled"
+        semantic_recall_message = "Semantic recall is disabled by runtime configuration."
+    elif preset.semantic_recall_enabled and request.semantic_config is not None:
         try:
             semantic_payload = semantic_retrieve_candidates(
                 db_path=request.db_path,

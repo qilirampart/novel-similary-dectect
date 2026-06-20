@@ -1,8 +1,22 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
-import { getResultDetail, listResults, saveReview } from "../api";
-import { formatConfidenceLabel, formatMetricLabel, formatReviewLabel, formatSemanticStatusLabel, formatTaskStatusLabel } from "../displayText";
+import {
+  clearPendingReviewResults,
+  downloadReviewExport,
+  getResultDetail,
+  listResults,
+  listTasks,
+  saveReview
+} from "../api";
+import {
+  formatConfidenceLabel,
+  formatMetricLabel,
+  formatReviewLabel,
+  formatSemanticStatusLabel,
+  formatTaskStatusLabel
+} from "../displayText";
+import { buildEvidenceHighlightRanges, renderHighlightedEvidence } from "../evidenceHighlight";
 import { Icon } from "../icons";
 import { PaginationBar } from "../PaginationBar";
 import { StatusState } from "../StatusState";
@@ -10,25 +24,36 @@ import { buildReviewSearchParams, parseReviewQueryState } from "../workflowLinks
 
 const DEFAULT_REVIEW_STATUS = "pending";
 const REVIEW_PAGE_SIZE = 8;
+const REVIEW_RESULT_SORT_BY = "score_desc";
+const DEFAULT_CANDIDATE_DISPLAY_SCORE_THRESHOLD = 0.01;
+const REVIEW_THRESHOLD_STORAGE_KEY = "novel-compare-review-threshold";
+
 const REVIEW_STATUS_OPTIONS = [
   { value: "pending", label: "待复核" },
   { value: "confirmed_high_risk", label: "确认高风险" },
-  { value: "needs_followup", label: "需要继续跟进" },
+  { value: "needs_followup", label: "继续跟进" },
   { value: "false_positive", label: "误报" }
 ] as const;
 
-function buildFilterKey(filters: {
-  taskFilter?: string;
-  resultStatusFilter?: string;
-  reviewStatusFilter?: string;
-  textFilter?: string;
-}) {
-  return [
-    filters.taskFilter ?? "",
-    filters.resultStatusFilter ?? "",
-    filters.reviewStatusFilter ?? "",
-    filters.textFilter ?? ""
-  ].join("\u0001");
+function clipText(value: unknown, limit = 24): string {
+  const text = String(value ?? "").trim();
+  if (!text) return "-";
+  return text.length <= limit ? text : `${text.slice(0, limit).trim()}...`;
+}
+
+function formatEpisodeLabel(value: unknown): string {
+  const text = String(value ?? "").trim();
+  if (!text) return "-";
+  if (text.startsWith("第") && text.endsWith("集")) return text;
+  return `第${text}集`;
+}
+
+function formatDuration(value: unknown): string {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return "-";
+  if (numeric < 1) return `${numeric.toFixed(2)}s`;
+  if (numeric < 10) return `${numeric.toFixed(1)}s`;
+  return `${numeric.toFixed(0)}s`;
 }
 
 function metricPercent(value: unknown): number {
@@ -56,9 +81,49 @@ function formatReviewStatus(value: string): string {
     .replace(/\b\w/g, (char: string) => char.toUpperCase());
 }
 
+function clampThreshold(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_CANDIDATE_DISPLAY_SCORE_THRESHOLD;
+  return Math.max(0, Math.min(1, value));
+}
+
+function readStoredThreshold(): number {
+  if (typeof window === "undefined") return DEFAULT_CANDIDATE_DISPLAY_SCORE_THRESHOLD;
+  const raw = window.localStorage.getItem(REVIEW_THRESHOLD_STORAGE_KEY);
+  const numeric = Number(raw);
+  return clampThreshold(numeric);
+}
+
+function parseThresholdText(value: string): number {
+  const text = String(value ?? "").trim();
+  if (!text) return readStoredThreshold();
+  return clampThreshold(Number(text));
+}
+
+function buildFilterKey(filters: {
+  taskFilter?: string;
+  resultStatusFilter?: string;
+  reviewStatusFilter?: string;
+  textFilter?: string;
+  dedupeLatest?: boolean;
+  displayThreshold?: number;
+}) {
+  return [
+    filters.taskFilter ?? "",
+    filters.resultStatusFilter ?? "",
+    filters.reviewStatusFilter ?? "",
+    filters.textFilter ?? "",
+    filters.dedupeLatest ? "1" : "0",
+    String(filters.displayThreshold ?? DEFAULT_CANDIDATE_DISPLAY_SCORE_THRESHOLD)
+  ].join("\u0001");
+}
+
 export function ReviewPage() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const [tasks, setTasks] = useState<Record<string, any>[]>([]);
+  const [tasksLoading, setTasksLoading] = useState(true);
   const [results, setResults] = useState<Record<string, any>[]>([]);
+  const [resultStats, setResultStats] = useState<Record<string, number>>({});
+  const [resultTotal, setResultTotal] = useState(0);
   const [selectedResultId, setSelectedResultId] = useState<number | null>(null);
   const [detail, setDetail] = useState<Record<string, any> | null>(null);
   const [isEvidenceModalOpen, setIsEvidenceModalOpen] = useState(false);
@@ -68,14 +133,57 @@ export function ReviewPage() {
   const [resultStatusFilter, setResultStatusFilter] = useState("");
   const [reviewStatusFilter, setReviewStatusFilter] = useState("");
   const [textFilter, setTextFilter] = useState("");
+  const [dedupeLatest, setDedupeLatest] = useState(true);
+  const [displayThreshold, setDisplayThreshold] = useState<number>(() => readStoredThreshold());
   const [resultPage, setResultPage] = useState(1);
   const [resultsLoading, setResultsLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
+  const [isClearingPending, setIsClearingPending] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const [syncedQueueHeight, setSyncedQueueHeight] = useState<number | null>(null);
   const [error, setError] = useState("");
   const hasSelection = selectedResultId !== null;
   const detailRequestRef = useRef(0);
   const appliedFilterKeyRef = useRef<string | null>(null);
+  const detailInFlightKeyRef = useRef<string | null>(null);
+  const detailInFlightPromiseRef = useRef<Promise<void> | null>(null);
+  const resultsInFlightKeyRef = useRef<string | null>(null);
+  const resultsInFlightPromiseRef = useRef<Promise<void> | null>(null);
+  const skipInitialPageLoadRef = useRef(true);
+  const reviewDetailRef = useRef<HTMLElement | null>(null);
+
+  async function loadTaskOptions() {
+    setTasksLoading(true);
+    try {
+      const response = await listTasks(100, 0);
+      setTasks(response.items);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "加载任务列表失败");
+    } finally {
+      setTasksLoading(false);
+    }
+  }
+
+  function getAppliedFilters(
+    overrides?: {
+      taskFilter?: string;
+      resultStatusFilter?: string;
+      reviewStatusFilter?: string;
+      textFilter?: string;
+      dedupeLatest?: boolean;
+      displayThreshold?: number;
+    }
+  ) {
+    return {
+      taskFilter: overrides?.taskFilter ?? taskFilter,
+      resultStatusFilter: overrides?.resultStatusFilter ?? resultStatusFilter,
+      reviewStatusFilter: overrides?.reviewStatusFilter ?? reviewStatusFilter,
+      textFilter: overrides?.textFilter ?? textFilter,
+      dedupeLatest: overrides?.dedupeLatest ?? dedupeLatest,
+      displayThreshold: overrides?.displayThreshold ?? displayThreshold
+    };
+  }
 
   function buildSearchParams(
     overrides?: {
@@ -84,6 +192,8 @@ export function ReviewPage() {
       reviewStatusFilter?: string;
       textFilter?: string;
       selectedResultId?: number | null;
+      dedupeLatest?: boolean;
+      displayThreshold?: number;
     }
   ) {
     const next = getAppliedFilters(overrides);
@@ -93,92 +203,9 @@ export function ReviewPage() {
       status: next.resultStatusFilter,
       reviewStatus: next.reviewStatusFilter,
       q: next.textFilter,
-      resultId: nextResultId
+      resultId: nextResultId,
+      threshold: next.displayThreshold.toFixed(2)
     });
-  }
-
-  function getAppliedFilters(
-    overrides?: {
-      taskFilter?: string;
-      resultStatusFilter?: string;
-      reviewStatusFilter?: string;
-      textFilter?: string;
-    }
-  ) {
-    return {
-      taskFilter: overrides?.taskFilter ?? taskFilter,
-      resultStatusFilter: overrides?.resultStatusFilter ?? resultStatusFilter,
-      reviewStatusFilter: overrides?.reviewStatusFilter ?? reviewStatusFilter,
-      textFilter: overrides?.textFilter ?? textFilter
-    };
-  }
-
-  async function loadResults(
-    targetResultId?: number,
-    overrides?: {
-      taskFilter?: string;
-      resultStatusFilter?: string;
-      reviewStatusFilter?: string;
-      textFilter?: string;
-    }
-  ) {
-    setResultsLoading(true);
-    setError("");
-    try {
-      const { taskFilter: nextTaskFilter, resultStatusFilter: nextResultStatusFilter, reviewStatusFilter: nextReviewStatusFilter, textFilter: nextTextFilter } = getAppliedFilters(overrides);
-      const response = await listResults({
-        limit: 100,
-        offset: 0,
-        taskId: nextTaskFilter.trim() || undefined,
-        status: nextResultStatusFilter || undefined,
-        reviewStatus: nextReviewStatusFilter || undefined,
-        sortBy: "updated_at_desc"
-      });
-      const filteredItems = response.items.filter((item) => {
-        const keyword = nextTextFilter.trim().toLowerCase();
-        if (!keyword) return true;
-
-        return [
-          item.query_text_preview,
-          item.top1_book_name,
-          item.top1_chapter_name,
-          item.task_id,
-          item.top1_review_label
-        ]
-          .map((value) => String(value ?? "").toLowerCase())
-          .some((value) => value.includes(keyword));
-      });
-      const retainedSelectedId =
-        selectedResultId && filteredItems.some((item) => Number(item.result_id) === selectedResultId)
-          ? selectedResultId
-          : undefined;
-      const nextId = targetResultId ?? retainedSelectedId ?? (filteredItems[0]?.result_id as number | undefined);
-      const nextPageCount = Math.max(Math.ceil(filteredItems.length / REVIEW_PAGE_SIZE), 1);
-      const nextSelectedIndex =
-        nextId === undefined ? -1 : filteredItems.findIndex((item) => Number(item.result_id) === Number(nextId));
-
-      setResults(filteredItems);
-      setResultPage((current) => {
-        if (nextSelectedIndex >= 0) {
-          return Math.floor(nextSelectedIndex / REVIEW_PAGE_SIZE) + 1;
-        }
-        return Math.min(current, nextPageCount);
-      });
-      if (!nextId) {
-        setSelectedResultId(null);
-        setDetail(null);
-        setDetailLoading(false);
-        setReviewStatus(DEFAULT_REVIEW_STATUS);
-        setReviewNote("");
-        return;
-      }
-
-      await loadDetail(nextId);
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "加载复核结果失败");
-    } finally {
-      setResultsLoading(false);
-    }
   }
 
   async function loadDetail(resultId: number) {
@@ -205,37 +232,190 @@ export function ReviewPage() {
     }
   }
 
-  useEffect(() => {
-    const nextQueryState = parseReviewQueryState(searchParams);
-    const nextTaskFilter = nextQueryState.taskId;
-    const nextResultStatusFilter = nextQueryState.status;
-    const nextReviewStatusFilter = nextQueryState.reviewStatus;
-    const nextTextFilter = nextQueryState.q;
-    const nextResultId = nextQueryState.resultId;
-    const nextFilters = {
+  async function loadResults(
+    targetResultId?: number,
+    overrides?: {
+      taskFilter?: string;
+      resultStatusFilter?: string;
+      reviewStatusFilter?: string;
+      textFilter?: string;
+      dedupeLatest?: boolean;
+      displayThreshold?: number;
+    },
+    pageOverride?: number
+  ) {
+    setResultsLoading(true);
+    setError("");
+    try {
+      const {
+        taskFilter: nextTaskFilter,
+        resultStatusFilter: nextResultStatusFilter,
+        reviewStatusFilter: nextReviewStatusFilter,
+        textFilter: nextTextFilter,
+        dedupeLatest: nextDedupeLatest,
+        displayThreshold: nextDisplayThreshold
+      } = getAppliedFilters(overrides);
+      const requestedPage = Math.max(pageOverride ?? resultPage, 1);
+      const response = await listResults({
+        limit: REVIEW_PAGE_SIZE,
+        offset: (requestedPage - 1) * REVIEW_PAGE_SIZE,
+        taskId: nextTaskFilter.trim() || undefined,
+        status: nextResultStatusFilter || undefined,
+        reviewStatus: nextReviewStatusFilter || undefined,
+        sortBy: REVIEW_RESULT_SORT_BY,
+        dedupeLatest: nextDedupeLatest,
+        q: nextTextFilter.trim() || undefined,
+        excludeCleared: true,
+        candidateScoreThreshold: nextDisplayThreshold
+      });
+
+      const nextItems = Array.isArray(response.items) ? response.items : [];
+      const nextTotal = Math.max(Number(response.total ?? nextItems.length ?? 0), 0);
+      const nextPageCount = Math.max(Math.ceil(nextTotal / REVIEW_PAGE_SIZE), 1);
+      const normalizedPage = Math.min(requestedPage, nextPageCount);
+
+      if (normalizedPage !== requestedPage) {
+        await requestResults(undefined, overrides, normalizedPage);
+        return;
+      }
+
+      const retainedSelectedId =
+        selectedResultId && nextItems.some((item) => Number(item.result_id) === selectedResultId)
+          ? selectedResultId
+          : undefined;
+      const nextId = targetResultId && nextItems.some((item) => Number(item.result_id) === targetResultId)
+        ? targetResultId
+        : retainedSelectedId ?? (nextItems[0]?.result_id as number | undefined);
+
+      setResults(nextItems);
+      setResultTotal(nextTotal);
+      setResultStats(response.stats ?? {});
+      setResultPage(normalizedPage);
+
+      if (!nextId) {
+        setSelectedResultId(null);
+        setDetail(null);
+        setDetailLoading(false);
+        setReviewStatus(DEFAULT_REVIEW_STATUS);
+        setReviewNote("");
+        return;
+      }
+
+      void requestDetail(nextId);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "加载复核结果失败");
+    } finally {
+      setResultsLoading(false);
+    }
+  }
+
+  async function requestDetail(resultId: number) {
+    const requestKey = String(resultId);
+    if (detailInFlightKeyRef.current === requestKey && detailInFlightPromiseRef.current) {
+      await detailInFlightPromiseRef.current;
+      return;
+    }
+    const task = loadDetail(resultId);
+    detailInFlightKeyRef.current = requestKey;
+    detailInFlightPromiseRef.current = task;
+    try {
+      await task;
+    } finally {
+      if (detailInFlightPromiseRef.current === task) {
+        detailInFlightKeyRef.current = null;
+        detailInFlightPromiseRef.current = null;
+      }
+    }
+  }
+
+  async function requestResults(
+    targetResultId?: number,
+    overrides?: {
+      taskFilter?: string;
+      resultStatusFilter?: string;
+      reviewStatusFilter?: string;
+      textFilter?: string;
+      dedupeLatest?: boolean;
+      displayThreshold?: number;
+    },
+    pageOverride?: number
+  ) {
+    const {
       taskFilter: nextTaskFilter,
       resultStatusFilter: nextResultStatusFilter,
       reviewStatusFilter: nextReviewStatusFilter,
-      textFilter: nextTextFilter
+      textFilter: nextTextFilter,
+      dedupeLatest: nextDedupeLatest,
+      displayThreshold: nextDisplayThreshold
+    } = getAppliedFilters(overrides);
+    const requestedPage = Math.max(pageOverride ?? resultPage, 1);
+    const requestKey = JSON.stringify({
+      taskFilter: nextTaskFilter.trim(),
+      resultStatusFilter: nextResultStatusFilter,
+      reviewStatusFilter: nextReviewStatusFilter,
+      textFilter: nextTextFilter.trim(),
+      dedupeLatest: nextDedupeLatest,
+      displayThreshold: nextDisplayThreshold,
+      requestedPage,
+      targetResultId: targetResultId ?? null
+    });
+    if (resultsInFlightKeyRef.current === requestKey && resultsInFlightPromiseRef.current) {
+      await resultsInFlightPromiseRef.current;
+      return;
+    }
+    const task = loadResults(targetResultId, overrides, pageOverride);
+    resultsInFlightKeyRef.current = requestKey;
+    resultsInFlightPromiseRef.current = task;
+    try {
+      await task;
+    } finally {
+      if (resultsInFlightPromiseRef.current === task) {
+        resultsInFlightKeyRef.current = null;
+        resultsInFlightPromiseRef.current = null;
+      }
+    }
+  }
+
+  useEffect(() => {
+    void loadTaskOptions();
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(REVIEW_THRESHOLD_STORAGE_KEY, displayThreshold.toFixed(2));
+  }, [displayThreshold]);
+
+  useEffect(() => {
+    const nextQueryState = parseReviewQueryState(searchParams);
+    const nextDisplayThreshold = parseThresholdText(nextQueryState.threshold);
+    const nextTaskFilter = nextQueryState.taskId || nextQueryState.taskIds[0] || "";
+    const nextFilters = {
+      taskFilter: nextTaskFilter,
+      resultStatusFilter: nextQueryState.status,
+      reviewStatusFilter: nextQueryState.reviewStatus,
+      textFilter: nextQueryState.q,
+      dedupeLatest,
+      displayThreshold: nextDisplayThreshold
     };
     const nextFilterKey = buildFilterKey(nextFilters);
     const filtersChanged = appliedFilterKeyRef.current !== nextFilterKey;
     appliedFilterKeyRef.current = nextFilterKey;
 
     setTaskFilter(nextTaskFilter);
-    setResultStatusFilter(nextResultStatusFilter);
-    setReviewStatusFilter(nextReviewStatusFilter);
-    setTextFilter(nextTextFilter);
+    setResultStatusFilter(nextQueryState.status);
+    setReviewStatusFilter(nextQueryState.reviewStatus);
+    setTextFilter(nextQueryState.q);
+    setDisplayThreshold(nextDisplayThreshold);
 
     if (filtersChanged || results.length === 0) {
-      void loadResults(nextResultId ?? undefined, nextFilters);
+      void requestResults(nextQueryState.resultId ?? undefined, nextFilters);
       return;
     }
 
-    if (nextResultId) {
-      if (nextResultId !== selectedResultId) {
+    if (nextQueryState.resultId) {
+      if (nextQueryState.resultId !== selectedResultId) {
         setError("");
-        void loadDetail(nextResultId);
+        void requestDetail(nextQueryState.resultId);
       }
       return;
     }
@@ -252,13 +432,75 @@ export function ReviewPage() {
 
     if (selectedResultId !== Number(fallbackId)) {
       setError("");
-      void loadDetail(Number(fallbackId));
+      void requestDetail(Number(fallbackId));
     }
-  }, [searchParams]);
+  }, [searchParams, dedupeLatest]);
+
+  useEffect(() => {
+    if (skipInitialPageLoadRef.current) {
+      skipInitialPageLoadRef.current = false;
+      return;
+    }
+    void requestResults(undefined, undefined, resultPage);
+  }, [resultPage]);
 
   useEffect(() => {
     setIsEvidenceModalOpen(false);
   }, [selectedResultId]);
+
+  useLayoutEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const detailElement = reviewDetailRef.current;
+    if (!detailElement) return;
+
+    let frameId = 0;
+
+    const syncQueueHeight = () => {
+      frameId = 0;
+
+      if (window.innerWidth <= 900 || !hasSelection || detailLoading) {
+        setSyncedQueueHeight(null);
+        return;
+      }
+
+      const nextHeight = Math.ceil(detailElement.getBoundingClientRect().height);
+      if (nextHeight <= 0) return;
+      setSyncedQueueHeight((currentHeight) => (currentHeight === nextHeight ? currentHeight : nextHeight));
+    };
+
+    const requestSync = () => {
+      if (frameId) {
+        cancelAnimationFrame(frameId);
+      }
+      frameId = requestAnimationFrame(syncQueueHeight);
+    };
+
+    requestSync();
+
+    const resizeObserver = new ResizeObserver(() => {
+      requestSync();
+    });
+    resizeObserver.observe(detailElement);
+
+    window.addEventListener("resize", requestSync);
+
+    return () => {
+      if (frameId) {
+        cancelAnimationFrame(frameId);
+      }
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", requestSync);
+    };
+  }, [hasSelection, detailLoading, detail, results.length, resultPage]);
+
+  const reviewQueueStyle = useMemo(() => {
+    if (!syncedQueueHeight) return undefined;
+    return {
+      minHeight: `${syncedQueueHeight}px`,
+      maxHeight: `${syncedQueueHeight}px`
+    };
+  }, [syncedQueueHeight]);
 
   async function handleSelectResult(resultId: number) {
     if (selectedResultId === resultId) return;
@@ -275,7 +517,6 @@ export function ReviewPage() {
     try {
       const response = await saveReview(selectedResultId, {
         reviewStatus: nextStatus,
-        reviewerName: "web-ui",
         reviewNote
       });
       const nextResult = response.result;
@@ -300,7 +541,86 @@ export function ReviewPage() {
     }
   }
 
-  const fineResults = Array.isArray(detail?.result_payload?.fine?.results) ? (detail.result_payload.fine.results as Record<string, any>[]) : [];
+  async function handleApplyFilters() {
+    setResultPage(1);
+    const nextParams = buildSearchParams({ selectedResultId: null });
+    setSearchParams(nextParams, { replace: false });
+  }
+
+  async function handleClearFilters() {
+    setTaskFilter("");
+    setResultStatusFilter("");
+    setReviewStatusFilter("");
+    setTextFilter("");
+    setDisplayThreshold(DEFAULT_CANDIDATE_DISPLAY_SCORE_THRESHOLD);
+    setResultPage(1);
+    const nextParams = buildReviewSearchParams({
+      threshold: DEFAULT_CANDIDATE_DISPLAY_SCORE_THRESHOLD.toFixed(2)
+    });
+    setSearchParams(nextParams, { replace: false });
+  }
+
+  function handleToggleDedupe() {
+    setResultPage(1);
+    setDedupeLatest((current) => !current);
+  }
+
+  function handleTaskFilterChange(taskId: string) {
+    const normalizedTaskId = String(taskId || "").trim();
+    setResultPage(1);
+    const nextParams = buildSearchParams({
+      taskFilter: normalizedTaskId,
+      selectedResultId: null
+    });
+    setSearchParams(nextParams, { replace: false });
+  }
+
+  async function handleClearPendingQueue() {
+    const confirmed = window.confirm("确认清空当前账号下全部待复核结果吗？已确认、继续跟进、误报结果不会被清除。");
+    if (!confirmed) return;
+
+    setIsClearingPending(true);
+    setError("");
+    try {
+      await clearPendingReviewResults();
+      setSelectedResultId(null);
+      setDetail(null);
+      setReviewStatus(DEFAULT_REVIEW_STATUS);
+      setReviewNote("");
+      setResultPage(1);
+      const nextParams = buildSearchParams({ selectedResultId: null });
+      setSearchParams(nextParams, { replace: false });
+      await requestResults(undefined, undefined, 1);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "清空待复核结果失败");
+    } finally {
+      setIsClearingPending(false);
+    }
+  }
+
+  async function handleExportReviewedResults() {
+    setIsExporting(true);
+    setError("");
+    try {
+      await downloadReviewExport({
+        taskId: taskFilter.trim() || undefined,
+        status: resultStatusFilter || undefined,
+        reviewStatus: reviewStatusFilter || undefined,
+        sortBy: REVIEW_RESULT_SORT_BY,
+        dedupeLatest,
+        q: textFilter.trim() || undefined,
+        candidateScoreThreshold: displayThreshold
+      });
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "导出复核结果失败");
+    } finally {
+      setIsExporting(false);
+    }
+  }
+
+  const fineResults = Array.isArray(detail?.result_payload?.fine?.results)
+    ? (detail.result_payload.fine.results as Record<string, any>[])
+    : [];
   const topFine = fineResults[0] ?? null;
   const bestMatch = topFine?.best_match as Record<string, any> | undefined;
   const metrics = bestMatch
@@ -325,7 +645,10 @@ export function ReviewPage() {
     const currentValue = String(detail?.review?.review_status ?? reviewStatus ?? "").trim();
     if (currentValue) dynamicValues.add(currentValue);
 
-    const options: Array<{ value: string; label: string }> = REVIEW_STATUS_OPTIONS.map((item) => ({ value: item.value, label: item.label }));
+    const options: Array<{ value: string; label: string }> = REVIEW_STATUS_OPTIONS.map((item) => ({
+      value: item.value,
+      label: item.label
+    }));
     for (const value of dynamicValues) {
       if (!options.some((item) => item.value === value)) {
         options.push({ value, label: formatReviewStatus(value) });
@@ -336,54 +659,49 @@ export function ReviewPage() {
   }, [detail?.review?.review_status, results, reviewStatus]);
 
   const stats = useMemo(() => {
-    const countBy = (status: string) =>
-      results.filter((item) => {
-        const current = String(item.review?.review_status ?? "").trim() || DEFAULT_REVIEW_STATUS;
-        return current === status;
-      }).length;
-
     return [
-      ["待复核", String(countBy("pending")), "doc"],
-      ["已确认", String(countBy("confirmed_high_risk")), "warning"],
-      ["待跟进", String(countBy("needs_followup")), "refresh"],
-      ["误报", String(countBy("false_positive")), "shield"],
-      ["结果总数", String(results.length), "filter"]
+      ["待复核", String(resultStats.pending ?? 0), "doc"],
+      ["确认高风险", String(resultStats.confirmed_high_risk ?? 0), "warning"],
+      ["继续跟进", String(resultStats.needs_followup ?? 0), "refresh"],
+      ["误报", String(resultStats.false_positive ?? 0), "shield"],
+      ["当前队列", String(resultStats.total ?? resultTotal), "filter"]
     ] as const;
-  }, [results]);
+  }, [resultStats, resultTotal]);
 
   const selectedStatus = hasSelection ? String(detail?.review?.review_status ?? reviewStatus ?? "").trim() || DEFAULT_REVIEW_STATUS : "";
-  const canClearFilters = Boolean(taskFilter || resultStatusFilter || reviewStatusFilter || textFilter);
+  const canClearFilters = Boolean(taskFilter || resultStatusFilter || reviewStatusFilter || textFilter || displayThreshold !== DEFAULT_CANDIDATE_DISPLAY_SCORE_THRESHOLD);
   const isDetailLoading = hasSelection && detailLoading && !detail;
   const selectedResultLabel = hasSelection ? `#${selectedResultId}` : "-";
   const detailUpdatedAt = detail?.review?.updated_at || detail?.updated_at || "-";
   const detailReviewer = detail?.review?.reviewer_name || "-";
-  const resultPageCount = Math.max(Math.ceil(results.length / REVIEW_PAGE_SIZE), 1);
-  const currentResultPage = Math.min(resultPage, resultPageCount);
-  const visibleResults = useMemo(
-    () => results.slice((currentResultPage - 1) * REVIEW_PAGE_SIZE, currentResultPage * REVIEW_PAGE_SIZE),
-    [currentResultPage, results]
+  const shortDramaName = String(detail?.source_short_drama || "").trim() || "未标注短剧名";
+  const sourceNovelName = String(detail?.source_novel_name || "").trim() || "-";
+  const sourceExcelRow = String(detail?.source_excel_row || "").trim() || "-";
+  const sourceEpisode = formatEpisodeLabel(detail?.source_episode);
+  const sourceAuthor = String(detail?.source_author || "").trim() || "-";
+  const sourcePlatform = String(detail?.source_platform || "").trim() || "-";
+  const sourceDisplayTitle = String(detail?.source_display_title || "").trim() || "-";
+  const sourceDescription = String(detail?.source_description || "").trim() || "-";
+  const queryPreview = detail?.query_text || bestMatch?.query_text || bestMatch?.query_text_preview || "-";
+  const candidatePreview =
+    bestMatch?.candidate_review_context_text ||
+    bestMatch?.candidate_text_full ||
+    bestMatch?.candidate_text ||
+    bestMatch?.candidate_text_preview ||
+    "-";
+  const matchedSubstring = String(bestMatch?.matched_substring || "").trim();
+  const evidenceHighlight = useMemo(
+    () => buildEvidenceHighlightRanges(queryPreview, candidatePreview, matchedSubstring),
+    [candidatePreview, matchedSubstring, queryPreview]
   );
-
-  async function handleApplyFilters() {
-    const nextParams = buildSearchParams();
-    setSearchParams(nextParams, { replace: false });
-  }
-
-  async function handleClearFilters() {
-    setTaskFilter("");
-    setResultStatusFilter("");
-    setReviewStatusFilter("");
-    setTextFilter("");
-    const nextParams = buildReviewSearchParams({ resultId: selectedResultId });
-    setSearchParams(nextParams, { replace: false });
-  }
+  const activeTask = tasks.find((task) => String(task.task_id) === taskFilter) ?? null;
 
   return (
     <div className="page-grid review-reference-page">
       <section className="single-page-heading">
         <div>
           <h1>结果复核</h1>
-          <p>查看排序结果、核验证据，并保存复核结论供后续导出和处理。</p>
+          <p>把短剧名、查询文本和命中小说放在一个视野里，减少跳转，直接完成侵权复核判断。</p>
         </div>
       </section>
 
@@ -402,14 +720,47 @@ export function ReviewPage() {
       </section>
 
       <section className="card-panel span-full review-filter-panel">
+        <div className="review-task-toolbar">
+          <div className="review-task-toolbar-head">
+            <div>
+              <span className="panel-label">任务范围</span>
+              <h2>选择任务并绑定复核结果</h2>
+            </div>
+            <div className="review-task-toolbar-actions">
+              <div className="filter-chip">当前绑定：{activeTask ? clipText(activeTask.source_file_name || activeTask.task_id, 24) : "全部任务"}</div>
+            </div>
+          </div>
+
+          {tasksLoading ? (
+            <StatusState title="正在加载任务列表" description="同步当前账号下的批量任务，用于绑定复核结果和批量删除。" tone="info" variant="inline" icon="tasks" />
+          ) : tasks.length === 0 ? (
+            <StatusState title="当前没有可选择的任务" description="先创建并运行批量任务，这里才会出现对应的任务范围。" variant="inline" icon="tasks" />
+          ) : (
+            <div className="review-task-selector review-task-selector--single">
+              <label className="review-task-select-field">
+                <span>复核任务</span>
+                <select
+                  className="compact-select review-task-select"
+                  value={taskFilter}
+                  onChange={(event) => handleTaskFilterChange(event.target.value)}
+                >
+                  <option value="">全部任务</option>
+                  {tasks.map((task) => {
+                    const taskId = String(task.task_id);
+                    const taskName = String(task.source_file_name || taskId).trim() || taskId;
+                    return (
+                      <option key={taskId} value={taskId}>
+                        {`${clipText(taskName, 28)} | ${formatTaskStatusLabel(String(task.status || ""))} | ${task.counts?.completed ?? 0}/${task.counts?.accepted ?? 0}`}
+                      </option>
+                    );
+                  })}
+                </select>
+              </label>
+            </div>
+          )}
+        </div>
+
         <div className="filter-bar review-filter-bar">
-          <input
-            className="compact-select"
-            type="text"
-            value={taskFilter}
-            onChange={(event) => setTaskFilter(event.target.value)}
-            placeholder="按任务 ID 筛选"
-          />
           <select className="compact-select" value={resultStatusFilter} onChange={(event) => setResultStatusFilter(event.target.value)}>
             <option value="">全部结果状态</option>
             <option value="completed">{formatTaskStatusLabel("completed")}</option>
@@ -429,27 +780,42 @@ export function ReviewPage() {
             type="text"
             value={textFilter}
             onChange={(event) => setTextFilter(event.target.value)}
-            placeholder="按预览、书名、章节或标签筛选"
+            placeholder="按短剧名、书名、章节或文本"
           />
-          <div className="filter-chip">已筛结果：{results.length} 条</div>
+          <label className="batch-results-threshold-field review-threshold-field">
+            <span>展示阈值</span>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.01}
+              value={displayThreshold}
+              onChange={(event) => setDisplayThreshold(clampThreshold(Number(event.target.value)))}
+            />
+          </label>
+          <label className={`filter-chip review-toggle-chip${dedupeLatest ? " active" : ""}`}>
+            <input type="checkbox" checked={dedupeLatest} onChange={handleToggleDedupe} />
+            只看最新去重结果
+          </label>
+          <div className="filter-chip">当前结果：{resultTotal} 条</div>
           <div className="filter-chip">当前选中：{selectedResultLabel}</div>
-          <div className="filter-chip">语义状态：{formatSemanticStatusLabel(String(detail?.semantic_status || ""))}</div>
-          <div className="filter-chip">任务：{detail?.task_id || "-"}</div>
-          <div className="filter-chip">复核状态：{hasSelection ? formatReviewStatus(selectedStatus) : "-"}</div>
-          <button
-            className="outline-button slim"
-            type="button"
-            onClick={() => void handleApplyFilters()}
-          >
+          <button className="outline-button slim" type="button" onClick={() => void handleApplyFilters()}>
             <Icon name="refresh" />
             应用
           </button>
           <button
-            className="ghost-button slim"
+            className="outline-button slim"
             type="button"
-            disabled={!canClearFilters}
-            onClick={() => void handleClearFilters()}
+            disabled={resultsLoading || isExporting}
+            onClick={() => void handleExportReviewedResults()}
           >
+            <Icon name="doc" />
+            {isExporting ? "导出中..." : "导出已处理结果"}
+          </button>
+          <button className="ghost-button danger slim" type="button" disabled={resultsLoading || isClearingPending} onClick={() => void handleClearPendingQueue()}>
+            {isClearingPending ? "清空中..." : "清空待复核"}
+          </button>
+          <button className="ghost-button slim" type="button" disabled={!canClearFilters} onClick={() => void handleClearFilters()}>
             清空
           </button>
         </div>
@@ -467,22 +833,23 @@ export function ReviewPage() {
       )}
 
       <div className="review-reference-layout span-full">
-        <section className="card-panel review-reference-list">
+        <section className="card-panel review-reference-list" style={reviewQueueStyle}>
           <div className="section-heading compact-bottom">
             <div>
               <h2>结果队列</h2>
-              <p>当前共有 {results.length} 条可复核的比对结果。</p>
+              <p>{taskFilter ? `当前只显示任务 ${clipText(taskFilter, 16)} 下的结果。` : "当前显示所有任务的复核结果，可结合上方任务范围切换。"}</p>
             </div>
           </div>
 
           <div className="review-reference-items">
             {resultsLoading ? (
-              <StatusState title="正在加载复核结果" description="正在同步符合筛选条件的结果列表。" tone="info" icon="queue" />
+              <StatusState title="正在加载复核结果" description="同步当前筛选条件下的结果队列。" tone="info" icon="queue" />
             ) : results.length === 0 ? (
-              <StatusState title="当前还没有可复核结果" description="请先完成一次比对任务，再到这里查看命中结果。" icon="review" />
+              <StatusState title="当前没有可复核结果" description="先完成一次比对任务，或调整任务范围与展示阈值。" icon="review" />
             ) : (
-              visibleResults.map((item) => {
+              results.map((item) => {
                 const itemStatus = String(item.review?.review_status ?? "").trim() || DEFAULT_REVIEW_STATUS;
+                const itemDrama = String(item.source_short_drama || "").trim() || "未标注短剧名";
 
                 return (
                   <article
@@ -494,15 +861,35 @@ export function ReviewPage() {
                       {selectedResultId === item.result_id ? <Icon name="check" /> : <span />}
                     </div>
                     <div className="review-reference-main">
+                      <div className="review-reference-title-row">
+                        <strong className="review-reference-drama">{itemDrama}</strong>
+                        <span className="soft-tag">{formatReviewStatus(itemStatus)}</span>
+                      </div>
+                      <div className="review-reference-preview-meta">
+                        <span>{formatEpisodeLabel(item.source_episode)}</span>
+                        <span>{item.source_author || "-"}</span>
+                      </div>
                       <div className="review-reference-preview">{item.query_text_preview || "-"}</div>
                       <div className="review-reference-grid">
                         <div>
-                          <span>Top1 书名</span>
+                          <span>命中书名</span>
                           <strong>{item.top1_book_name || "-"}</strong>
                         </div>
                         <div>
-                          <span>Top1 章节</span>
+                          <span>命中章节</span>
                           <strong>{item.top1_chapter_name || "-"}</strong>
+                        </div>
+                        <div>
+                          <span>集数</span>
+                          <strong>{formatEpisodeLabel(item.source_episode)}</strong>
+                        </div>
+                        <div>
+                          <span>作者</span>
+                          <strong>{item.source_author || "-"}</strong>
+                        </div>
+                        <div>
+                          <span>源小说名</span>
+                          <strong>{item.source_novel_name || "-"}</strong>
                         </div>
                         <div>
                           <span>{formatMetricLabel("fine_score")}</span>
@@ -513,20 +900,16 @@ export function ReviewPage() {
                           <strong>{formatSemanticStatusLabel(String(item.semantic_status || ""))}</strong>
                         </div>
                         <div>
-                          <span>复核状态</span>
-                          <strong>{formatReviewStatus(itemStatus)}</strong>
+                          <span>耗时</span>
+                          <strong>{formatDuration(item.duration_seconds)}</strong>
+                        </div>
+                        <div>
+                          <span>Excel 行号</span>
+                          <strong>{item.source_excel_row || "-"}</strong>
                         </div>
                         <div>
                           <span>任务 ID</span>
-                          <strong>{item.task_id || "-"}</strong>
-                        </div>
-                        <div>
-                          <span>{formatMetricLabel("review_label")}</span>
-                          <strong>{formatReviewLabel(String(item.top1_review_label || ""))}</strong>
-                        </div>
-                        <div>
-                          <span>更新时间</span>
-                          <strong>{item.updated_at || "-"}</strong>
+                          <strong>{clipText(item.task_id, 16)}</strong>
                         </div>
                       </div>
                     </div>
@@ -535,12 +918,13 @@ export function ReviewPage() {
               })
             )}
           </div>
+
           {!resultsLoading && (
             <PaginationBar
               className="review-reference-pagination"
-              page={currentResultPage}
-              pageCount={resultPageCount}
-              total={results.length}
+              page={resultPage}
+              pageCount={Math.max(Math.ceil(resultTotal / REVIEW_PAGE_SIZE), 1)}
+              total={resultTotal}
               pageSize={REVIEW_PAGE_SIZE}
               itemLabel="结果"
               onChange={setResultPage}
@@ -548,29 +932,48 @@ export function ReviewPage() {
           )}
         </section>
 
-        <section className="review-reference-detail">
+        <section className="review-reference-detail" ref={reviewDetailRef}>
           {!hasSelection ? (
             <article className="dark-card-panel review-reference-empty">
               <div className="review-reference-empty-copy">
                 <span className="eyebrow">复核详情</span>
                 <h2>请选择一条结果</h2>
-                <p>从左侧结果队列中选择一条记录后，即可查看命中文本、指标证据和当前复核结论。</p>
+                <p>从左侧结果队列中选中一条后，这里会展示短剧样本、命中小说和文本证据。</p>
               </div>
             </article>
           ) : isDetailLoading ? (
             <article className="card-panel review-reference-loading">
-              <StatusState title="正在加载复核详情" description="正在同步当前结果的证据、指标和复核状态。" tone="info" variant="inline" icon="review" />
+              <StatusState title="正在加载复核详情" description="同步当前结果的文本证据、指标和复核状态。" tone="info" variant="inline" icon="review" />
             </article>
           ) : (
             <>
               <article className="dark-card-panel review-reference-summary">
+                <div className="review-reference-summary-header">
+                  <div>
+                    <span className="panel-label">短剧样本</span>
+                    <h2>{shortDramaName}</h2>
+                    <p>{sourceEpisode} · 作者：{sourceAuthor} · 平台：{sourcePlatform}</p>
+                  </div>
+                  <div className="review-reference-summary-badges">
+                    <span className="soft-tag">{formatReviewLabel(String(detail?.top1_review_label || ""))}</span>
+                    <span className="soft-tag muted">{formatConfidenceLabel(String(detail?.top1_confidence_label || ""))}</span>
+                  </div>
+                </div>
                 <div className="review-reference-summary-grid">
                   <div>
-                    <span>Top1 书名</span>
+                    <span>集数</span>
+                    <strong>{sourceEpisode}</strong>
+                  </div>
+                  <div>
+                    <span>作者</span>
+                    <strong>{sourceAuthor}</strong>
+                  </div>
+                  <div>
+                    <span>命中书名</span>
                     <strong>{detail?.top1_book_name || "-"}</strong>
                   </div>
                   <div>
-                    <span>Top1 章节</span>
+                    <span>命中章节</span>
                     <strong>{detail?.top1_chapter_name || "-"}</strong>
                   </div>
                   <div>
@@ -578,12 +981,8 @@ export function ReviewPage() {
                     <strong>{formatScore(detail?.top1_fine_score)}</strong>
                   </div>
                   <div>
-                    <span>{formatMetricLabel("review_label")}</span>
-                    <strong className="emphasis warm">{formatReviewLabel(String(detail?.top1_review_label || ""))}</strong>
-                  </div>
-                  <div>
-                    <span>{formatMetricLabel("confidence_label")}</span>
-                    <strong className="emphasis warm">{formatConfidenceLabel(String(detail?.top1_confidence_label || ""))}</strong>
+                    <span>耗时</span>
+                    <strong>{formatDuration(detail?.duration_seconds)}</strong>
                   </div>
                   <div>
                     <span>{formatMetricLabel("semantic_status")}</span>
@@ -593,6 +992,14 @@ export function ReviewPage() {
                     <span>复核状态</span>
                     <strong>{formatReviewStatus(selectedStatus)}</strong>
                   </div>
+                  <div>
+                    <span>任务状态</span>
+                    <strong>{formatTaskStatusLabel(String(detail?.task_status || ""))}</strong>
+                  </div>
+                  <div>
+                    <span>任务 ID</span>
+                    <strong>{detail?.task_id || "-"}</strong>
+                  </div>
                 </div>
               </article>
 
@@ -601,12 +1008,12 @@ export function ReviewPage() {
                   <div className="review-reference-section-head">
                     <div>
                       <span className="panel-label">核心对比</span>
-                      <h3>先看文本，再做判断</h3>
+                      <h3>先看文本，再判断是否侵权</h3>
                     </div>
                     <div className="review-reference-head-actions">
                       <div className="review-reference-head-chips">
-                        <span className="soft-tag">{formatReviewLabel(String(detail?.top1_review_label || ""))}</span>
-                        <span className="soft-tag muted">{formatConfidenceLabel(String(detail?.top1_confidence_label || ""))}</span>
+                        <span className="soft-tag">{formatSemanticStatusLabel(String(detail?.semantic_status || ""))}</span>
+                        <span className="soft-tag muted">结果 {selectedResultLabel}</span>
                       </div>
                       {bestMatch ? (
                         <button className="ghost-button slim single-evidence-expand-button" type="button" onClick={() => setIsEvidenceModalOpen(true)}>
@@ -616,73 +1023,86 @@ export function ReviewPage() {
                       ) : null}
                     </div>
                   </div>
+
                   {bestMatch ? (
-                    <div className="single-evidence-grid review-reference-evidence-grid">
-                      <article className="evidence-card review-evidence-card review-evidence-card-query">
-                        <span className="single-evidence-label">查询文本</span>
-                        <p>{bestMatch.query_text || detail?.query_text || bestMatch.query_text_preview || "-"}</p>
-                      </article>
-                      <article className="evidence-card highlighted review-evidence-card review-evidence-card-candidate">
-                        <span className="single-evidence-label">候选文本</span>
-                        <p>{bestMatch.candidate_text || bestMatch.candidate_text_preview || "-"}</p>
-                      </article>
-                    </div>
+                    <>
+                      <div className="single-evidence-grid review-reference-evidence-grid">
+                        <article className="evidence-card review-evidence-card review-evidence-card-query">
+                          <span className="single-evidence-label">查询文本</span>
+                          <p>{renderHighlightedEvidence(queryPreview, evidenceHighlight.queryRanges, "review-query")}</p>
+                        </article>
+                        <article className="evidence-card highlighted review-evidence-card review-evidence-card-candidate">
+                          <span className="single-evidence-label">候选文本</span>
+                          <p>{renderHighlightedEvidence(candidatePreview, evidenceHighlight.candidateRanges, "review-candidate")}</p>
+                        </article>
+                      </div>
+
+                      <div className="review-reference-inline-support">
+                        <div className="review-reference-support-block surface">
+                          <div className="review-reference-section-head compact">
+                            <div>
+                              <span className="panel-label">辅助信息</span>
+                              <h3>保留必要背景</h3>
+                            </div>
+                          </div>
+                          <div className="review-reference-meta-grid">
+                            <div>
+                              <span>展示标题</span>
+                              <strong>{sourceDisplayTitle}</strong>
+                            </div>
+                            <div>
+                              <span>平台</span>
+                              <strong>{sourcePlatform}</strong>
+                            </div>
+                            <div>
+                              <span>短剧名</span>
+                              <strong>{shortDramaName}</strong>
+                            </div>
+                            <div>
+                              <span>源小说名</span>
+                              <strong>{sourceNovelName}</strong>
+                            </div>
+                            <div>
+                              <span>来源标识</span>
+                              <strong>{detail?.source_ref || "-"}</strong>
+                            </div>
+                            <div>
+                              <span>Excel 行号</span>
+                              <strong>{sourceExcelRow}</strong>
+                            </div>
+                            <div>
+                              <span>描述</span>
+                              <strong>{sourceDescription}</strong>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="review-reference-support-block surface">
+                          <div className="review-reference-section-head compact">
+                            <div>
+                              <span className="panel-label">辅助指标</span>
+                              <h3>只展示关键指标</h3>
+                            </div>
+                          </div>
+                          <div className="review-metrics-grid review-metrics-grid-compact">
+                            {metrics.length === 0 ? (
+                              <StatusState title="当前没有指标详情" description="该结果暂时没有可展示的命中指标。" icon="filter" />
+                            ) : (
+                              metrics.map(([label, value]) => (
+                                <div key={label} className="review-metric-box">
+                                  <span>{formatMetricLabel(label)}</span>
+                                  <strong>{formatScore(value)}</strong>
+                                  <div className="single-inline-score"><span style={{ width: `${metricPercent(value)}%` }} /></div>
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </>
                   ) : (
-                    <StatusState title="当前没有证据内容" description="该结果暂时没有可展示的最佳命中文本预览。" icon="search" />
+                    <StatusState title="当前没有证据内容" description="该结果暂时没有可展示的最佳命中文本。" icon="search" />
                   )}
-
-                  {detail ? (
-                    <div className="review-reference-inline-support">
-                      <div className="review-reference-support-block surface">
-                        <div className="review-reference-section-head compact">
-                          <div>
-                            <span className="panel-label">辅助信息</span>
-                            <h3>只保留必要背景</h3>
-                          </div>
-                        </div>
-                        <div className="review-reference-meta-grid">
-                          <div>
-                            <span>任务 ID</span>
-                            <strong>{detail?.task_id || "-"}</strong>
-                          </div>
-                          <div>
-                            <span>结果编号</span>
-                            <strong>{selectedResultLabel}</strong>
-                          </div>
-                          <div>
-                            <span>{formatMetricLabel("semantic_status")}</span>
-                            <strong>{formatSemanticStatusLabel(String(detail?.semantic_status || ""))}</strong>
-                          </div>
-                          <div>
-                            <span>复核状态</span>
-                            <strong>{formatReviewStatus(selectedStatus)}</strong>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="review-reference-support-block surface">
-                        <div className="review-reference-section-head compact">
-                          <div>
-                            <span className="panel-label">辅助指标</span>
-                            <h3>只展示关键指标</h3>
-                          </div>
-                        </div>
-                        <div className="review-metrics-grid review-metrics-grid-compact">
-                          {metrics.length === 0 ? (
-                            <StatusState title="当前没有指标详情" description="该结果暂时没有可展示的命中指标。" icon="filter" />
-                          ) : (
-                            metrics.map(([label, value]) => (
-                              <div key={label} className="review-metric-box">
-                                <span>{formatMetricLabel(label)}</span>
-                                <strong>{formatScore(value)}</strong>
-                                <div className="single-inline-score"><span style={{ width: `${metricPercent(value)}%` }} /></div>
-                              </div>
-                            ))
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  ) : null}
                 </article>
 
                 <aside className="review-reference-sidebar">
@@ -699,10 +1119,10 @@ export function ReviewPage() {
                         确认高风险
                       </button>
                       <button className="ghost-button warm" type="button" disabled={!selectedResultId || isSaving} onClick={() => void handleSaveReview("needs_followup")}>
-                        需要继续跟进
+                        继续跟进
                       </button>
                       <button className="ghost-button" type="button" disabled={!selectedResultId || isSaving} onClick={() => void handleSaveReview("false_positive")}>
-                        标记为误报
+                        标记误报
                       </button>
                     </div>
 
@@ -738,56 +1158,6 @@ export function ReviewPage() {
                     {detailLoading && (
                       <StatusState title="正在刷新复核详情" description="保存后会自动同步当前结果的最新状态。" tone="info" variant="inline" icon="refresh" />
                     )}
-                    <div className="review-reference-support">
-                      <div className="review-reference-support-block">
-                      <div className="review-reference-section-head compact">
-                        <div>
-                          <span className="panel-label">辅助信息</span>
-                          <h3>只保留必要背景</h3>
-                        </div>
-                      </div>
-                      <div className="review-reference-meta-grid">
-                        <div>
-                          <span>任务 ID</span>
-                          <strong>{detail?.task_id || "-"}</strong>
-                        </div>
-                        <div>
-                          <span>结果编号</span>
-                          <strong>{selectedResultLabel}</strong>
-                        </div>
-                        <div>
-                          <span>{formatMetricLabel("semantic_status")}</span>
-                          <strong>{formatSemanticStatusLabel(String(detail?.semantic_status || ""))}</strong>
-                        </div>
-                        <div>
-                          <span>复核状态</span>
-                          <strong>{formatReviewStatus(selectedStatus)}</strong>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="review-reference-support-block">
-                      <div className="review-reference-section-head compact">
-                        <div>
-                          <span className="panel-label">辅助指标</span>
-                          <h3>只展示关键指标</h3>
-                        </div>
-                      </div>
-                      <div className="review-metrics-grid review-metrics-grid-compact">
-                        {metrics.length === 0 ? (
-                          <StatusState title="当前没有指标详情" description="该结果暂时没有可展示的命中指标。" icon="filter" />
-                        ) : (
-                          metrics.map(([label, value]) => (
-                            <div key={label} className="review-metric-box">
-                              <span>{formatMetricLabel(label)}</span>
-                              <strong>{formatScore(value)}</strong>
-                              <div className="single-inline-score"><span style={{ width: `${metricPercent(value)}%` }} /></div>
-                            </div>
-                          ))
-                        )}
-                      </div>
-                      </div>
-                    </div>
                   </article>
                 </aside>
               </div>
@@ -803,8 +1173,8 @@ export function ReviewPage() {
               <div className="single-evidence-modal-title">
                 <div>
                   <span className="single-evidence-modal-eyebrow">证据详情</span>
-                  <h2>{detail?.top1_book_name || "当前命中结果"}</h2>
-                  <p>{detail?.top1_chapter_name || "查看查询文本与候选文本的完整对照"}</p>
+                  <h2>{shortDramaName}</h2>
+                  <p>{detail?.top1_book_name || "当前命中结果"} · {detail?.top1_chapter_name || "查看完整文本对照"}</p>
                 </div>
               </div>
               <button className="icon-button single-evidence-modal-close" type="button" aria-label="关闭证据详情弹窗" onClick={() => setIsEvidenceModalOpen(false)}>
@@ -816,11 +1186,11 @@ export function ReviewPage() {
               <div className="single-evidence-modal-grid">
                 <article className="evidence-card single-evidence-modal-card">
                   <span className="single-evidence-label">查询文本</span>
-                  <p>{bestMatch.query_text || detail?.query_text || bestMatch.query_text_preview || "-"}</p>
+                  <p>{renderHighlightedEvidence(queryPreview, evidenceHighlight.queryRanges, "review-modal-query")}</p>
                 </article>
                 <article className="evidence-card highlighted single-evidence-modal-card">
                   <span className="single-evidence-label">候选文本</span>
-                  <p>{bestMatch.candidate_text || bestMatch.candidate_text_preview || "-"}</p>
+                  <p>{renderHighlightedEvidence(candidatePreview, evidenceHighlight.candidateRanges, "review-modal-candidate")}</p>
                 </article>
               </div>
 

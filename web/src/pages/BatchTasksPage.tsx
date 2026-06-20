@@ -1,16 +1,20 @@
 import { useEffect, useId, useMemo, useRef, useState, type DragEvent, type KeyboardEvent } from "react";
 import { Link } from "react-router-dom";
 
-import { cancelTask, createCompareTask, downloadTaskExport, getTaskDetail, listTasks, retryTask, type DetectionMode } from "../api";
-import { formatConfidenceLabel, formatDetectionModeLabel, formatMetricLabel, formatReviewLabel, formatSemanticStatusLabel, formatTaskMessage, formatTaskStatusLabel, formatTaskTypeLabel } from "../displayText";
+import { cancelTask, createCompareTask, deleteTask, deleteTasks, downloadTaskExport, getTaskDetail, listTasks, pauseTask, resumeTask, retryTask, type DetectionMode } from "../api";
+import { formatConfidenceLabel, formatDetectionModeLabel, formatReviewLabel, formatSemanticStatusLabel, formatTaskMessage, formatTaskStatusLabel } from "../displayText";
 import { Icon } from "../icons";
 import { PaginationBar } from "../PaginationBar";
 import { StatusState } from "../StatusState";
-import { buildReviewPath, isHighRiskReviewLabel } from "../workflowLinks";
+import { formatTaskEta, formatTaskProgressDetail } from "../taskProgress";
+import { buildReviewPath } from "../workflowLinks";
 
-const DEFAULT_CANDIDATE_DISPLAY_SCORE_THRESHOLD = 0.1;
+const DEFAULT_CANDIDATE_DISPLAY_SCORE_THRESHOLD = 0.01;
+const BATCH_THRESHOLD_STORAGE_KEY = "novel-compare-batch-threshold";
 const TASK_PAGE_SIZE = 8;
 const TASK_RESULT_PAGE_SIZE = 8;
+const TASK_DETAIL_FETCH_LIMIT = 200;
+const BULK_DELETABLE_TASK_STATUSES = ["queued", "paused", "failed", "partial_failed", "cancelled", "completed"];
 
 function toPercent(task: Record<string, any>): number {
   const counts = (task.counts ?? {}) as Record<string, number | null>;
@@ -30,9 +34,14 @@ function getProgressLabel(task: Record<string, any>): string {
   const total = Math.max(accepted, completed + failed);
   const progress = total > 0 ? Math.min(Math.round(((completed + failed) / total) * 100), 100) : 0;
 
-  if (status === "queued") return "排队中";
-  if (status === "running") return `执行中 ${progress}%`;
-  if (status === "cancel_requested") return `取消中 ${progress}%`;
+  const detail = formatTaskProgressDetail(task);
+  const eta = formatTaskEta(task);
+
+  if (status === "queued") return accepted > 0 ? `排队中 · ${detail}` : "排队中";
+  if (status === "running") return eta !== "-" ? `执行中 ${progress}% · ${detail} · 剩余 ${eta}` : `执行中 ${progress}% · ${detail}`;
+  if (status === "pause_requested") return `暂停中 ${progress}% · ${detail}`;
+  if (status === "paused") return accepted > 0 ? `已暂停 · ${detail}` : "已暂停";
+  if (status === "cancel_requested") return `取消中 ${progress}% · ${detail}`;
   if (status === "completed") return "已完成 100%";
   if (status === "partial_failed") return `部分失败 ${progress}%`;
   if (status === "failed") return "失败";
@@ -57,8 +66,11 @@ function formatItemDuration(value: unknown): string {
   return `${minutes} 分 ${remainSeconds.toFixed(remainSeconds < 10 ? 1 : 0)} 秒`;
 }
 
-function countHighRisk(items: Record<string, any>[]): number {
-  return items.filter((item) => isHighRiskReviewLabel(item.top1_review_label)).length;
+function formatEpisodeLabel(value: unknown): string {
+  const text = String(value ?? "").trim();
+  if (!text) return "-";
+  if (text.startsWith("第") && text.endsWith("集")) return text;
+  return `第${text}集`;
 }
 
 function clampThreshold(value: number): number {
@@ -66,9 +78,15 @@ function clampThreshold(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
 
+function readStoredThreshold(): number {
+  if (typeof window === "undefined") return DEFAULT_CANDIDATE_DISPLAY_SCORE_THRESHOLD;
+  const raw = window.localStorage.getItem(BATCH_THRESHOLD_STORAGE_KEY);
+  return clampThreshold(Number(raw));
+}
+
 function isLiveTask(task: Record<string, any> | null | undefined): boolean {
   const status = String(task?.status ?? "");
-  return ["queued", "running", "cancel_requested"].includes(status);
+  return ["queued", "running", "pause_requested", "cancel_requested"].includes(status);
 }
 
 export function BatchTasksPage() {
@@ -76,17 +94,22 @@ export function BatchTasksPage() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const taskDetailRequestRef = useRef(0);
   const taskListRequestRef = useRef(0);
-  const [rewriteEnabled, setRewriteEnabled] = useState(false);
+  const silentTaskDetailInFlightRef = useRef(false);
+  const silentTaskListInFlightRef = useRef(false);
+  const [rewriteEnabled, setRewriteEnabled] = useState(true);
   const [file, setFile] = useState<File | null>(null);
   const [topK, setTopK] = useState(10);
   const [compareTopK, setCompareTopK] = useState(50);
   const [mergedTopK, setMergedTopK] = useState(20);
-  const [candidateDisplayScoreThreshold, setCandidateDisplayScoreThreshold] = useState(DEFAULT_CANDIDATE_DISPLAY_SCORE_THRESHOLD);
+  const [taskResultDisplayThreshold, setTaskResultDisplayThreshold] = useState(() => readStoredThreshold());
   const [tasks, setTasks] = useState<Record<string, any>[]>([]);
+  const [selectedTaskIds, setSelectedTaskIds] = useState<string[]>([]);
   const [taskPage, setTaskPage] = useState(1);
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [selectedTask, setSelectedTask] = useState<Record<string, any> | null>(null);
   const [selectedItems, setSelectedItems] = useState<Record<string, any>[]>([]);
+  const [selectedItemTotal, setSelectedItemTotal] = useState(0);
+  const [selectedItemStats, setSelectedItemStats] = useState({ item_total: 0, high_risk_count: 0, semantic_fallback_count: 0 });
   const [resultPage, setResultPage] = useState(1);
   const [tasksLoading, setTasksLoading] = useState(true);
   const [tasksRefreshing, setTasksRefreshing] = useState(false);
@@ -95,13 +118,44 @@ export function BatchTasksPage() {
   const [isCreating, setIsCreating] = useState(false);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [exportingKind, setExportingKind] = useState<"summary" | "review" | null>(null);
-  const [exportNotice, setExportNotice] = useState("");
+  const [isDeletingSelectedTasks, setIsDeletingSelectedTasks] = useState(false);
   const [error, setError] = useState("");
   const mode: DetectionMode = rewriteEnabled ? "rewrite" : "reuse";
 
+  async function getFullTaskDetail(taskId: string) {
+    const firstPage = await getTaskDetail(String(taskId), TASK_DETAIL_FETCH_LIMIT, 0);
+    const total = Math.max(Number(firstPage.item_total ?? firstPage.items.length ?? 0), 0);
+    if (total <= firstPage.items.length || total <= TASK_DETAIL_FETCH_LIMIT) {
+      return firstPage;
+    }
+
+    const allItems = [...firstPage.items];
+    let offset = allItems.length;
+
+    while (offset < total) {
+      const nextPage = await getTaskDetail(String(taskId), TASK_DETAIL_FETCH_LIMIT, offset);
+      if (!Array.isArray(nextPage.items) || nextPage.items.length === 0) {
+        break;
+      }
+      allItems.push(...nextPage.items);
+      offset += nextPage.items.length;
+    }
+
+    return {
+      ...firstPage,
+      items: allItems
+    };
+  }
+
   async function loadTaskDetail(taskId: string, options: { resetView?: boolean; silent?: boolean } = {}) {
     const { resetView = true, silent = false } = options;
+    if (silent && silentTaskDetailInFlightRef.current) {
+      return;
+    }
     const requestId = ++taskDetailRequestRef.current;
+    if (silent) {
+      silentTaskDetailInFlightRef.current = true;
+    }
     if (silent) {
       setTaskDetailRefreshing(true);
     } else {
@@ -110,20 +164,31 @@ export function BatchTasksPage() {
     if (resetView) {
       setSelectedTask(null);
       setSelectedItems([]);
+      setSelectedItemTotal(0);
+      setSelectedItemStats({ item_total: 0, high_risk_count: 0, semantic_fallback_count: 0 });
       setResultPage(1);
     }
     try {
-      const detail = await getTaskDetail(String(taskId), 100, 0);
+      const detail = await getFullTaskDetail(String(taskId));
       if (taskDetailRequestRef.current !== requestId) return;
       setSelectedTaskId(String(taskId));
       setSelectedTask(detail.task);
       setSelectedItems(detail.items);
+      setSelectedItemTotal(Number(detail.item_total ?? 0));
+      setSelectedItemStats({
+        item_total: Number(detail.result_stats?.item_total ?? detail.item_total ?? 0),
+        high_risk_count: Number(detail.result_stats?.high_risk_count ?? 0),
+        semantic_fallback_count: Number(detail.result_stats?.semantic_fallback_count ?? 0)
+      });
     } catch (requestError) {
       if (taskDetailRequestRef.current !== requestId) return;
       if (!silent) {
         setError(requestError instanceof Error ? requestError.message : "加载任务详情失败");
       }
     } finally {
+      if (silent) {
+        silentTaskDetailInFlightRef.current = false;
+      }
       if (taskDetailRequestRef.current === requestId) {
         if (silent) {
           setTaskDetailRefreshing(false);
@@ -136,7 +201,13 @@ export function BatchTasksPage() {
 
   async function loadTasks(preferredTaskId = "", options: { silent?: boolean } = {}) {
     const { silent = false } = options;
+    if (silent && silentTaskListInFlightRef.current) {
+      return;
+    }
     const requestId = ++taskListRequestRef.current;
+    if (silent) {
+      silentTaskListInFlightRef.current = true;
+    }
     if (silent) {
       setTasksRefreshing(true);
     } else {
@@ -159,11 +230,26 @@ export function BatchTasksPage() {
         setSelectedTaskId("");
         setSelectedTask(null);
         setSelectedItems([]);
+        setSelectedItemTotal(0);
+        setSelectedItemStats({ item_total: 0, high_risk_count: 0, semantic_fallback_count: 0 });
         setTaskDetailLoading(false);
         return;
       }
 
       const shouldResetView = String(selectedTaskId) !== nextTaskId || !selectedTask;
+      const shouldSkipSilentDetailRefresh =
+        silent &&
+        !shouldResetView &&
+        isLiveTask(preferredTask);
+      if (shouldSkipSilentDetailRefresh) {
+        setSelectedTask((current) =>
+          current && String(current.task_id) === nextTaskId
+            ? { ...current, ...preferredTask }
+            : preferredTask ?? current
+        );
+        setSelectedTaskId(nextTaskId);
+        return;
+      }
       void loadTaskDetail(nextTaskId, {
         resetView: shouldResetView,
         silent: silent && !shouldResetView
@@ -174,6 +260,9 @@ export function BatchTasksPage() {
         setError(requestError instanceof Error ? requestError.message : "加载批量任务失败");
       }
     } finally {
+      if (silent) {
+        silentTaskListInFlightRef.current = false;
+      }
       if (taskListRequestRef.current === requestId) {
         if (silent) {
           setTasksRefreshing(false);
@@ -189,6 +278,17 @@ export function BatchTasksPage() {
   }, []);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(BATCH_THRESHOLD_STORAGE_KEY, taskResultDisplayThreshold.toFixed(2));
+  }, [taskResultDisplayThreshold]);
+
+  useEffect(() => {
+    setSelectedTaskIds((current) =>
+      current.filter((taskId) => tasks.some((task) => String(task.task_id) === taskId))
+    );
+  }, [tasks]);
+
+  useEffect(() => {
     const hasLiveTask = tasks.some((task) => isLiveTask(task)) || isLiveTask(selectedTask);
     if (!hasLiveTask) return;
 
@@ -198,6 +298,10 @@ export function BatchTasksPage() {
 
     return () => window.clearInterval(timer);
   }, [tasks, selectedTask, selectedTaskId]);
+
+  useEffect(() => {
+    setResultPage(1);
+  }, [selectedTaskId, taskResultDisplayThreshold]);
 
   function clearSelectedFile() {
     setFile(null);
@@ -246,9 +350,7 @@ export function BatchTasksPage() {
         detectionMode: mode,
         topK,
         compareTopK,
-        mergedTopK,
-        candidateDisplayScoreThreshold,
-        createdBy: "web-ui"
+        mergedTopK
       });
       clearSelectedFile();
       await loadTasks(String(response.task_id));
@@ -262,6 +364,10 @@ export function BatchTasksPage() {
   async function handleSelectTask(taskId: string) {
     setSelectedTaskId(taskId);
     void loadTaskDetail(taskId);
+  }
+
+  function handleResultPageChange(page: number) {
+    setResultPage(page);
   }
 
   async function handleCancelTask(taskId: string) {
@@ -284,14 +390,89 @@ export function BatchTasksPage() {
     }
   }
 
+  async function handlePauseTask(taskId: string) {
+    setError("");
+    try {
+      await pauseTask(taskId);
+      await loadTasks(taskId);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "暂停任务失败");
+    }
+  }
+
+  async function handleResumeTask(taskId: string) {
+    setError("");
+    try {
+      await resumeTask(taskId);
+      await loadTasks(taskId);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "继续任务失败");
+    }
+  }
+
+  async function handleDeleteTask(taskId: string) {
+    setError("");
+    try {
+      await deleteTask(taskId);
+      await loadTasks();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "删除任务失败");
+    }
+  }
+
+  function handleToggleTaskSelection(taskId: string) {
+    setSelectedTaskIds((current) =>
+      current.includes(taskId) ? current.filter((currentTaskId) => currentTaskId !== taskId) : [...current, taskId]
+    );
+  }
+
+  function handleToggleVisibleTaskSelection() {
+    const visibleIds = visibleTasks.map((task) => String(task.task_id));
+    const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((taskId) => selectedTaskIds.includes(taskId));
+    setSelectedTaskIds((current) =>
+      allVisibleSelected
+        ? current.filter((taskId) => !visibleIds.includes(taskId))
+        : Array.from(new Set([...current, ...visibleIds]))
+    );
+  }
+
+  async function handleDeleteSelectedTasks() {
+    const deletableIds = selectedTaskIds.filter((taskId) => {
+      const task = tasks.find((item) => String(item.task_id) === taskId);
+      return task && BULK_DELETABLE_TASK_STATUSES.includes(String(task.status || ""));
+    });
+    if (deletableIds.length <= 0) {
+      setError("当前选中的任务没有可删除项。运行中、取消中和暂停中的任务暂不支持批量删除。");
+      return;
+    }
+
+    const skippedCount = selectedTaskIds.length - deletableIds.length;
+    const confirmed = window.confirm(
+      skippedCount > 0
+        ? `将删除 ${deletableIds.length} 个可删除任务，另有 ${skippedCount} 个任务状态不支持删除。是否继续？`
+        : `确认删除选中的 ${deletableIds.length} 个任务吗？`
+    );
+    if (!confirmed) return;
+
+    setIsDeletingSelectedTasks(true);
+    setError("");
+    try {
+      await deleteTasks(deletableIds);
+      setSelectedTaskIds((current) => current.filter((taskId) => !deletableIds.includes(taskId)));
+      await loadTasks(selectedTaskId);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "批量删除任务失败");
+    } finally {
+      setIsDeletingSelectedTasks(false);
+    }
+  }
+
   async function handleExport(kind: "summary" | "review") {
     if (!selectedTask) return;
     setError("");
-    setExportNotice("");
     setExportingKind(kind);
     try {
-      const fileName = await downloadTaskExport(String(selectedTask.task_id), kind);
-      setExportNotice(`已开始下载 ${fileName}`);
+      await downloadTaskExport(String(selectedTask.task_id), kind);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "瀵煎嚭鏂囦欢澶辫触");
     } finally {
@@ -299,26 +480,42 @@ export function BatchTasksPage() {
     }
   }
 
-  const selectedHighRisk = countHighRisk(selectedItems);
-  const semanticFallbackCount = selectedItems.filter((item) => item.semantic_status === "fallback_lexical_only").length;
+  const selectedHighRisk = Number(selectedItemStats.high_risk_count ?? 0);
+  const semanticFallbackCount = Number(selectedItemStats.semantic_fallback_count ?? 0);
+  const taskUsesRewriteDetection = String(selectedTask?.detection_mode ?? "") === "rewrite";
+  const hasSemanticFallback = taskUsesRewriteDetection && semanticFallbackCount > 0;
   const selectedTaskReviewLink = selectedTask ? buildReviewPath({ taskId: selectedTask.task_id }) : "";
   const hasSummaryExport = Boolean(selectedTask?.summary_export_path);
   const hasReviewExport = Boolean(selectedTask?.review_export_path);
   const isSilentRefreshing = tasksRefreshing || taskDetailRefreshing;
-  const selectedTaskCandidateDisplayScoreThreshold = clampThreshold(
-    Number(selectedTask?.params?.candidate_display_score_threshold ?? DEFAULT_CANDIDATE_DISPLAY_SCORE_THRESHOLD)
-  );
+  const activeResultDisplayThreshold = clampThreshold(taskResultDisplayThreshold);
   const taskPageCount = Math.max(Math.ceil(tasks.length / TASK_PAGE_SIZE), 1);
   const currentTaskPage = Math.min(taskPage, taskPageCount);
   const visibleTasks = useMemo(
     () => tasks.slice((currentTaskPage - 1) * TASK_PAGE_SIZE, currentTaskPage * TASK_PAGE_SIZE),
     [currentTaskPage, tasks]
   );
-  const resultPageCount = Math.max(Math.ceil(selectedItems.length / TASK_RESULT_PAGE_SIZE), 1);
+  const allVisibleSelected =
+    visibleTasks.length > 0 && visibleTasks.every((task) => selectedTaskIds.includes(String(task.task_id)));
+  const filteredSelectedItems = useMemo(
+    () =>
+      selectedItems.filter((item) => {
+        const score = Number(item.top1_fine_score);
+        return !Number.isFinite(score) || score >= activeResultDisplayThreshold;
+      }),
+    [activeResultDisplayThreshold, selectedItems]
+  );
+  const filteredResultTotal = filteredSelectedItems.length;
+  const loadedResultTotal = selectedItems.length;
+  const resultPageCount = Math.max(Math.ceil(filteredResultTotal / TASK_RESULT_PAGE_SIZE), 1);
   const currentResultPage = Math.min(resultPage, resultPageCount);
   const visibleSelectedItems = useMemo(
-    () => selectedItems.slice((currentResultPage - 1) * TASK_RESULT_PAGE_SIZE, currentResultPage * TASK_RESULT_PAGE_SIZE),
-    [currentResultPage, selectedItems]
+    () =>
+      filteredSelectedItems.slice(
+        (currentResultPage - 1) * TASK_RESULT_PAGE_SIZE,
+        currentResultPage * TASK_RESULT_PAGE_SIZE
+      ),
+    [currentResultPage, filteredSelectedItems]
   );
 
   return (
@@ -417,17 +614,6 @@ export function BatchTasksPage() {
                   <span>merged_top_k</span>
                   <input type="number" min={1} max={200} value={mergedTopK} onChange={(event) => setMergedTopK(Number(event.target.value) || 20)} />
                 </label>
-                <label className="batch-parameter-box">
-                  <span>候选展示阈值</span>
-                  <input
-                    type="number"
-                    min={0}
-                    max={1}
-                    step={0.01}
-                    value={candidateDisplayScoreThreshold}
-                    onChange={(event) => setCandidateDisplayScoreThreshold(clampThreshold(Number(event.target.value)))}
-                  />
-                </label>
               </div>
             </div>
 
@@ -446,6 +632,16 @@ export function BatchTasksPage() {
                 tone="error"
                 variant="inline"
                 icon="warning"
+              />
+            )}
+
+            {rewriteEnabled && (
+              <StatusState
+                title="批量任务默认开启改写检测"
+                description="如果语义召回不可用，系统会自动降级为仅词法召回，并在任务结果中提示回退情况。"
+                tone="info"
+                variant="inline"
+                icon="review"
               />
             )}
           </article>
@@ -468,10 +664,35 @@ export function BatchTasksPage() {
               </button>
             </div>
 
+            <div className="batch-queue-toolbar">
+              <div className="batch-queue-toolbar-meta">
+                <div className="filter-chip">已选任务：{selectedTaskIds.length} 个</div>
+                <div className="filter-chip">当前页：{visibleTasks.length} 个</div>
+              </div>
+              <div className="batch-queue-toolbar-actions">
+                <button
+                  className="ghost-button danger slim"
+                  type="button"
+                  disabled={selectedTaskIds.length === 0 || isDeletingSelectedTasks}
+                  onClick={() => void handleDeleteSelectedTasks()}
+                >
+                  {isDeletingSelectedTasks ? "删除中..." : "删除选中任务"}
+                </button>
+              </div>
+            </div>
+
             <div className="list-shell list-shell-table batch-queue-table-wrap">
               <table className="data-table compact batch-queue-table">
                 <thead>
                   <tr>
+                    <th className="batch-queue-select-cell">
+                      <input
+                        type="checkbox"
+                        checked={allVisibleSelected}
+                        onChange={handleToggleVisibleTaskSelection}
+                        aria-label="选择当前页全部任务"
+                      />
+                    </th>
                     <th>任务 ID</th>
                     <th>状态</th>
                     <th>进度</th>
@@ -484,15 +705,16 @@ export function BatchTasksPage() {
                 <tbody>
                   {tasksLoading ? (
                     <tr>
-                      <td colSpan={7}>
+                      <td colSpan={8}>
                         <StatusState title="正在加载任务列表" description="正在同步最近批量任务的执行状态和进度。" tone="info" icon="queue" />
                       </td>
                     </tr>
                   ) : tasks.length > 0 ? (
                     visibleTasks.map((task) => {
                       const progress = toPercent(task);
-                      const selected = selectedTaskId === task.task_id;
                       const taskId = String(task.task_id);
+                      const selected = selectedTaskId === taskId;
+                      const checked = selectedTaskIds.includes(taskId);
 
                       return (
                         <tr
@@ -500,6 +722,17 @@ export function BatchTasksPage() {
                           className={selected ? "selected" : ""}
                           onClick={() => void handleSelectTask(taskId)}
                         >
+                          <td
+                            className="batch-queue-select-cell"
+                            onClick={(event) => event.stopPropagation()}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => handleToggleTaskSelection(taskId)}
+                              aria-label={`选择任务 ${taskId}`}
+                            />
+                          </td>
                           <td className="batch-queue-id-cell">
                             {selected && <span className="batch-selected-dot" />}
                             {taskId}
@@ -528,7 +761,7 @@ export function BatchTasksPage() {
                     })
                   ) : (
                     <tr>
-                      <td colSpan={7}>
+                      <td colSpan={8}>
                         <StatusState title="当前还没有批量任务" description="先上传一个批量文件并创建任务，这里才会展示任务队列。" icon="layers" />
                       </td>
                     </tr>
@@ -592,6 +825,14 @@ export function BatchTasksPage() {
                     <strong>{selectedTask.counts?.failed ?? 0}</strong>
                   </div>
                   <div>
+                    <span>当前进度</span>
+                    <strong>{formatTaskProgressDetail(selectedTask)}</strong>
+                  </div>
+                  <div>
+                    <span>预计剩余</span>
+                    <strong>{isLiveTask(selectedTask) ? formatTaskEta(selectedTask) : "-"}</strong>
+                  </div>
+                  <div>
                     <span>高风险</span>
                     <strong>{selectedHighRisk}</strong>
                   </div>
@@ -604,22 +845,40 @@ export function BatchTasksPage() {
                     <strong>{selectedTask.summary_export_path ? "已就绪" : "待生成"}</strong>
                   </div>
                   <div>
-                    <span>候选展示阈值</span>
-                    <strong>{selectedTaskCandidateDisplayScoreThreshold.toFixed(2)}</strong>
+                    <span>当前展示</span>
+                    <strong>{filteredResultTotal}</strong>
                   </div>
                   <div>
                     <span>状态说明</span>
                     <strong>{formatTaskMessage(String(selectedTask.status_message || ""))}</strong>
                   </div>
                 </div>
-                {(["queued", "running", "cancel_requested"].includes(String(selectedTask.status)) ||
-                  ["failed", "partial_failed", "cancelled"].includes(String(selectedTask.status))) && (
+                {hasSemanticFallback && (
+                  <StatusState
+                    title="当前任务出现语义回退"
+                    description={`本任务有 ${semanticFallbackCount} 条结果已自动降级为仅词法召回，结果仍可复核，但未使用语义召回能力。`}
+                    tone="warning"
+                    variant="inline"
+                    icon="warning"
+                  />
+                )}
+                {(["queued", "running", "pause_requested", "cancel_requested", "paused"].includes(String(selectedTask.status)) ||
+                  ["failed", "partial_failed", "cancelled", "completed"].includes(String(selectedTask.status))) && (
                   <div className="button-row batch-summary-actions">
-                    {["queued", "running", "cancel_requested"].includes(String(selectedTask.status)) && (
+                    {["queued", "running"].includes(String(selectedTask.status)) && (
+                      <button className="ghost-button" type="button" onClick={() => void handlePauseTask(String(selectedTask.task_id))}>暂停任务</button>
+                    )}
+                    {["paused", "pause_requested"].includes(String(selectedTask.status)) && (
+                      <button className="ghost-button warm" type="button" onClick={() => void handleResumeTask(String(selectedTask.task_id))}>继续任务</button>
+                    )}
+                    {["queued", "running", "pause_requested", "cancel_requested"].includes(String(selectedTask.status)) && (
                       <button className="ghost-button danger" type="button" onClick={() => void handleCancelTask(String(selectedTask.task_id))}>取消任务</button>
                     )}
                     {["failed", "partial_failed", "cancelled"].includes(String(selectedTask.status)) && (
                       <button className="ghost-button warm" type="button" onClick={() => void handleRetryTask(String(selectedTask.task_id))}>重试任务</button>
+                    )}
+                    {["queued", "paused", "failed", "partial_failed", "cancelled", "completed"].includes(String(selectedTask.status)) && (
+                      <button className="ghost-button danger" type="button" onClick={() => void handleDeleteTask(String(selectedTask.task_id))}>删除任务</button>
                     )}
                   </div>
                 )}
@@ -635,10 +894,22 @@ export function BatchTasksPage() {
                 <h2>当前任务结果</h2>
                 <p>查看当前任务输出的结果明细，并直接进入复核。</p>
               </div>
-              <div className="filter-chip">结果数 {selectedItems.length}</div>
+              <div className="filter-chip">结果数 {selectedItemTotal}</div>
+              <div className="filter-chip">当前展示 {filteredResultTotal}</div>
               <div className="filter-chip">高风险 {selectedHighRisk}</div>
               <div className="filter-chip">回退 {semanticFallbackCount}</div>
-              <div className="filter-chip">展示阈值 ≥ {selectedTaskCandidateDisplayScoreThreshold.toFixed(2)}</div>
+              <div className="filter-chip">已加载 {loadedResultTotal}</div>
+              <label className="batch-results-threshold-field">
+                <span>展示阈值</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={taskResultDisplayThreshold}
+                  onChange={(event) => setTaskResultDisplayThreshold(clampThreshold(Number(event.target.value)))}
+                />
+              </label>
               {hasSummaryExport ? (
                 <button className="outline-button slim" type="button" disabled={exportingKind !== null} onClick={() => void handleExport("summary")}>{exportingKind === "summary" ? "导出中..." : "摘要 CSV"}</button>
               ) : (
@@ -659,6 +930,9 @@ export function BatchTasksPage() {
                 <thead>
                   <tr>
                     <th>序号</th>
+                    <th>短剧</th>
+                    <th>集数</th>
+                    <th>作者</th>
                     <th>查询文本</th>
                     <th>Top1 书名</th>
                     <th>章节</th>
@@ -671,41 +945,57 @@ export function BatchTasksPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {visibleSelectedItems.map((item) => (
-                    <tr key={String(item.result_id)}>
-                      <td>{item.item_order}</td>
-                      <td>
-                        <div className="batch-result-query-cell">
-                          <span>{item.query_text_preview}</span>
-                          <small>耗时：{formatItemDuration(item.duration_seconds)}</small>
-                        </div>
-                      </td>
-                      <td>{item.top1_book_name || "-"}</td>
-                      <td>{item.top1_chapter_name || "-"}</td>
-                      <td><span className="soft-tag">{formatReviewLabel(String(item.top1_review_label || ""))}</span></td>
-                      <td><span className="soft-tag muted">{formatConfidenceLabel(String(item.top1_confidence_label || ""))}</span></td>
-                      <td>
-                        <div className="score-with-bar">
-                          <span>{item.top1_fine_score === null ? "-" : Number(item.top1_fine_score).toFixed(2)}</span>
-                          <div className="mini-bar"><span style={{ width: `${Math.min((Number(item.top1_fine_score) || 0) * 100, 100)}%` }} /></div>
-                        </div>
-                      </td>
-                      <td><span className="semantic-chip">{formatSemanticStatusLabel(String(item.semantic_status || ""))}</span></td>
-                      <td><span className={`status-pill ${item.status}`}>{formatTaskStatusLabel(String(item.status || ""))}</span></td>
-                      <td>
-                        <Link
-                          className="text-button"
-                          to={buildReviewPath({
-                            taskId: item.task_id,
-                            resultId: item.result_id,
-                            q: item.query_text_preview || item.top1_book_name || item.top1_chapter_name
-                          })}
-                        >
-                          去复核
-                        </Link>
+                  {visibleSelectedItems.length > 0 ? (
+                    visibleSelectedItems.map((item) => (
+                      <tr key={String(item.result_id)}>
+                        <td>{item.item_order}</td>
+                        <td>{item.source_short_drama || "-"}</td>
+                        <td>{formatEpisodeLabel(item.source_episode)}</td>
+                        <td>{item.source_author || "-"}</td>
+                        <td>
+                          <div className="batch-result-query-cell">
+                            <span>{item.query_text_preview}</span>
+                            <small>耗时：{formatItemDuration(item.duration_seconds)}</small>
+                          </div>
+                        </td>
+                        <td>{item.top1_book_name || "-"}</td>
+                        <td>{item.top1_chapter_name || "-"}</td>
+                        <td><span className="soft-tag">{formatReviewLabel(String(item.top1_review_label || ""))}</span></td>
+                        <td><span className="soft-tag muted">{formatConfidenceLabel(String(item.top1_confidence_label || ""))}</span></td>
+                        <td>
+                          <div className="score-with-bar">
+                            <span>{item.top1_fine_score === null ? "-" : Number(item.top1_fine_score).toFixed(2)}</span>
+                            <div className="mini-bar"><span style={{ width: `${Math.min((Number(item.top1_fine_score) || 0) * 100, 100)}%` }} /></div>
+                          </div>
+                        </td>
+                        <td><span className="semantic-chip">{formatSemanticStatusLabel(String(item.semantic_status || ""))}</span></td>
+                        <td><span className={`status-pill ${item.status}`}>{formatTaskStatusLabel(String(item.status || ""))}</span></td>
+                        <td>
+                          <Link
+                            className="text-button"
+                            to={buildReviewPath({
+                              taskId: item.task_id,
+                              resultId: item.result_id,
+                              q: item.query_text_preview || item.top1_book_name || item.top1_chapter_name
+                            })}
+                          >
+                            去复核
+                          </Link>
+                        </td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={13}>
+                        <StatusState
+                          title="当前阈值下没有可显示结果"
+                          description="可以调低展示阈值，查看更多当前任务结果。"
+                          tone="info"
+                          icon="filter"
+                        />
                       </td>
                     </tr>
-                  ))}
+                  )}
                 </tbody>
               </table>
               </div>
@@ -718,10 +1008,10 @@ export function BatchTasksPage() {
               <PaginationBar
                 page={currentResultPage}
                 pageCount={resultPageCount}
-                total={selectedItems.length}
+                total={filteredResultTotal}
                 pageSize={TASK_RESULT_PAGE_SIZE}
                 itemLabel="结果"
-                onChange={setResultPage}
+                onChange={handleResultPageChange}
               />
             )}
           </article>

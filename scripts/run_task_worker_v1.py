@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--retrieval-db", default=SETTINGS.db_path)
     parser.add_argument("--export-root", default=SETTINGS.task_export_root)
     parser.add_argument("--worker-name", default=SETTINGS.task_worker_name)
+    parser.add_argument("--item-parallelism", type=int, default=SETTINGS.task_item_parallelism)
     args = parser.parse_args()
 
     SETTINGS.ensure_runtime_dirs()
@@ -35,6 +36,7 @@ def main() -> None:
             semantic_config=semantic_config,
             export_root=args.export_root,
             worker_name=args.worker_name,
+            item_parallelism=args.item_parallelism,
         )
         if task is not None:
             print(f"OK processed_task={task['task_id']} status={task['status']}")

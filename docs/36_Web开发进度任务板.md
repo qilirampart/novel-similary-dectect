@@ -211,6 +211,14 @@
 
 ## 5. 全项目优化任务板
 
+### 5.0A `rewrite` 速度优化正式收口
+
+- `已完成` `rewrite` 细比对保守提速正式应用
+  - 目标：只做可证明安全的剪枝与缓存，不改变召回排序语义
+  - 范围：`service/fine_compare.py`、`service/local_semantic_retrieval.py`、`service/semantic_retrieval.py`、`scripts/run_global_compare_v1.py`
+  - 当前结果：26 条样本回归通过，`rewrite` 未出现 Top1 漂移，smoke 测试已恢复通过
+  - 说明：这轮优化已经可以作为正式版本继续用，后续如再提速，只能在同样保守的前提下继续做
+
 ### 5.0 P0 数据正确性
 
 - `已完成` 回查未召回样本的本地上游文本链路

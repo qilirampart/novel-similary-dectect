@@ -27,6 +27,33 @@ class TaskCreateResponse(BaseModel):
     source_file_name: str
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, description="Login username.")
+    password: str = Field(..., min_length=1, description="Login password.")
+
+
+class UserProfileResponse(BaseModel):
+    user: dict[str, Any]
+
+
+class CreateUserRequest(BaseModel):
+    username: str = Field(..., min_length=1, description="Unique username.")
+    password: str = Field(..., min_length=1, description="Initial password.")
+    display_name: str = Field(..., min_length=1, description="Display name.")
+    role: str = Field(default="operator", description="User role.")
+
+
+class UserListResponse(BaseModel):
+    items: list[dict[str, Any]]
+    current_user_id: int
+
+
+class UpdateUserRequest(BaseModel):
+    display_name: str = Field(..., min_length=1, description="Display name.")
+    role: Optional[str] = Field(default=None, description="Optional role update.")
+    is_active: Optional[bool] = Field(default=None, description="Optional active flag update.")
+
+
 class TaskListResponse(BaseModel):
     items: list[dict[str, Any]]
     limit: int
@@ -38,6 +65,8 @@ class TaskDetailResponse(BaseModel):
     items: list[dict[str, Any]]
     item_limit: int
     item_offset: int
+    item_total: int
+    result_stats: dict[str, int]
 
 
 class BasicTaskResponse(BaseModel):
@@ -52,6 +81,14 @@ class ResultListResponse(BaseModel):
     items: list[dict[str, Any]]
     limit: int
     offset: int
+    total: Optional[int] = None
+    stats: Optional[dict[str, int]] = None
+
+
+class BulkActionResponse(BaseModel):
+    status: str
+    affected_count: int
+    message: str
 
 
 class CompareReviewRequest(BaseModel):

@@ -69,7 +69,7 @@ class ApiSettings:
     semantic_chapter_top_k: int = int(os.environ.get("NOVEL_SEMANTIC_CHAPTER_TOP_K", "0"))
     semantic_chunk_top_k: int = int(os.environ.get("NOVEL_SEMANTIC_CHUNK_TOP_K", "12"))
     semantic_score_threshold: float = float(os.environ.get("NOVEL_SEMANTIC_SCORE_THRESHOLD", "0.0"))
-    candidate_display_score_threshold: float = float(os.environ.get("NOVEL_CANDIDATE_DISPLAY_SCORE_THRESHOLD", "0.10"))
+    candidate_display_score_threshold: float = float(os.environ.get("NOVEL_CANDIDATE_DISPLAY_SCORE_THRESHOLD", "0.01"))
     cors_allowed_origins: str = os.environ.get(
         "NOVEL_SIMILARITY_CORS_ALLOWED_ORIGINS",
         "http://127.0.0.1:4175,http://localhost:4175",
@@ -77,6 +77,7 @@ class ApiSettings:
     # Keep batch tasks consumable even when the API is started directly without the helper script.
     auto_worker_enabled: bool = _env_bool("NOVEL_SIMILARITY_AUTOSTART_WORKER", "1")
     auto_worker_poll_seconds: float = float(os.environ.get("NOVEL_SIMILARITY_AUTOWORKER_POLL_SECONDS", "2.0"))
+    task_item_parallelism: int = int(os.environ.get("NOVEL_SIMILARITY_TASK_ITEM_PARALLELISM", "2"))
 
     def ensure_runtime_dirs(self) -> None:
         Path(self.task_upload_root).mkdir(parents=True, exist_ok=True)

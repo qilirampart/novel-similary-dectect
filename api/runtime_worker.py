@@ -31,6 +31,7 @@ def _run_worker_loop(stop_event: threading.Event) -> None:
                 semantic_config=semantic_config,
                 export_root=SETTINGS.task_export_root,
                 worker_name=worker_name,
+                item_parallelism=SETTINGS.task_item_parallelism,
             )
             if task is None:
                 stop_event.wait(poll_seconds)

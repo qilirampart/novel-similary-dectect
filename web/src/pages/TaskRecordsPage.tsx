@@ -1,14 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { cancelTask, downloadTaskExport, getTaskDetail, listTasks, retryTask } from "../api";
+import { cancelTask, deleteTask, downloadTaskExport, getTaskDetail, listTasks, pauseTask, resumeTask, retryTask } from "../api";
 import { formatDetectionModeLabel, formatTaskMessage, formatTaskStatusLabel, formatTaskTypeLabel } from "../displayText";
 import { PaginationBar } from "../PaginationBar";
 import { StatusState } from "../StatusState";
+import { formatTaskEta, formatTaskProgressDetail } from "../taskProgress";
 import { buildReviewPath } from "../workflowLinks";
 
-const CANCELABLE_STATUSES = ["queued", "running", "cancel_requested"];
+const CANCELABLE_STATUSES = ["queued", "running", "pause_requested", "cancel_requested"];
+const PAUSABLE_STATUSES = ["queued", "running"];
+const RESUMABLE_STATUSES = ["paused", "pause_requested"];
 const RETRYABLE_STATUSES = ["failed", "partial_failed", "cancelled"];
+const DELETABLE_STATUSES = ["queued", "paused", "failed", "partial_failed", "cancelled", "completed"];
 const TASK_RECORD_PAGE_SIZE = 8;
 
 function countTasksByStatuses(tasks: Record<string, any>[], statuses: string[]) {
@@ -107,6 +111,39 @@ export function TaskRecordsPage() {
     }
   }
 
+  async function handlePauseTask(taskId: string) {
+    try {
+      setError("");
+      await pauseTask(taskId);
+      await loadTasks(taskId);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "暂停任务失败");
+      setIsLoading(false);
+    }
+  }
+
+  async function handleResumeTask(taskId: string) {
+    try {
+      setError("");
+      await resumeTask(taskId);
+      await loadTasks(taskId);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "继续任务失败");
+      setIsLoading(false);
+    }
+  }
+
+  async function handleDeleteTask(taskId: string) {
+    try {
+      setError("");
+      await deleteTask(taskId);
+      await loadTasks();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "删除任务失败");
+      setIsLoading(false);
+    }
+  }
+
   async function handleExport(kind: "summary" | "review") {
     if (!selectedTask) return;
     setError("");
@@ -136,7 +173,10 @@ export function TaskRecordsPage() {
 
   const selectedTaskStatus = String(selectedTask?.status ?? "");
   const canCancelTask = CANCELABLE_STATUSES.includes(selectedTaskStatus);
+  const canPauseTask = PAUSABLE_STATUSES.includes(selectedTaskStatus);
+  const canResumeTask = RESUMABLE_STATUSES.includes(selectedTaskStatus);
   const canRetryTask = RETRYABLE_STATUSES.includes(selectedTaskStatus);
+  const canDeleteTask = DELETABLE_STATUSES.includes(selectedTaskStatus);
   const hasSummaryExport = Boolean(selectedTask?.summary_export_path);
   const hasReviewExport = Boolean(selectedTask?.review_export_path);
   const taskPageCount = Math.max(Math.ceil(tasks.length / TASK_RECORD_PAGE_SIZE), 1);
@@ -204,6 +244,7 @@ export function TaskRecordsPage() {
                   <th>创建时间</th>
                   <th>完成时间</th>
                   <th>状态</th>
+                  <th>进度</th>
                   <th>接收数</th>
                   <th>失败数</th>
                   <th>导出</th>
@@ -225,6 +266,7 @@ export function TaskRecordsPage() {
                       <td>{item.created_at || "-"}</td>
                       <td>{item.finished_at || "-"}</td>
                       <td><span className={`status-pill ${item.status}`}>{formatTaskStatusLabel(String(item.status ?? ""))}</span></td>
+                      <td>{String(item.status ?? "") === "running" ? `${formatTaskProgressDetail(item)} · ${formatTaskEta(item)}` : formatTaskProgressDetail(item)}</td>
                       <td>{item.counts?.accepted ?? "-"}</td>
                       <td>{item.counts?.failed ?? 0}</td>
                       <td>{item.summary_export_path ? "已就绪" : "-"}</td>
@@ -272,6 +314,8 @@ export function TaskRecordsPage() {
                   <div><span>接收数</span><strong>{selectedTask.counts?.accepted ?? 0}</strong></div>
                   <div><span>完成数</span><strong>{selectedTask.counts?.completed ?? 0}</strong></div>
                   <div><span>失败数</span><strong>{selectedTask.counts?.failed ?? 0}</strong></div>
+                  <div><span>当前进度</span><strong>{formatTaskProgressDetail(selectedTask)}</strong></div>
+                  <div><span>预计剩余</span><strong>{CANCELABLE_STATUSES.includes(selectedTaskStatus) ? formatTaskEta(selectedTask) : "-"}</strong></div>
                   <div><span>top_k</span><strong>{selectedTask.params?.top_k ?? "-"}</strong></div>
                   <div><span>compare_top_k</span><strong>{selectedTask.params?.compare_top_k ?? "-"}</strong></div>
                   <div><span>merged_top_k</span><strong>{selectedTask.params?.merged_top_k ?? "-"}</strong></div>
@@ -285,9 +329,24 @@ export function TaskRecordsPage() {
                       取消任务
                     </button>
                   )}
+                  {canPauseTask && (
+                    <button className="ghost-button" type="button" onClick={() => void handlePauseTask(String(selectedTask.task_id))}>
+                      暂停任务
+                    </button>
+                  )}
+                  {canResumeTask && (
+                    <button className="ghost-button warm" type="button" onClick={() => void handleResumeTask(String(selectedTask.task_id))}>
+                      继续任务
+                    </button>
+                  )}
                   {canRetryTask && (
                     <button className="ghost-button warm" type="button" onClick={() => void handleRetryTask(String(selectedTask.task_id))}>
                       重试任务
+                    </button>
+                  )}
+                  {canDeleteTask && (
+                    <button className="ghost-button danger" type="button" onClick={() => void handleDeleteTask(String(selectedTask.task_id))}>
+                      删除任务
                     </button>
                   )}
                   {hasSummaryExport ? (

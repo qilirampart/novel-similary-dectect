@@ -1,6 +1,7 @@
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { useMemo, useState } from "react";
 
+import { useAuth } from "./auth";
 import { Icon } from "./icons";
 import type { NavItem, TopNavItem } from "./types";
 
@@ -30,12 +31,26 @@ function matchesPath(target: string, current: string) {
 
 export function AppLayout() {
   const location = useLocation();
+  const { user, logoutAction } = useAuth();
   const [collapsed, setCollapsed] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
 
   const currentTopNav = useMemo(
     () => topNavItems.find((item) => matchesPath(item.path, location.pathname)),
     [location.pathname]
   );
+
+  async function handleLogout() {
+    setLoggingOut(true);
+    try {
+      await logoutAction();
+    } finally {
+      setLoggingOut(false);
+    }
+  }
+
+  const displayName = user?.display_name || user?.username || "当前用户";
+  const initials = displayName.slice(0, 1).toUpperCase();
 
   return (
     <div className={`app-shell${collapsed ? " is-collapsed" : ""}`}>
@@ -75,10 +90,6 @@ export function AppLayout() {
               </NavLink>
             ))}
           </div>
-          <button className="nav-footer-button" type="button">
-            <Icon name="arrow" className="nav-icon rotate-180" />
-            {!collapsed && <span>收起导航</span>}
-          </button>
         </nav>
       </aside>
 
@@ -97,21 +108,20 @@ export function AppLayout() {
             ))}
           </nav>
           <div className="topbar-meta">
-            <button className="icon-button with-badge" type="button">
-              <Icon name="bell" />
-              <span className="badge-dot">3</span>
-            </button>
             <div className="org-switcher">
               <span className="org-main">相似度比对控制台</span>
               <span className="org-sub">{currentTopNav?.label ?? "总览看板"}</span>
             </div>
             <div className="user-chip">
-              <div className="user-avatar">A</div>
+              <div className="user-avatar">{initials || "U"}</div>
               <div>
-                <div className="user-name">web-ui</div>
-                <div className="user-role">操作员</div>
+                <div className="user-name">{displayName}</div>
+                <div className="user-role">{user?.role === "admin" ? "管理员" : "操作员"}</div>
               </div>
             </div>
+            <button className="ghost-button slim" type="button" onClick={() => void handleLogout()} disabled={loggingOut}>
+              {loggingOut ? "退出中..." : "退出登录"}
+            </button>
           </div>
         </header>
         <main className="page-shell">

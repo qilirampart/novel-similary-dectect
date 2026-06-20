@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 
 import { compareSingle, type DetectionMode } from "../api";
 import { formatConfidenceLabel, formatMetricLabel, formatReviewLabel, formatSemanticStatusLabel } from "../displayText";
+import { buildEvidenceHighlightRanges, renderHighlightedEvidence } from "../evidenceHighlight";
 import { Icon } from "../icons";
 import { StatusState } from "../StatusState";
 
@@ -10,7 +11,7 @@ const sampleText = `女主在婚礼前夜突然失踪，男主顺着她留下的
 当表面的甜宠关系开始露出裂缝，真正危险的不是爱情本身，而是谁在操控这段爱情叙事。`;
 
 const CANDIDATE_PAGE_SIZE = 5;
-const DEFAULT_CANDIDATE_DISPLAY_SCORE_THRESHOLD = 0.1;
+const DEFAULT_CANDIDATE_DISPLAY_SCORE_THRESHOLD = 0.01;
 
 type MetricRow = {
   label: string;
@@ -48,7 +49,7 @@ function clampThreshold(value: number): number {
 }
 
 export function SingleComparePage() {
-  const [rewriteEnabled, setRewriteEnabled] = useState(false);
+  const [rewriteEnabled, setRewriteEnabled] = useState(true);
   const [text, setText] = useState(sampleText);
   const [topK, setTopK] = useState(10);
   const [compareTopK, setCompareTopK] = useState(50);
@@ -79,6 +80,18 @@ export function SingleComparePage() {
   const visibleCandidates = displayCandidates.slice(candidatePageStart, candidatePageStart + CANDIDATE_PAGE_SIZE);
   const selectedResult = displayCandidates[selectedIndex] ?? displayCandidates[0] ?? null;
   const selectedMatch = selectedResult?.best_match as Record<string, any> | undefined;
+  const matchedSubstring = String(selectedMatch?.matched_substring || "").trim();
+  const queryEvidenceText = text || selectedMatch?.query_text || selectedMatch?.query_text_preview || "-";
+  const candidateEvidenceText =
+    selectedMatch?.candidate_review_context_text ||
+    selectedMatch?.candidate_text_full ||
+    selectedMatch?.candidate_text ||
+    selectedMatch?.candidate_text_preview ||
+    "-";
+  const evidenceHighlight = useMemo(
+    () => buildEvidenceHighlightRanges(queryEvidenceText, candidateEvidenceText, matchedSubstring),
+    [candidateEvidenceText, matchedSubstring, queryEvidenceText]
+  );
 
   const metrics = useMemo(
     () => [
@@ -88,6 +101,8 @@ export function SingleComparePage() {
     ],
     [displayCandidates.length, mode, result, rewriteEnabled, semanticStatus]
   );
+  const isSemanticFallback = mode === "rewrite" && semanticStatus === "fallback_lexical_only";
+  const semanticFallbackMessage = String(result?.rewrite_detection?.message || "").trim();
 
   const evidenceMetrics: MetricRow[] = selectedMatch
     ? [
@@ -224,6 +239,16 @@ export function SingleComparePage() {
               />
             )}
 
+            {isSemanticFallback && (
+              <StatusState
+                title="改写检测已降级为仅词法召回"
+                description={semanticFallbackMessage || "当前已自动回退为仅词法召回，本次结果仍可查看，但未使用语义召回能力。"}
+                tone="warning"
+                variant="inline"
+                icon="warning"
+              />
+            )}
+
             <details className="single-advanced-panel">
               <summary>高级参数</summary>
               <div className="parameter-panel single-parameter-panel">
@@ -276,11 +301,11 @@ export function SingleComparePage() {
                 <div className="single-evidence-preview-stack">
                   <article className="evidence-card single-evidence-card">
                     <span className="single-evidence-label">查询文本</span>
-                    <p>{selectedMatch.query_text || selectedMatch.query_text_preview || text}</p>
+                    <p>{renderHighlightedEvidence(queryEvidenceText, evidenceHighlight.queryRanges, "single-query")}</p>
                   </article>
                   <article className="evidence-card highlighted single-evidence-card">
                     <span className="single-evidence-label">候选文本</span>
-                    <p>{selectedMatch.candidate_text || selectedMatch.candidate_text_preview || "-"}</p>
+                    <p>{renderHighlightedEvidence(candidateEvidenceText, evidenceHighlight.candidateRanges, "single-candidate")}</p>
                   </article>
                 </div>
 
@@ -467,11 +492,11 @@ export function SingleComparePage() {
               <div className="single-evidence-modal-grid">
                 <article className="evidence-card single-evidence-modal-card">
                   <span className="single-evidence-label">查询文本</span>
-                  <p>{selectedMatch.query_text || selectedMatch.query_text_preview || text}</p>
+                  <p>{renderHighlightedEvidence(queryEvidenceText, evidenceHighlight.queryRanges, "single-modal-query")}</p>
                 </article>
                 <article className="evidence-card highlighted single-evidence-modal-card">
                   <span className="single-evidence-label">候选文本</span>
-                  <p>{selectedMatch.candidate_text || selectedMatch.candidate_text_preview || "-"}</p>
+                  <p>{renderHighlightedEvidence(candidateEvidenceText, evidenceHighlight.candidateRanges, "single-modal-candidate")}</p>
                 </article>
               </div>
 

@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import csv
 import glob
-import sqlite3
 from datetime import datetime
 from pathlib import Path
+
+try:
+    from pysqlite3 import dbapi2 as sqlite3  # type: ignore
+except Exception:
+    import sqlite3
 
 
 def pick_manifest(explicit: str | None) -> Path:

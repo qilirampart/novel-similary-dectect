@@ -28,6 +28,8 @@ snapshots/
 *.jpg
 *.jpeg
 *.zip
+*.tar.gz
+*.tgz
 *.sqlite3
 *.db
 ~$*.xlsx
@@ -35,3 +37,5 @@ snapshots/
 .qdrant-initialized
 review-net.txt
 .env.local.ps1
+.deploy_stage/
+third_party/

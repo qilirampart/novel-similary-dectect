@@ -1,6 +1,8 @@
 const TASK_STATUS_LABELS: Record<string, string> = {
   queued: "排队中",
   running: "执行中",
+  paused: "已暂停",
+  pause_requested: "暂停中",
   completed: "已完成",
   failed: "失败",
   partial_failed: "部分失败",
@@ -173,6 +175,9 @@ export function formatSystemHint(value: string): string {
   const evidenceMatch = normalized.match(/^Evidence windows\s+(.+)$/);
   if (evidenceMatch) return `证据窗 ${evidenceMatch[1]}`;
 
+  const queuePausedMatch = normalized.match(/^Queued\s+(.+?)\s*\/\s*Paused\s+(.+?)\s*\/\s*Total\s+(.+)$/);
+  if (queuePausedMatch) return `排队 ${queuePausedMatch[1]} / 暂停 ${queuePausedMatch[2]} / 总数 ${queuePausedMatch[3]}`;
+
   const queueMatch = normalized.match(/^Queued\s+(.+?)\s*\/\s*Total\s+(.+)$/);
   if (queueMatch) return `排队 ${queueMatch[1]} / 总数 ${queueMatch[2]}`;
 
@@ -192,17 +197,35 @@ export function formatTaskMessage(value: string): string {
   if (normalized === "Task claimed by worker. Parsing input file.") return "任务已被 Worker 接手，正在解析输入文件。";
   if (normalized === "Task execution failed with an unhandled exception.") return "任务执行时发生未处理异常。";
   if (normalized === "Task cancelled during execution.") return "任务在执行过程中已取消。";
+  if (normalized === "task paused from api") return "任务已收到暂停请求。";
+  if (normalized === "task resumed from api") return "任务已继续，重新进入队列。";
+  if (normalized === "task deleted from api") return "任务已删除。";
+  if (normalized === "task paused before execution") return "任务已在执行前暂停。";
+  if (normalized === "task pause requested") return "任务正在暂停，等待当前执行项结束。";
+  if (normalized === "task resumed and returned to queue") return "任务已继续，等待 Worker 重新领取。";
+  if (normalized === "task pause request revoked and execution resumed") return "任务已继续，本轮暂停请求已取消。";
   if (normalized === "Input file contains no executable text.") return "输入文件中没有可执行文本。";
   if (normalized === "Input file is missing and the task cannot be executed.") return "输入文件缺失，任务无法执行。";
 
   const parsedMatch = normalized.match(/^Parsed input file with (\d+) pending text items\.$/);
   if (parsedMatch) return `输入文件解析完成，共有 ${parsedMatch[1]} 条待处理文本。`;
 
+  const resumedMatch = normalized.match(/^Resumed task with (\d+) remaining text items\.$/);
+  if (resumedMatch) return `任务已继续，剩余 ${resumedMatch[1]} 条待处理文本。`;
+
   const processingMatch = normalized.match(/^Processing item (\d+)\/(\d+)\.$/);
   if (processingMatch) return `正在处理第 ${processingMatch[1]}/${processingMatch[2]} 条。`;
 
+  const processingInFlightMatch = normalized.match(/^Processing item (\d+)\/(\d+)\. In flight (\d+)\.$/);
+  if (processingInFlightMatch) {
+    return `正在处理第 ${processingInFlightMatch[1]}/${processingInFlightMatch[2]} 条，并发中 ${processingInFlightMatch[3]} 条。`;
+  }
+
   const completedMatch = normalized.match(/^Task completed successfully\. Processed (\d+) items\.$/);
   if (completedMatch) return `任务已完成，共处理 ${completedMatch[1]} 条。`;
+
+  const pausedMatch = normalized.match(/^Task paused\. Processed (\d+)\/(\d+) items\.$/);
+  if (pausedMatch) return `任务已暂停，已处理 ${pausedMatch[1]}/${pausedMatch[2]} 条。`;
 
   const partialFailedMatch = normalized.match(/^Task completed with partial failure\. (\d+)\/(\d+) items failed\.$/);
   if (partialFailedMatch) return `任务已完成，但有部分失败，${partialFailedMatch[1]}/${partialFailedMatch[2]} 条处理失败。`;

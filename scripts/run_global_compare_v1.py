@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import io
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -21,6 +22,34 @@ from service.semantic_retrieval import (
     DEFAULT_REMOTE_EMBEDDING_BACKEND,
     SemanticRetrievalConfig,
 )
+
+
+def _configure_stdio() -> None:
+    # Keep UTF-8 in interactive terminals, but leave piped/captured output alone
+    # so subprocess callers can decode it with the active locale.
+    if sys.stdout.isatty():
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
+        else:
+            sys.stdout = io.TextIOWrapper(
+                sys.stdout.buffer,
+                encoding="utf-8",
+                errors="replace",
+                line_buffering=True,
+            )
+    if sys.stderr.isatty():
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)
+        else:
+            sys.stderr = io.TextIOWrapper(
+                sys.stderr.buffer,
+                encoding="utf-8",
+                errors="replace",
+                line_buffering=True,
+            )
+
+
+_configure_stdio()
 
 
 def load_query_text(query_text: str, query_file: str) -> str:

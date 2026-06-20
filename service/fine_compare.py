@@ -41,11 +41,47 @@ def _empty_score_payload() -> dict[str, float | str]:
     }
 
 
+def _sequence_match_metrics(
+    query_scoring: str,
+    candidate_scoring: str,
+    matcher: SequenceMatcher | None = None,
+) -> tuple[float, int, str]:
+    matcher = matcher or SequenceMatcher(a=query_scoring, b=candidate_scoring)
+    if matcher is not None and (matcher.a != query_scoring or matcher.b != candidate_scoring):
+        matcher.set_seqs(query_scoring, candidate_scoring)
+    matching_blocks = matcher.get_matching_blocks()
+    total_matched = 0
+    longest_match_len = 0
+    longest_match_start = 0
+    for block in matching_blocks:
+        size = int(block.size)
+        total_matched += size
+        if size > longest_match_len:
+            longest_match_len = size
+            longest_match_start = int(block.a)
+
+    total_length = len(query_scoring) + len(candidate_scoring)
+    sequence_ratio = (2.0 * total_matched / total_length) if total_length > 0 else 0.0
+    matched_substring = (
+        query_scoring[longest_match_start : longest_match_start + longest_match_len]
+        if longest_match_len > 0
+        else ""
+    )
+    return sequence_ratio, longest_match_len, matched_substring
+
+
 def _prepare_scoring_text(text: str, ngram_size: int) -> tuple[str, set[str]]:
     scoring_text = normalize_scoring_text(text)
     if not scoring_text:
         return "", set()
     return scoring_text, set(ordered_unique_ngrams(scoring_text, ngram_size))
+
+
+def _max_possible_sequence_ratio(query_len: int, candidate_len: int) -> float:
+    total = query_len + candidate_len
+    if total <= 0:
+        return 0.0
+    return 2.0 * min(query_len, candidate_len) / total
 
 
 def _prepare_windows(
@@ -70,6 +106,166 @@ def _prepare_windows(
             }
         )
     return prepared
+
+
+def _match_priority_key(
+    *,
+    score: float,
+    exact_substring_hit: bool,
+    longest_match_ratio: float,
+    ngram_recall: float,
+    sequence_ratio: float,
+    jaccard: float,
+    query_scoring_len: int,
+    candidate_scoring_len: int,
+    candidate_start_offset: int,
+) -> tuple[float, int, float, float, float, float, int, int]:
+    return (
+        float(score),
+        1 if exact_substring_hit else 0,
+        float(longest_match_ratio),
+        float(ngram_recall),
+        float(sequence_ratio),
+        float(jaccard),
+        -abs(int(query_scoring_len) - int(candidate_scoring_len)),
+        -int(candidate_start_offset),
+    )
+
+
+def _match_upper_bound_key(
+    *,
+    query_scoring: str,
+    query_grams: set[str],
+    candidate_scoring: str,
+    candidate_grams: set[str],
+    ngram_size: int,
+    sequence_ratio_upper: float,
+    candidate_start_offset: int,
+) -> tuple[float, int, float, float, float, float, int, int]:
+    if not query_scoring or not candidate_scoring or not query_grams or not candidate_grams:
+        return _match_priority_key(
+            score=0.0,
+            exact_substring_hit=False,
+            longest_match_ratio=0.0,
+            ngram_recall=0.0,
+            sequence_ratio=0.0,
+            jaccard=0.0,
+            query_scoring_len=len(query_scoring),
+            candidate_scoring_len=len(candidate_scoring),
+            candidate_start_offset=candidate_start_offset,
+        )
+
+    query_len = len(query_scoring)
+    candidate_len = len(candidate_scoring)
+    shorter_len = min(query_len, candidate_len)
+    longer_len = max(query_len, candidate_len)
+    intersection_size = len(query_grams & candidate_grams)
+    if intersection_size <= 0:
+        return _match_priority_key(
+            score=0.0,
+            exact_substring_hit=False,
+            longest_match_ratio=0.0,
+            ngram_recall=0.0,
+            sequence_ratio=0.0,
+            jaccard=0.0,
+            query_scoring_len=query_len,
+            candidate_scoring_len=candidate_len,
+            candidate_start_offset=candidate_start_offset,
+        )
+
+    ngram_recall = intersection_size / len(query_grams)
+    ngram_precision = intersection_size / len(candidate_grams)
+    union_size = len(query_grams | candidate_grams)
+    jaccard = intersection_size / union_size if union_size else 0.0
+    length_ratio = shorter_len / longer_len if longer_len > 0 else 0.0
+    sequence_ratio = max(0.0, min(1.0, float(sequence_ratio_upper)))
+    longest_match_len_upper = min(query_len, candidate_len, intersection_size + max(0, ngram_size - 1))
+    longest_match_ratio = longest_match_len_upper / query_len if query_len > 0 else 0.0
+    longest_match_precision = longest_match_len_upper / candidate_len if candidate_len > 0 else 0.0
+    exact_substring_hit = query_scoring in candidate_scoring
+
+    score = (
+        0.30 * longest_match_ratio
+        + 0.25 * ngram_recall
+        + 0.10 * ngram_precision
+        + 0.10 * jaccard
+        + 0.10 * sequence_ratio
+        + 0.05 * length_ratio
+        + 0.10 * longest_match_precision
+    )
+    if exact_substring_hit:
+        score += 0.15
+
+    return _match_priority_key(
+        score=min(score, 1.0),
+        exact_substring_hit=exact_substring_hit,
+        longest_match_ratio=longest_match_ratio,
+        ngram_recall=ngram_recall,
+        sequence_ratio=sequence_ratio,
+        jaccard=jaccard,
+        query_scoring_len=query_len,
+        candidate_scoring_len=candidate_len,
+        candidate_start_offset=candidate_start_offset,
+    )
+
+
+def _candidate_can_beat_current_best(
+    *,
+    query_scoring: str,
+    query_grams: set[str],
+    candidate_scoring: str,
+    candidate_grams: set[str],
+    current_best_key: tuple[float, int, float, float, float, float, int, int] | None,
+    candidate_start_offset: int,
+) -> bool:
+    if current_best_key is None:
+        return True
+    if not query_scoring or not candidate_scoring or not query_grams or not candidate_grams:
+        return False
+
+    query_len = len(query_scoring)
+    candidate_len = len(candidate_scoring)
+    if query_len <= 0 or candidate_len <= 0:
+        return False
+
+    intersection_size = len(query_grams & candidate_grams)
+    if intersection_size <= 0:
+        return False
+
+    ngram_recall = intersection_size / len(query_grams)
+    ngram_precision = intersection_size / len(candidate_grams)
+    union_size = len(query_grams | candidate_grams)
+    jaccard = intersection_size / union_size if union_size else 0.0
+    length_ratio = min(query_len, candidate_len) / max(query_len, candidate_len)
+    longest_match_ratio_upper = min(1.0, intersection_size / query_len)
+    longest_match_precision_upper = min(1.0, intersection_size / candidate_len)
+    sequence_ratio_upper = _max_possible_sequence_ratio(query_len, candidate_len)
+
+    score_upper = (
+        0.30 * longest_match_ratio_upper
+        + 0.25 * ngram_recall
+        + 0.10 * ngram_precision
+        + 0.10 * jaccard
+        + 0.10 * sequence_ratio_upper
+        + 0.05 * length_ratio
+        + 0.10 * longest_match_precision_upper
+    )
+    if query_scoring in candidate_scoring:
+        score_upper += 0.15
+    score_upper = min(score_upper, 1.0)
+
+    upper_key = _match_priority_key(
+        score=score_upper,
+        exact_substring_hit=query_scoring in candidate_scoring,
+        longest_match_ratio=longest_match_ratio_upper,
+        ngram_recall=ngram_recall,
+        sequence_ratio=sequence_ratio_upper,
+        jaccard=jaccard,
+        query_scoring_len=query_len,
+        candidate_scoring_len=candidate_len,
+        candidate_start_offset=candidate_start_offset,
+    )
+    return upper_key > current_best_key
 
 
 def classify_confidence(
@@ -122,17 +318,16 @@ def score_text_pair(query_text: str, candidate_text: str, ngram_size: int = 3) -
     ngram_recall = intersection_size / len(query_grams)
     ngram_precision = intersection_size / len(candidate_grams)
     jaccard = intersection_size / union_size if union_size else 0.0
-    matcher = SequenceMatcher(a=query_scoring, b=candidate_scoring)
-    sequence_ratio = matcher.ratio()
+    sequence_ratio, longest_match_len, matched_substring = _sequence_match_metrics(
+        query_scoring=query_scoring,
+        candidate_scoring=candidate_scoring,
+    )
     length_ratio = min(len(query_scoring), len(candidate_scoring)) / max(
         len(query_scoring),
         len(candidate_scoring),
     )
-    longest_match = matcher.find_longest_match(0, len(query_scoring), 0, len(candidate_scoring))
-    longest_match_len = longest_match.size
     longest_match_ratio = longest_match_len / len(query_scoring)
     longest_match_precision = longest_match_len / len(candidate_scoring)
-    matched_substring = query_scoring[longest_match.a : longest_match.a + longest_match_len]
     exact_substring_hit = query_scoring in candidate_scoring
     structural_rewrite_hit = (
         sequence_ratio >= 0.90
@@ -190,26 +385,29 @@ def _score_prepared_text_pair(
     query_grams: set[str],
     candidate_scoring: str,
     candidate_grams: set[str],
+    matcher: SequenceMatcher | None = None,
 ) -> dict[str, float | str]:
     if not query_grams or not candidate_grams or not query_scoring or not candidate_scoring:
         return _empty_score_payload()
 
     intersection_size = len(query_grams & candidate_grams)
+    if intersection_size <= 0:
+        return _empty_score_payload()
     union_size = len(query_grams | candidate_grams)
     ngram_recall = intersection_size / len(query_grams)
     ngram_precision = intersection_size / len(candidate_grams)
     jaccard = intersection_size / union_size if union_size else 0.0
-    matcher = SequenceMatcher(a=query_scoring, b=candidate_scoring)
-    sequence_ratio = matcher.ratio()
+    sequence_ratio, longest_match_len, matched_substring = _sequence_match_metrics(
+        query_scoring=query_scoring,
+        candidate_scoring=candidate_scoring,
+        matcher=matcher,
+    )
     length_ratio = min(len(query_scoring), len(candidate_scoring)) / max(
         len(query_scoring),
         len(candidate_scoring),
     )
-    longest_match = matcher.find_longest_match(0, len(query_scoring), 0, len(candidate_scoring))
-    longest_match_len = longest_match.size
     longest_match_ratio = longest_match_len / len(query_scoring)
     longest_match_precision = longest_match_len / len(candidate_scoring)
-    matched_substring = query_scoring[longest_match.a : longest_match.a + longest_match_len]
     exact_substring_hit = query_scoring in candidate_scoring
     structural_rewrite_hit = (
         sequence_ratio >= 0.90
@@ -285,17 +483,40 @@ def find_best_window_match(
         ngram_size=ngram_size,
         preview_limit=160,
     )
+    candidate_matchers = [
+        SequenceMatcher(a="", b=str(candidate_window["scoring_text"]))
+        for candidate_window in prepared_candidate_windows
+    ]
     if not query_windows or not prepared_candidate_windows:
         return None
 
     best_match: dict[str, Any] | None = None
+    best_match_key: tuple[float, int, float, float, float, float, int, int] | None = None
     for query_window in query_windows:
-        for candidate_window in prepared_candidate_windows:
+        query_scoring = str(query_window["scoring_text"])
+        query_grams = query_window["ngrams"]
+        for candidate_window, matcher in zip(prepared_candidate_windows, candidate_matchers):
+            candidate_scoring = str(candidate_window["scoring_text"])
+            candidate_grams = candidate_window["ngrams"]
+            candidate_start_offset = int(candidate_window["start_offset"])
+
+            if not _candidate_can_beat_current_best(
+                query_scoring=query_scoring,
+                query_grams=query_grams,
+                candidate_scoring=candidate_scoring,
+                candidate_grams=candidate_grams,
+                current_best_key=best_match_key,
+                candidate_start_offset=candidate_start_offset,
+            ):
+                continue
+
+            matcher.set_seq1(query_scoring)
             metrics = _score_prepared_text_pair(
-                query_scoring=str(query_window["scoring_text"]),
-                query_grams=set(query_window["ngrams"]),
-                candidate_scoring=str(candidate_window["scoring_text"]),
-                candidate_grams=set(candidate_window["ngrams"]),
+                query_scoring=query_scoring,
+                query_grams=query_grams,
+                candidate_scoring=candidate_scoring,
+                candidate_grams=candidate_grams,
+                matcher=matcher,
             )
             current = {
                 "score": float(metrics["score"]),
@@ -317,34 +538,29 @@ def find_best_window_match(
                 "query_text": str(query_window["text"]),
                 "query_text_preview": str(query_window["text_preview"]),
                 "candidate_window_order": int(candidate_window["window_order"]),
-                "candidate_start_offset": int(candidate_window["start_offset"]),
+                "candidate_start_offset": candidate_start_offset,
                 "candidate_end_offset": int(candidate_window["end_offset"]),
                 "candidate_text": str(candidate_window["text"]),
                 "candidate_text_preview": str(candidate_window["text_preview"]),
             }
+            current_key = _match_priority_key(
+                score=float(current["score"]),
+                exact_substring_hit=bool(current["exact_substring_hit"]),
+                longest_match_ratio=float(current["longest_match_ratio"]),
+                ngram_recall=float(current["ngram_recall"]),
+                sequence_ratio=float(current["sequence_ratio"]),
+                jaccard=float(current["jaccard"]),
+                query_scoring_len=len(query_scoring),
+                candidate_scoring_len=len(candidate_scoring),
+                candidate_start_offset=candidate_start_offset,
+            )
             if best_match is None:
                 best_match = current
+                best_match_key = current_key
                 continue
-            if (
-                current["score"],
-                bool(current["exact_substring_hit"]),
-                current["longest_match_ratio"],
-                current["ngram_recall"],
-                current["sequence_ratio"],
-                current["jaccard"],
-                -abs(len(current["query_text"]) - len(current["candidate_text"])),
-                -current["candidate_start_offset"],
-            ) > (
-                best_match["score"],
-                bool(best_match["exact_substring_hit"]),
-                best_match["longest_match_ratio"],
-                best_match["ngram_recall"],
-                best_match["sequence_ratio"],
-                best_match["jaccard"],
-                -abs(len(best_match["query_text"]) - len(best_match["candidate_text"])),
-                -best_match["candidate_start_offset"],
-            ):
+            if best_match_key is None or current_key > best_match_key:
                 best_match = current
+                best_match_key = current_key
 
     if best_match is None:
         return None

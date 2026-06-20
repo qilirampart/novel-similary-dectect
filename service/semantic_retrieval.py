@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 from urllib import error, request
 import json
 import sys
@@ -180,6 +181,54 @@ def qdrant_search(
     if not isinstance(results, list):
         raise SemanticRetrievalError(f"Unexpected Qdrant response: {resp}")
     return results
+
+
+def _search_one_query_chunk(
+    *,
+    query_chunk: dict[str, Any],
+    vector: list[float],
+    effective: SemanticRetrievalConfig,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str, str]:
+    chapter_hits: list[dict[str, Any]] = []
+    chunk_hits: list[dict[str, Any]] = []
+    chapter_error = ""
+    chunk_error = ""
+
+    if effective.chapter_top_k > 0:
+        try:
+            hits = qdrant_search(
+                qdrant_url=effective.qdrant_url,
+                collection=effective.chapter_collection,
+                vector=vector,
+                limit=effective.chapter_top_k,
+                score_threshold=effective.score_threshold,
+            )
+        except SemanticRetrievalError as exc:
+            chapter_error = str(exc)
+        else:
+            for item in hits:
+                row = dict(item)
+                row["query_chunk_order"] = int(query_chunk["chunk_order"])
+                chapter_hits.append(row)
+
+    if effective.chunk_top_k > 0:
+        try:
+            hits = qdrant_search(
+                qdrant_url=effective.qdrant_url,
+                collection=effective.chunk_collection,
+                vector=vector,
+                limit=effective.chunk_top_k,
+                score_threshold=effective.score_threshold,
+            )
+        except SemanticRetrievalError as exc:
+            chunk_error = str(exc)
+        else:
+            for item in hits:
+                row = dict(item)
+                row["query_chunk_order"] = int(query_chunk["chunk_order"])
+                chunk_hits.append(row)
+
+    return chapter_hits, chunk_hits, chapter_error, chunk_error
 
 
 def fetch_chapter_metadata(
@@ -515,52 +564,39 @@ def semantic_retrieve_candidates(
     chunk_search_enabled = effective.chunk_top_k > 0
     chapter_error = ""
     chunk_error = ""
-    for query_chunk, vector in zip(query_chunks, query_vectors):
-        if chapter_search_enabled:
-            try:
-                # Long queries should not depend on the first slice only.
-                hits = qdrant_search(
-                    qdrant_url=effective.qdrant_url,
-                    collection=effective.chapter_collection,
+    search_jobs = [
+        (query_chunk, vector)
+        for query_chunk, vector in zip(query_chunks, query_vectors)
+    ]
+    if search_jobs:
+        with ThreadPoolExecutor(max_workers=min(4, len(search_jobs))) as executor:
+            futures = [
+                executor.submit(
+                    _search_one_query_chunk,
+                    query_chunk=query_chunk,
                     vector=vector,
-                    limit=effective.chapter_top_k,
-                    score_threshold=effective.score_threshold,
+                    effective=effective,
                 )
-            except SemanticRetrievalError as exc:
-                chapter_search_enabled = False
-                chapter_error = str(exc)
-                if not chunk_search_enabled:
-                    raise
-            else:
-                for item in hits:
-                    row = dict(item)
-                    row["query_chunk_order"] = int(query_chunk["chunk_order"])
-                    chapter_hits.append(row)
+                for query_chunk, vector in search_jobs
+            ]
+            for future in futures:
+                chunk_chapter_hits, chunk_chunk_hits, chunk_chapter_error, chunk_chunk_error = future.result()
+                chapter_hits.extend(chunk_chapter_hits)
+                chunk_hits.extend(chunk_chunk_hits)
+                if chunk_chapter_error and not chapter_error:
+                    chapter_error = chunk_chapter_error
+                if chunk_chunk_error and not chunk_error:
+                    chunk_error = chunk_chunk_error
 
-        if chunk_search_enabled:
-            try:
-                hits = qdrant_search(
-                    qdrant_url=effective.qdrant_url,
-                    collection=effective.chunk_collection,
-                    vector=vector,
-                    limit=effective.chunk_top_k,
-                    score_threshold=effective.score_threshold,
-                )
-            except SemanticRetrievalError as exc:
-                chunk_search_enabled = False
-                chunk_error = str(exc)
-                if not chapter_search_enabled:
-                    if chapter_error:
-                        raise SemanticRetrievalError(
-                            "Semantic recall failed for both chapter and chunk collections. "
-                            f"chapter_error={chapter_error}; chunk_error={chunk_error}"
-                        ) from exc
-                    raise
-            else:
-                for item in hits:
-                    row = dict(item)
-                    row["query_chunk_order"] = int(query_chunk["chunk_order"])
-                    chunk_hits.append(row)
+    if chapter_error and chunk_error:
+        raise SemanticRetrievalError(
+            "Semantic recall failed for both chapter and chunk collections. "
+            f"chapter_error={chapter_error}; chunk_error={chunk_error}"
+        )
+    if chapter_error and not chunk_search_enabled:
+        raise SemanticRetrievalError(chapter_error)
+    if chunk_error and not chapter_search_enabled:
+        raise SemanticRetrievalError(chunk_error)
 
     aggregated_hits = aggregate_semantic_hits(
         chapter_hits=chapter_hits,

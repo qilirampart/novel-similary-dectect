@@ -184,13 +184,15 @@ def local_semantic_retrieve_candidates(
         window_size=config.query_window_size,
         overlap_size=config.query_overlap_size,
     )
-
-    chapter_query_vector = embed_texts_local(
+    query_texts = [query_text] + [str(item["text"]) for item in query_chunks]
+    query_vectors = embed_texts_local(
         model_path=model_path,
-        texts=[query_text],
+        texts=query_texts,
         device=config.local_device,
         batch_size=config.local_encode_batch_size,
-    )[0]
+    )
+
+    chapter_query_vector = query_vectors[0]
     chapter_hits = search_local_index(
         index_dir=index_dir,
         query_vector=chapter_query_vector,
@@ -198,14 +200,8 @@ def local_semantic_retrieve_candidates(
         score_threshold=config.score_threshold,
     )
 
-    chunk_vectors = embed_texts_local(
-        model_path=model_path,
-        texts=[str(item["text"]) for item in query_chunks],
-        device=config.local_device,
-        batch_size=config.local_encode_batch_size,
-    )
     chunk_hits: list[dict[str, Any]] = []
-    for query_chunk, vector in zip(query_chunks, chunk_vectors):
+    for query_chunk, vector in zip(query_chunks, query_vectors[1:]):
         hits = search_local_index(
             index_dir=index_dir,
             query_vector=np.asarray(vector, dtype=np.float32),
