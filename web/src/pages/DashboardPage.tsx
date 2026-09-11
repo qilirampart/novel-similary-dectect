@@ -98,7 +98,9 @@ export function DashboardPage() {
     const running = tasks.filter((task) => task.status === "running").length;
     const queued = tasks.filter((task) => task.status === "queued").length;
     const highRisk = results.filter((result) => isHighRiskReviewLabel(result.top1_review_label)).length;
-    const semanticFallback = results.filter((result) => result.semantic_status === "fallback_lexical_only").length;
+    const semanticFallback = results.filter((result) =>
+      result.semantic_status === "fallback_lexical_only" || result.semantic_status === "fallback_semantic_timeout"
+    ).length;
 
     return [
       {

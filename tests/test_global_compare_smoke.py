@@ -63,6 +63,7 @@ def test_global_compare_smoke() -> None:
     assert payload["rewrite_detection"]["status"] in {
         "semantic_ready",
         "fallback_lexical_only",
+        "fallback_semantic_timeout",
     }
     assert "semantic" in payload["coarse"]
     assert payload["fine"]["compared_candidate_count"] > 0

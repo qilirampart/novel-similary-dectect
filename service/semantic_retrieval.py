@@ -60,6 +60,10 @@ class SemanticRetrievalConfig:
     local_model_path: str = ""
     local_device: str = "cpu"
     local_encode_batch_size: int = 16
+    embed_timeout_seconds: int = 30
+    embed_max_attempts: int = 2
+    embed_total_timeout_seconds: int = 15
+    qdrant_timeout_seconds: int = 30
 
 
 def http_json(
@@ -79,11 +83,18 @@ def http_json(
         with request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8")
             return json.loads(body) if body else {}
+    except TimeoutError as exc:
+        raise SemanticRetrievalError(f"Request timed out for {url}: {exc}") from exc
     except error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise SemanticRetrievalError(f"HTTP {exc.code} for {url}: {body}") from exc
     except error.URLError as exc:
         raise SemanticRetrievalError(f"Request failed for {url}: {exc}") from exc
+    except OSError as exc:
+        message = str(exc).strip()
+        if "timed out" in message.lower() or "timeout" in message.lower():
+            raise SemanticRetrievalError(f"Request timed out for {url}: {message}") from exc
+        raise SemanticRetrievalError(f"Request failed for {url}: {message}") from exc
 
 
 def clip_text(text: str, limit: int = 120) -> str:
@@ -113,14 +124,19 @@ def slice_query_semantic_chunks(
     ]
 
 
-def embed_texts(ollama_url: str, model: str, texts: list[str]) -> list[list[float]]:
+def embed_texts(
+    ollama_url: str,
+    model: str,
+    texts: list[str],
+    timeout_seconds: int,
+) -> list[list[float]]:
     if not texts:
         return []
     payload = {
         "model": model,
         "input": texts,
     }
-    resp = http_json("POST", f"{ollama_url}/api/embed", payload, timeout=600)
+    resp = http_json("POST", f"{ollama_url}/api/embed", payload, timeout=timeout_seconds)
     embeddings = resp.get("embeddings")
     if not isinstance(embeddings, list):
         raise SemanticRetrievalError(f"Unexpected Ollama response: {resp}")
@@ -137,6 +153,7 @@ def embed_texts_remote(config: SemanticRetrievalConfig, texts: list[str]) -> lis
             ollama_url=config.ollama_url,
             model=config.model,
             texts=texts,
+            timeout_seconds=config.embed_timeout_seconds,
         )
     if config.remote_embedding_backend == "gitee_api":
         try:
@@ -146,7 +163,9 @@ def embed_texts_remote(config: SemanticRetrievalConfig, texts: list[str]) -> lis
                 model=config.model,
                 texts=texts,
                 dimensions=config.gitee_dimensions,
-                timeout=600,
+                timeout=config.embed_timeout_seconds,
+                max_attempts=config.embed_max_attempts,
+                total_timeout_seconds=config.embed_total_timeout_seconds,
             )
         except GiteeEmbeddingError as exc:
             raise SemanticRetrievalError(str(exc)) from exc
@@ -160,7 +179,9 @@ def qdrant_search(
     collection: str,
     vector: list[float],
     limit: int,
+    timeout_seconds: int,
     score_threshold: float = 0.0,
+    query_filter: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
@@ -171,11 +192,13 @@ def qdrant_search(
     }
     if score_threshold > 0:
         payload["score_threshold"] = score_threshold
+    if query_filter:
+        payload["filter"] = query_filter
     resp = http_json(
         "POST",
         f"{qdrant_url}/collections/{collection}/points/search",
         payload,
-        timeout=600,
+        timeout=timeout_seconds,
     )
     results = resp.get("result")
     if not isinstance(results, list):
@@ -201,6 +224,7 @@ def _search_one_query_chunk(
                 collection=effective.chapter_collection,
                 vector=vector,
                 limit=effective.chapter_top_k,
+                timeout_seconds=effective.qdrant_timeout_seconds,
                 score_threshold=effective.score_threshold,
             )
         except SemanticRetrievalError as exc:
@@ -218,6 +242,7 @@ def _search_one_query_chunk(
                 collection=effective.chunk_collection,
                 vector=vector,
                 limit=effective.chunk_top_k,
+                timeout_seconds=effective.qdrant_timeout_seconds,
                 score_threshold=effective.score_threshold,
             )
         except SemanticRetrievalError as exc:

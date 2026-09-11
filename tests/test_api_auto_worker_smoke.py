@@ -4,6 +4,7 @@ from importlib import reload
 from io import BytesIO
 from pathlib import Path
 import sys
+import threading
 import time
 from typing import Any, Dict, Optional
 from urllib.parse import unquote
@@ -25,6 +26,165 @@ def login_as_admin(client: TestClient) -> None:
     assert response.status_code == 200
 
 
+def test_fault_diagnostics_registers_signal_handler(tmp_path: Path, monkeypatch) -> None:
+    business_db = tmp_path / "web_business_fault_diag.sqlite3"
+    retrieval_db = tmp_path / "retrieval_fault_diag.sqlite3"
+    upload_root = tmp_path / "uploads"
+    export_root = tmp_path / "exports"
+    retrieval_db.touch()
+
+    monkeypatch.setenv("NOVEL_SIMILARITY_BUSINESS_DB", str(business_db))
+    monkeypatch.setenv("NOVEL_SIMILARITY_DB", str(retrieval_db))
+    monkeypatch.setenv("NOVEL_SIMILARITY_TASK_UPLOAD_ROOT", str(upload_root))
+    monkeypatch.setenv("NOVEL_SIMILARITY_TASK_EXPORT_ROOT", str(export_root))
+    monkeypatch.setenv("NOVEL_SIMILARITY_FAULT_DIAGNOSTICS_ENABLED", "1")
+    monkeypatch.setenv("NOVEL_SIMILARITY_FAULT_DIAGNOSTICS_SIGNAL", "SIGUSR1")
+
+    import api.config as api_config
+    import api.app as api_app
+
+    reload(api_config)
+    api_app = reload(api_app)
+
+    observed_calls: list[tuple[str, int, object | None]] = []
+
+    def fake_enable(*, all_threads: bool = False) -> None:
+        observed_calls.append(("enable", int(all_threads), None))
+
+    def fake_register(signal_num: int, *, all_threads: bool = False, chain: bool = False) -> None:
+        observed_calls.append(("register", int(signal_num), (bool(all_threads), bool(chain))))
+
+    def fake_unregister(signal_num: int) -> None:
+        observed_calls.append(("unregister", int(signal_num), None))
+
+    monkeypatch.setattr(api_app.signal, "SIGUSR1", 10, raising=False)
+    monkeypatch.setattr(api_app.faulthandler, "enable", fake_enable)
+    monkeypatch.setattr(api_app.faulthandler, "register", fake_register, raising=False)
+    monkeypatch.setattr(api_app.faulthandler, "unregister", fake_unregister, raising=False)
+
+    api_app._FAULT_DIAGNOSTICS_ARMED = False
+    api_app._FAULT_DIAGNOSTICS_SIGNAL_NUM = None
+
+    api_app._configure_fault_diagnostics()
+    api_app._teardown_fault_diagnostics()
+
+    assert observed_calls == [
+        ("enable", 1, None),
+        ("unregister", 10, None),
+        ("register", 10, (True, False)),
+        ("unregister", 10, None),
+    ]
+    assert api_app._FAULT_DIAGNOSTICS_ARMED is False
+    assert api_app._FAULT_DIAGNOSTICS_SIGNAL_NUM is None
+
+
+def test_start_auto_worker_respects_worker_count(tmp_path: Path, monkeypatch) -> None:
+    business_db = tmp_path / "web_business_runtime_worker.sqlite3"
+    retrieval_db = tmp_path / "retrieval_runtime_worker.sqlite3"
+    upload_root = tmp_path / "uploads"
+    export_root = tmp_path / "exports"
+    retrieval_db.touch()
+
+    monkeypatch.setenv("NOVEL_SIMILARITY_AUTOSTART_WORKER", "1")
+    monkeypatch.setenv("NOVEL_SIMILARITY_AUTOWORKER_COUNT", "2")
+    monkeypatch.setenv("NOVEL_SIMILARITY_AUTOWORKER_POLL_SECONDS", "0.5")
+    monkeypatch.setenv("NOVEL_SIMILARITY_BUSINESS_DB", str(business_db))
+    monkeypatch.setenv("NOVEL_SIMILARITY_DB", str(retrieval_db))
+    monkeypatch.setenv("NOVEL_SIMILARITY_TASK_UPLOAD_ROOT", str(upload_root))
+    monkeypatch.setenv("NOVEL_SIMILARITY_TASK_EXPORT_ROOT", str(export_root))
+
+    import api.config as api_config
+    import api.runtime_worker as runtime_worker
+
+    reload(api_config)
+    runtime_worker = reload(runtime_worker)
+
+    observed_worker_names: set[str] = set()
+    entered_workers = 0
+    entered_lock = threading.Lock()
+    both_entered = threading.Event()
+
+    def fake_claim_next_queued_task_globally(*_args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        nonlocal entered_workers
+        with entered_lock:
+            observed_worker_names.add(str(kwargs.get("worker_name") or ""))
+            entered_workers += 1
+            if entered_workers >= 2:
+                both_entered.set()
+        time.sleep(0.05)
+        return None
+
+    monkeypatch.setattr(runtime_worker, "claim_next_queued_task_globally", fake_claim_next_queued_task_globally)
+
+    handle = runtime_worker.start_auto_worker()
+    assert handle is not None
+    assert len(handle.threads) == 2
+    assert both_entered.wait(timeout=3)
+
+    runtime_worker.stop_auto_worker(handle)
+
+    assert observed_worker_names == {
+        "local-worker-api-auto-1",
+        "local-worker-api-auto-2",
+    }
+    assert all(not thread.is_alive() for thread in handle.threads)
+
+
+def test_start_auto_worker_runs_periodic_recovery_sweep(tmp_path: Path, monkeypatch) -> None:
+    business_db = tmp_path / "web_business_runtime_recovery.sqlite3"
+    retrieval_db = tmp_path / "retrieval_runtime_recovery.sqlite3"
+    upload_root = tmp_path / "uploads"
+    export_root = tmp_path / "exports"
+    retrieval_db.touch()
+
+    monkeypatch.setenv("NOVEL_SIMILARITY_AUTOSTART_WORKER", "1")
+    monkeypatch.setenv("NOVEL_SIMILARITY_AUTOWORKER_COUNT", "1")
+    monkeypatch.setenv("NOVEL_SIMILARITY_AUTOWORKER_POLL_SECONDS", "0.5")
+    monkeypatch.setenv("NOVEL_SIMILARITY_TASK_RECOVERY_SWEEP_SECONDS", "0.05")
+    monkeypatch.setenv("NOVEL_SIMILARITY_TASK_RECOVERY_STALE_SECONDS", "33")
+    monkeypatch.setenv("NOVEL_SIMILARITY_BUSINESS_DB", str(business_db))
+    monkeypatch.setenv("NOVEL_SIMILARITY_DB", str(retrieval_db))
+    monkeypatch.setenv("NOVEL_SIMILARITY_TASK_UPLOAD_ROOT", str(upload_root))
+    monkeypatch.setenv("NOVEL_SIMILARITY_TASK_EXPORT_ROOT", str(export_root))
+
+    import api.config as api_config
+    import api.runtime_worker as runtime_worker
+
+    reload(api_config)
+    runtime_worker = reload(runtime_worker)
+
+    observed_calls: list[tuple[str, float]] = []
+    recovery_called = threading.Event()
+
+    def fake_claim_next_queued_task_globally(*_args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        time.sleep(0.02)
+        return None
+
+    def fake_recover_interrupted_tasks(db_path: str, *, stale_after_seconds: float) -> Dict[str, int]:
+        observed_calls.append((db_path, stale_after_seconds))
+        recovery_called.set()
+        return {
+            "running_to_queued": 0,
+            "cancel_requested_to_cancelled": 0,
+            "pause_requested_to_paused": 0,
+            "requeued_item_count": 0,
+        }
+
+    monkeypatch.setattr(runtime_worker, "claim_next_queued_task_globally", fake_claim_next_queued_task_globally)
+    monkeypatch.setattr(runtime_worker, "recover_interrupted_tasks", fake_recover_interrupted_tasks)
+
+    handle = runtime_worker.start_auto_worker()
+    assert handle is not None
+    assert recovery_called.wait(timeout=3)
+
+    runtime_worker.stop_auto_worker(handle)
+
+    assert observed_calls
+    assert observed_calls[0] == (str(business_db), 33.0)
+    if handle.maintenance_thread is not None:
+        assert not handle.maintenance_thread.is_alive()
+
+
 def test_api_auto_worker_smoke(tmp_path: Path, monkeypatch) -> None:
     business_db = tmp_path / "web_business.sqlite3"
     retrieval_db = tmp_path / "retrieval.sqlite3"
@@ -33,6 +193,7 @@ def test_api_auto_worker_smoke(tmp_path: Path, monkeypatch) -> None:
     retrieval_db.touch()
 
     monkeypatch.setenv("NOVEL_SIMILARITY_AUTOSTART_WORKER", "1")
+    monkeypatch.setenv("NOVEL_SIMILARITY_AUTOWORKER_COUNT", "2")
     monkeypatch.setenv("NOVEL_SIMILARITY_AUTOWORKER_POLL_SECONDS", "0.2")
     monkeypatch.setenv("NOVEL_SIMILARITY_BUSINESS_DB", str(business_db))
     monkeypatch.setenv("NOVEL_SIMILARITY_DB", str(retrieval_db))
@@ -47,10 +208,12 @@ def test_api_auto_worker_smoke(tmp_path: Path, monkeypatch) -> None:
     runtime_worker = reload(runtime_worker)
     api_app = reload(api_app)
 
+    from service.business_store import claim_next_queued_task_globally as real_claim_next_queued_task_globally
     from service.task_executor import ComparePipelineRequest
-    from service.task_executor import run_next_queued_task as real_run_next_queued_task
+    from service.task_executor import execute_claimed_task as real_execute_claimed_task
 
     captured_thresholds: list[float | None] = []
+    observed_worker_names: set[str] = set()
 
     def fake_pipeline(request: ComparePipelineRequest) -> Dict[str, Any]:
         captured_thresholds.append(request.candidate_display_score_threshold)
@@ -105,10 +268,15 @@ def test_api_auto_worker_smoke(tmp_path: Path, monkeypatch) -> None:
             },
         }
 
-    def run_next_with_fake_pipeline(**kwargs: Any) -> Optional[Dict[str, Any]]:
-        return real_run_next_queued_task(compare_fn=fake_pipeline, **kwargs)
+    def claim_with_observed_worker(db_path: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        observed_worker_names.add(str(kwargs.get("worker_name") or ""))
+        return real_claim_next_queued_task_globally(db_path, **kwargs)
 
-    monkeypatch.setattr(runtime_worker, "run_next_queued_task", run_next_with_fake_pipeline)
+    def execute_with_fake_pipeline(**kwargs: Any) -> Optional[Dict[str, Any]]:
+        return real_execute_claimed_task(compare_fn=fake_pipeline, **kwargs)
+
+    monkeypatch.setattr(runtime_worker, "claim_next_queued_task_globally", claim_with_observed_worker)
+    monkeypatch.setattr(runtime_worker, "execute_claimed_task", execute_with_fake_pipeline)
 
     with TestClient(api_app.app) as client:
         login_as_admin(client)
@@ -146,6 +314,10 @@ def test_api_auto_worker_smoke(tmp_path: Path, monkeypatch) -> None:
         assert len(last_payload["items"]) == 2
         assert last_payload["items"][0]["top1_book_name"] == "Smoke Novel"
         assert captured_thresholds == [0.35, 0.35]
+        assert observed_worker_names >= {
+            "local-worker-api-auto-1",
+            "local-worker-api-auto-2",
+        }
         assert Path(last_payload["task"]["summary_export_path"]).name == "task_summary.csv"
         assert Path(last_payload["task"]["review_export_path"]).name == "task_review_rows.csv"
         assert Path(last_payload["task"]["result_json_path"]).name == "task_summary.json"
@@ -208,6 +380,7 @@ def test_api_result_review_smoke(tmp_path: Path, monkeypatch) -> None:
     export_root = tmp_path / "exports"
 
     monkeypatch.setenv("NOVEL_SIMILARITY_AUTOSTART_WORKER", "1")
+    monkeypatch.setenv("NOVEL_SIMILARITY_AUTOWORKER_COUNT", "2")
     monkeypatch.setenv("NOVEL_SIMILARITY_AUTOWORKER_POLL_SECONDS", "0.2")
     monkeypatch.setenv("NOVEL_SIMILARITY_BUSINESS_DB", str(business_db))
     monkeypatch.setenv("NOVEL_SIMILARITY_DB", str(retrieval_db))
@@ -223,7 +396,7 @@ def test_api_result_review_smoke(tmp_path: Path, monkeypatch) -> None:
     api_app = reload(api_app)
 
     from service.task_executor import ComparePipelineRequest
-    from service.task_executor import run_next_queued_task as real_run_next_queued_task
+    from service.task_executor import execute_claimed_task as real_execute_claimed_task
 
     def fake_pipeline(request: ComparePipelineRequest) -> Dict[str, Any]:
         return {
@@ -277,10 +450,10 @@ def test_api_result_review_smoke(tmp_path: Path, monkeypatch) -> None:
             },
         }
 
-    def run_next_with_fake_pipeline(**kwargs: Any) -> Optional[Dict[str, Any]]:
-        return real_run_next_queued_task(compare_fn=fake_pipeline, **kwargs)
+    def execute_with_fake_pipeline(**kwargs: Any) -> Optional[Dict[str, Any]]:
+        return real_execute_claimed_task(compare_fn=fake_pipeline, **kwargs)
 
-    monkeypatch.setattr(runtime_worker, "run_next_queued_task", run_next_with_fake_pipeline)
+    monkeypatch.setattr(runtime_worker, "execute_claimed_task", execute_with_fake_pipeline)
 
     with TestClient(api_app.app) as client:
         login_as_admin(client)
@@ -386,6 +559,7 @@ def test_api_review_export_xlsx_smoke(tmp_path: Path, monkeypatch) -> None:
     export_root = tmp_path / "exports"
 
     monkeypatch.setenv("NOVEL_SIMILARITY_AUTOSTART_WORKER", "1")
+    monkeypatch.setenv("NOVEL_SIMILARITY_AUTOWORKER_COUNT", "2")
     monkeypatch.setenv("NOVEL_SIMILARITY_AUTOWORKER_POLL_SECONDS", "0.2")
     monkeypatch.setenv("NOVEL_SIMILARITY_BUSINESS_DB", str(business_db))
     monkeypatch.setenv("NOVEL_SIMILARITY_DB", str(retrieval_db))
@@ -401,7 +575,7 @@ def test_api_review_export_xlsx_smoke(tmp_path: Path, monkeypatch) -> None:
     api_app = reload(api_app)
 
     from service.task_executor import ComparePipelineRequest
-    from service.task_executor import run_next_queued_task as real_run_next_queued_task
+    from service.task_executor import execute_claimed_task as real_execute_claimed_task
 
     def fake_pipeline(request: ComparePipelineRequest) -> Dict[str, Any]:
         candidate_context = "这里是命中章节的长证据文本，用于后续侵权复核。" * 6
@@ -477,10 +651,10 @@ def test_api_review_export_xlsx_smoke(tmp_path: Path, monkeypatch) -> None:
             },
         }
 
-    def run_next_with_fake_pipeline(**kwargs: Any) -> Optional[Dict[str, Any]]:
-        return real_run_next_queued_task(compare_fn=fake_pipeline, **kwargs)
+    def execute_with_fake_pipeline(**kwargs: Any) -> Optional[Dict[str, Any]]:
+        return real_execute_claimed_task(compare_fn=fake_pipeline, **kwargs)
 
-    monkeypatch.setattr(runtime_worker, "run_next_queued_task", run_next_with_fake_pipeline)
+    monkeypatch.setattr(runtime_worker, "execute_claimed_task", execute_with_fake_pipeline)
 
     with TestClient(api_app.app) as client:
         login_as_admin(client)

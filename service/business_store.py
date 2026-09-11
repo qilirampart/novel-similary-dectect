@@ -4,6 +4,9 @@ from pathlib import Path
 import json
 from datetime import datetime, timedelta
 from hashlib import sha256
+import logging
+import threading
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -26,15 +29,134 @@ from v2_common import connect_db  # noqa: E402
 
 SCHEMA_PATH = ROOT_DIR / "service" / "business_schema_v1.sql"
 HIGH_RISK_REVIEW_LABEL = "强证据"
+DEFAULT_TASK_RECOVERY_STALE_SECONDS = 120.0
+DEFAULT_BUSINESS_DB_BUSY_TIMEOUT_MS = 60000
+BACKGROUND_DB_BUSY_TIMEOUT_MS = 250
+BACKGROUND_DB_LOCK_ATTEMPTS = 3
 
 
-def connect_business_db(path: str | Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, timeout=60)
+logger = logging.getLogger(__name__)
+_DB_LOCK_METRICS_LOCK = threading.Lock()
+_DB_LOCK_METRICS: dict[str, dict[str, float | int]] = {}
+
+
+def connect_business_db(
+    path: str | Path,
+    *,
+    busy_timeout_ms: int = DEFAULT_BUSINESS_DB_BUSY_TIMEOUT_MS,
+    configure_wal: bool = False,
+) -> sqlite3.Connection:
+    normalized_busy_timeout_ms = max(int(busy_timeout_ms), 0)
+    conn = sqlite3.connect(
+        path,
+        timeout=max(normalized_busy_timeout_ms / 1000.0, 0.001),
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 60000")
-    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute(f"PRAGMA busy_timeout = {normalized_busy_timeout_ms}")
+    # journal_mode changes can acquire a database lock. Only initialization
+    # should configure WAL; hot-path connections inherit the persisted mode.
+    if configure_wal:
+        conn.execute("PRAGMA journal_mode = WAL")
     return conn
+
+
+def _is_sqlite_lock_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
+def _record_db_lock_metric(
+    operation: str,
+    *,
+    wait_seconds: float,
+    lock_events: int = 0,
+    retries: int = 0,
+    skipped: int = 0,
+) -> None:
+    with _DB_LOCK_METRICS_LOCK:
+        metric = _DB_LOCK_METRICS.setdefault(
+            operation,
+            {
+                "attempts": 0,
+                "lock_events": 0,
+                "retries": 0,
+                "skipped": 0,
+                "wait_seconds_total": 0.0,
+                "wait_seconds_max": 0.0,
+            },
+        )
+        metric["attempts"] = int(metric["attempts"]) + 1
+        metric["lock_events"] = int(metric["lock_events"]) + int(lock_events)
+        metric["retries"] = int(metric["retries"]) + int(retries)
+        metric["skipped"] = int(metric["skipped"]) + int(skipped)
+        metric["wait_seconds_total"] = float(metric["wait_seconds_total"]) + float(wait_seconds)
+        metric["wait_seconds_max"] = max(float(metric["wait_seconds_max"]), float(wait_seconds))
+
+
+def get_business_db_lock_metrics() -> dict[str, dict[str, float | int]]:
+    """Return process-local SQLite lock observations for diagnostics."""
+    with _DB_LOCK_METRICS_LOCK:
+        return {operation: dict(metric) for operation, metric in _DB_LOCK_METRICS.items()}
+
+
+def reset_business_db_lock_metrics() -> None:
+    with _DB_LOCK_METRICS_LOCK:
+        _DB_LOCK_METRICS.clear()
+
+
+def try_begin_business_write(
+    conn: sqlite3.Connection,
+    *,
+    operation: str,
+    max_attempts: int = BACKGROUND_DB_LOCK_ATTEMPTS,
+    retry_delay_seconds: float = 0.025,
+) -> bool:
+    """Start a short background write transaction without a 60-second stall."""
+    attempts = max(int(max_attempts), 1)
+    started_at = time.monotonic()
+    lock_events = 0
+    for attempt in range(1, attempts + 1):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            wait_seconds = time.monotonic() - started_at
+            _record_db_lock_metric(
+                operation,
+                wait_seconds=wait_seconds,
+                lock_events=lock_events,
+                retries=max(attempt - 1, 0),
+            )
+            if lock_events:
+                logger.info(
+                    "sqlite write lock acquired operation=%s attempts=%s wait_seconds=%.3f",
+                    operation,
+                    attempt,
+                    wait_seconds,
+                )
+            return True
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_lock_error(exc):
+                raise
+            lock_events += 1
+            if conn.in_transaction:
+                conn.rollback()
+            if attempt < attempts:
+                time.sleep(max(float(retry_delay_seconds), 0.0) * attempt)
+    wait_seconds = time.monotonic() - started_at
+    _record_db_lock_metric(
+        operation,
+        wait_seconds=wait_seconds,
+        lock_events=lock_events,
+        retries=max(attempts - 1, 0),
+        skipped=1,
+    )
+    logger.warning(
+        "sqlite write lock unavailable operation=%s attempts=%s wait_seconds=%.3f",
+        operation,
+        attempts,
+        wait_seconds,
+    )
+    return False
 
 
 def _ensure_compare_task_item_timing_columns(conn: sqlite3.Connection) -> None:
@@ -180,6 +302,103 @@ def _ensure_compare_task_control_columns(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_task_queue_entered_columns(conn: sqlite3.Connection) -> None:
+    """Keep a stable FIFO timestamp separate from task updates and progress writes."""
+    for table_name in ("compare_tasks", "drama_subtitle_tasks"):
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+        if "queue_entered_at" not in columns:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN queue_entered_at TEXT")
+        conn.execute(
+            f"UPDATE {table_name} SET queue_entered_at = created_at WHERE queue_entered_at IS NULL OR queue_entered_at = ''"
+        )
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table_name}_queue_entered ON {table_name} (is_deleted, status, queue_entered_at)"
+        )
+
+
+def _ensure_worker_lease_columns(conn: sqlite3.Connection) -> None:
+    """Add the claim generation used to fence late writes from stale workers."""
+    for table_name in ("compare_tasks", "drama_subtitle_tasks"):
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+        if "worker_lease_token" not in columns:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN worker_lease_token TEXT")
+
+
+def _ensure_compare_task_item_payload_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS compare_task_item_payloads (
+            result_id INTEGER PRIMARY KEY,
+            query_text TEXT NOT NULL,
+            result_payload_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (result_id) REFERENCES compare_task_items (result_id) ON DELETE CASCADE
+        )
+        """
+    )
+
+
+def _ensure_drama_subtitle_task_control_columns(conn: sqlite3.Connection) -> None:
+    task_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(drama_subtitle_tasks)").fetchall()
+    }
+    for column_name, column_type in (
+        ("paused_at", "TEXT"),
+        ("deleted_at", "TEXT"),
+    ):
+        if column_name not in task_columns:
+            conn.execute(f"ALTER TABLE drama_subtitle_tasks ADD COLUMN {column_name} {column_type}")
+
+    item_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(drama_subtitle_task_items)").fetchall()
+    }
+    for column_name, column_type in (
+        ("source_video_id", "TEXT"),
+        ("source_channel", "TEXT"),
+        ("source_upload_date", "TEXT"),
+        ("source_caption_language", "TEXT"),
+        ("source_caption_source", "TEXT"),
+        ("source_segment_order", "INTEGER"),
+        ("source_time_start", "TEXT"),
+        ("source_time_end", "TEXT"),
+        ("source_text_original", "TEXT"),
+    ):
+        if column_name not in item_columns:
+            conn.execute(f"ALTER TABLE drama_subtitle_task_items ADD COLUMN {column_name} {column_type}")
+
+
+def _ensure_drama_subtitle_translation_cache_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS drama_subtitle_translation_cache (
+            cache_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_user_id INTEGER NOT NULL,
+            source_text_sha256 TEXT NOT NULL,
+            source_language_code TEXT NOT NULL,
+            target_language_code TEXT NOT NULL,
+            provider_key TEXT NOT NULL,
+            translated_text TEXT NOT NULL,
+            source_char_count INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (owner_user_id, source_text_sha256, source_language_code, target_language_code, provider_key),
+            FOREIGN KEY (owner_user_id) REFERENCES app_users (user_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_drama_subtitle_translation_cache_lookup
+            ON drama_subtitle_translation_cache (
+                owner_user_id, source_text_sha256, source_language_code, target_language_code, provider_key
+            )
+        """
+    )
+
+
 def _ensure_default_admin_user(conn: sqlite3.Connection) -> None:
     now = now_ts()
     conn.execute(
@@ -241,10 +460,13 @@ def _backfill_compare_task_item_review_cache(conn: sqlite3.Connection) -> None:
                i.source_novel_name,
                i.source_ref,
                i.query_text,
+               p.query_text AS payload_query_text,
                i.owner_user_id,
                i.dedupe_key,
                t.owner_user_id AS task_owner_user_id
           FROM compare_task_items i
+          LEFT JOIN compare_task_item_payloads p
+            ON p.result_id = i.result_id
           LEFT JOIN compare_tasks t
             ON t.task_id = i.task_id
          WHERE i.owner_user_id IS NULL
@@ -269,7 +491,11 @@ def _backfill_compare_task_item_review_cache(conn: sqlite3.Connection) -> None:
                     source_short_drama=row["source_short_drama"],
                     source_novel_name=row["source_novel_name"],
                     source_ref=row["source_ref"],
-                    query_text=row["query_text"],
+                    query_text=(
+                        row["query_text"]
+                        if str(row["query_text"] or "").strip()
+                        else row["payload_query_text"]
+                    ),
                 ),
                 int(row["result_id"]),
             )
@@ -317,6 +543,7 @@ def _backfill_compare_task_item_source_metadata(conn: sqlite3.Connection) -> Non
             continue
         if not parsed_items:
             continue
+        now = now_ts()
         conn.executemany(
             """
             UPDATE compare_task_items
@@ -330,7 +557,8 @@ def _backfill_compare_task_item_source_metadata(conn: sqlite3.Connection) -> Non
                    source_description = ?,
                    source_ref = CASE WHEN COALESCE(?, '') <> '' THEN ? ELSE source_ref END,
                    query_text = ?,
-                   query_text_preview = ?
+                   query_text_preview = ?,
+                   dedupe_key = ?
              WHERE task_id = ?
                AND item_order = ?
             """,
@@ -348,26 +576,254 @@ def _backfill_compare_task_item_source_metadata(conn: sqlite3.Connection) -> Non
                     item.source_ref,
                     item.query_text,
                     _clip_text(item.query_text),
+                    _build_compare_task_item_dedupe_key(
+                        source_short_drama=item.source_short_drama,
+                        source_novel_name=item.source_novel_name,
+                        source_ref=(item.source_ref or ""),
+                        query_text=item.query_text,
+                    ),
                     str(row["task_id"]),
                     int(item.item_order),
                 )
                 for item in parsed_items
             ],
         )
+        existing_rows = conn.execute(
+            """
+            SELECT result_id,
+                   item_order,
+                   created_at
+              FROM compare_task_items
+             WHERE task_id = ?
+            """,
+            (str(row["task_id"]),),
+        ).fetchall()
+        existing_by_order = {
+            int(item_row["item_order"]): (
+                int(item_row["result_id"]),
+                str(item_row["created_at"] or now),
+            )
+            for item_row in existing_rows
+        }
+        _upsert_compare_task_item_payload_rows(
+            conn,
+            [
+                (
+                    existing_by_order[int(item.item_order)][0],
+                    item.query_text,
+                    None,
+                    existing_by_order[int(item.item_order)][1],
+                    now,
+                )
+                for item in parsed_items
+                if int(item.item_order) in existing_by_order
+            ],
+        )
+
+
+def _backfill_compare_task_item_payload_store(conn: sqlite3.Connection) -> None:
+    now = now_ts()
+    rows = conn.execute(
+        """
+        SELECT result_id,
+               query_text,
+               result_payload_json,
+               created_at,
+               updated_at
+          FROM compare_task_items
+        """
+    ).fetchall()
+    _upsert_compare_task_item_payload_rows(
+        conn,
+        [
+            (
+                int(row["result_id"]),
+                str(row["query_text"] or ""),
+                None
+                if row["result_payload_json"] is None
+                else str(row["result_payload_json"]),
+                str(row["created_at"] or now),
+                str(row["updated_at"] or now),
+            )
+            for row in rows
+        ],
+    )
+
+
+def _count_compare_task_item_payload_backfill_candidates_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    mode: str = "missing",
+) -> int:
+    normalized_mode = str(mode or "missing").strip().lower()
+    where_sql = "WHERE p.result_id IS NULL" if normalized_mode == "missing" else ""
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS total
+          FROM compare_task_items i
+          LEFT JOIN compare_task_item_payloads p
+            ON p.result_id = i.result_id
+         {where_sql}
+        """
+    ).fetchone()
+    return int(row["total"] or 0) if row is not None else 0
+
+
+def _fetch_compare_task_item_payload_backfill_rows_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    batch_size: int,
+    last_result_id: int = 0,
+    mode: str = "missing",
+) -> list[tuple[int, str, str | None, str, str]]:
+    normalized_mode = str(mode or "missing").strip().lower()
+    where_clauses = ["i.result_id > ?"]
+    params: list[Any] = [int(last_result_id)]
+    if normalized_mode == "missing":
+        where_clauses.append("p.result_id IS NULL")
+    rows = conn.execute(
+        f"""
+        SELECT i.result_id,
+               i.query_text,
+               i.result_payload_json,
+               i.created_at,
+               i.updated_at
+          FROM compare_task_items i
+          LEFT JOIN compare_task_item_payloads p
+            ON p.result_id = i.result_id
+         WHERE {" AND ".join(where_clauses)}
+         ORDER BY i.result_id ASC
+         LIMIT ?
+        """,
+        (*params, max(int(batch_size), 1)),
+    ).fetchall()
+    now = now_ts()
+    return [
+        (
+            int(row["result_id"]),
+            str(row["query_text"] or ""),
+            None
+            if row["result_payload_json"] is None
+            else str(row["result_payload_json"]),
+            str(row["created_at"] or now),
+            str(row["updated_at"] or now),
+        )
+        for row in rows
+    ]
+
+
+def backfill_compare_task_item_payload_store_batch(
+    db_path: str | Path,
+    *,
+    batch_size: int = 500,
+    last_result_id: int = 0,
+    mode: str = "missing",
+) -> dict[str, Any]:
+    conn = connect_business_db(db_path)
+    try:
+        total_before = _count_compare_task_item_payload_backfill_candidates_on_conn(
+            conn,
+            mode=mode,
+        )
+        rows = _fetch_compare_task_item_payload_backfill_rows_on_conn(
+            conn,
+            batch_size=batch_size,
+            last_result_id=last_result_id,
+            mode=mode,
+        )
+        _upsert_compare_task_item_payload_rows(conn, rows)
+        total_after = _count_compare_task_item_payload_backfill_candidates_on_conn(
+            conn,
+            mode=mode,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    processed = len(rows)
+    next_result_id = int(rows[-1][0]) if rows else int(last_result_id)
+    return {
+        "mode": str(mode or "missing").strip().lower() or "missing",
+        "batch_size": max(int(batch_size), 1),
+        "last_result_id": int(last_result_id),
+        "processed_rows": processed,
+        "next_result_id": next_result_id,
+        "remaining_rows": max(int(total_after), 0),
+        "completed": processed == 0 or int(total_after) <= 0,
+        "candidate_rows_before": max(int(total_before), 0),
+        "candidate_rows_after": max(int(total_after), 0),
+    }
+
+
+def backfill_compare_task_item_payload_store(
+    db_path: str | Path,
+    *,
+    batch_size: int = 500,
+    mode: str = "all",
+) -> int:
+    total_processed = 0
+    cursor = 0
+    while True:
+        batch = backfill_compare_task_item_payload_store_batch(
+            db_path,
+            batch_size=batch_size,
+            last_result_id=cursor,
+            mode=mode,
+        )
+        total_processed += int(batch["processed_rows"] or 0)
+        cursor = int(batch["next_result_id"] or cursor)
+        if bool(batch["completed"]) or int(batch["processed_rows"] or 0) <= 0:
+            return total_processed
+
+
+def _upsert_compare_task_item_payload_rows(
+    conn: sqlite3.Connection,
+    payload_rows: list[tuple[int, str, str | None, str, str]],
+) -> None:
+    if not payload_rows:
+        return
+    conn.executemany(
+        """
+        INSERT INTO compare_task_item_payloads (
+            result_id,
+            query_text,
+            result_payload_json,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(result_id) DO UPDATE SET
+            query_text = CASE
+                WHEN COALESCE(excluded.query_text, '') <> '' THEN excluded.query_text
+                ELSE compare_task_item_payloads.query_text
+            END,
+            result_payload_json = CASE
+                WHEN COALESCE(excluded.result_payload_json, '') <> '' THEN excluded.result_payload_json
+                ELSE compare_task_item_payloads.result_payload_json
+            END,
+            updated_at = excluded.updated_at
+        """,
+        payload_rows,
+    )
 
 
 def init_business_db(path: str | Path) -> None:
     db_path = Path(path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
-    conn = connect_business_db(db_path)
+    conn = connect_business_db(db_path, configure_wal=True)
     try:
         conn.executescript(schema_sql)
         _ensure_compare_task_item_timing_columns(conn)
         _ensure_compare_task_item_source_columns(conn)
         _ensure_compare_task_owner_column(conn)
         _ensure_compare_task_control_columns(conn)
+        _ensure_task_queue_entered_columns(conn)
+        _ensure_worker_lease_columns(conn)
         _ensure_compare_task_item_review_cache_columns(conn)
+        _ensure_compare_task_item_payload_table(conn)
+        _ensure_drama_subtitle_task_control_columns(conn)
+        _ensure_drama_subtitle_translation_cache_table(conn)
         _ensure_default_admin_user(conn)
         _backfill_compare_task_owner_user_id(conn)
         _backfill_compare_task_item_source_metadata(conn)
@@ -385,6 +841,98 @@ def _loads_json(value: str | None) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _dump_result_payload_json(value: Any) -> str:
+    payload = value if isinstance(value, dict) else dict(value or {})
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _prefer_payload_query_text(
+    hot_query_text: Any,
+    payload_query_text: Any = None,
+) -> str:
+    if str(payload_query_text or "").strip():
+        return str(payload_query_text or "")
+    return str(hot_query_text or "")
+
+
+def _prefer_payload_result_payload_json(
+    hot_result_payload_json: Any,
+    payload_result_payload_json: Any = None,
+) -> str | None:
+    if str(payload_result_payload_json or "").strip():
+        return str(payload_result_payload_json or "")
+    if hot_result_payload_json is None:
+        return None
+    return str(hot_result_payload_json)
+
+
+def _compare_task_item_list_projection_sql(item_alias: str = "") -> str:
+    prefix = f"{item_alias}." if item_alias else ""
+    return f"""
+        {prefix}result_id,
+        {prefix}task_id,
+        {prefix}item_order,
+        {prefix}source_ref,
+        {prefix}source_short_drama,
+        {prefix}source_novel_name,
+        {prefix}source_excel_row,
+        {prefix}source_episode,
+        {prefix}source_author,
+        {prefix}source_platform,
+        {prefix}source_display_title,
+        {prefix}source_description,
+        {prefix}query_text_preview,
+        {prefix}status,
+        {prefix}started_at,
+        {prefix}finished_at,
+        {prefix}duration_seconds,
+        {prefix}semantic_status,
+        {prefix}top1_book_name,
+        {prefix}top1_chapter_name,
+        {prefix}top1_review_label,
+        {prefix}top1_confidence_label,
+        {prefix}top1_fine_score,
+        {prefix}error_message,
+        {prefix}created_at,
+        {prefix}updated_at
+    """
+
+
+def _compare_task_projection_sql(task_alias: str = "") -> str:
+    prefix = f"{task_alias}." if task_alias else ""
+    return f"""
+        {prefix}task_id,
+        {prefix}task_type,
+        {prefix}status,
+        {prefix}owner_user_id,
+        {prefix}is_deleted,
+        {prefix}detection_mode,
+        {prefix}created_by,
+        {prefix}source_file_name,
+        {prefix}source_file_ext,
+        {prefix}source_file_path,
+        {prefix}source_file_sha256,
+        {prefix}source_file_size,
+        {prefix}params_json,
+        {prefix}accepted_input_count,
+        {prefix}completed_input_count,
+        {prefix}failed_input_count,
+        {prefix}worker_name,
+        {prefix}status_message,
+        {prefix}error_message,
+        {prefix}summary_export_path,
+        {prefix}review_export_path,
+        {prefix}result_json_path,
+        {prefix}created_at,
+        {prefix}updated_at,
+        {prefix}started_at,
+        {prefix}paused_at,
+        {prefix}deleted_at,
+        {prefix}finished_at,
+        {prefix}last_heartbeat_at
+    """
 
 
 def _clip_text_middle(text: str, limit: int = 2000) -> str:
@@ -420,6 +968,57 @@ def _fetch_chapter_content_by_uid(db_path: str | Path, chapter_uid: int) -> str:
     if row is None:
         return ""
     return str(row[0] or "")
+
+
+def _fetch_chapter_contents_by_uids(
+    db_path: str | Path,
+    chapter_uids: list[int] | tuple[int, ...],
+    batch_size: int = 500,
+) -> dict[int, str]:
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for value in chapter_uids:
+        chapter_uid = int(value or 0)
+        if chapter_uid <= 0 or chapter_uid in seen:
+            continue
+        seen.add(chapter_uid)
+        normalized.append(chapter_uid)
+    if not normalized:
+        return {}
+    try:
+        conn = connect_db(db_path)
+    except Exception:
+        return {}
+    try:
+        text_map: dict[int, str] = {}
+        effective_batch_size = max(int(batch_size), 1)
+        for start in range(0, len(normalized), effective_batch_size):
+            batch = normalized[start : start + effective_batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT chapter_uid,
+                           COALESCE(NULLIF(content_clean, ''), NULLIF(content_retrieval, ''), NULLIF(content_raw, '')) AS content
+                      FROM chapter_contents
+                     WHERE chapter_uid IN ({placeholders})
+                    """,
+                    batch,
+                ).fetchall()
+            except sqlite3.Error:
+                return text_map
+            for row in rows:
+                if isinstance(row, sqlite3.Row):
+                    chapter_uid = int(row["chapter_uid"] or 0)
+                    content = row["content"]
+                else:
+                    chapter_uid = int(row[0] or 0)
+                    content = row[1]
+                if chapter_uid > 0 and content:
+                    text_map[chapter_uid] = str(content)
+        return text_map
+    finally:
+        conn.close()
 
 
 def _build_candidate_review_context(
@@ -458,9 +1057,39 @@ def _build_candidate_review_context(
     return context_text, chapter_text_for_review
 
 
-def _enrich_result_payload_for_review(
-    retrieval_db_path: str | Path,
+def _collect_result_payload_review_chapter_uids(
     result_payload: dict[str, Any],
+    *,
+    max_results: int | None = None,
+) -> list[int]:
+    fine = result_payload.get("fine")
+    if not isinstance(fine, dict):
+        return []
+
+    results = fine.get("results")
+    if not isinstance(results, list):
+        return []
+
+    chapter_uids: list[int] = []
+    seen: set[int] = set()
+    for index, item in enumerate(results):
+        if max_results is not None and index >= max_results:
+            break
+        if not isinstance(item, dict):
+            continue
+        chapter_uid = int(item.get("chapter_uid") or 0)
+        if chapter_uid <= 0 or chapter_uid in seen:
+            continue
+        seen.add(chapter_uid)
+        chapter_uids.append(chapter_uid)
+    return chapter_uids
+
+
+def _enrich_result_payload_for_review_with_chapter_texts(
+    result_payload: dict[str, Any],
+    chapter_text_map: dict[int, str],
+    *,
+    max_results: int | None = None,
 ) -> dict[str, Any]:
     fine = result_payload.get("fine")
     if not isinstance(fine, dict):
@@ -470,7 +1099,9 @@ def _enrich_result_payload_for_review(
     if not isinstance(results, list):
         return result_payload
 
-    for item in results:
+    for index, item in enumerate(results):
+        if max_results is not None and index >= max_results:
+            break
         if not isinstance(item, dict):
             continue
         best_match = item.get("best_match")
@@ -479,7 +1110,7 @@ def _enrich_result_payload_for_review(
         chapter_uid = int(item.get("chapter_uid") or 0)
         if chapter_uid <= 0:
             continue
-        chapter_text = _fetch_chapter_content_by_uid(retrieval_db_path, chapter_uid)
+        chapter_text = str(chapter_text_map.get(chapter_uid) or "")
         if not chapter_text:
             continue
         review_context_text, chapter_text_for_review = _build_candidate_review_context(
@@ -495,6 +1126,25 @@ def _enrich_result_payload_for_review(
             0,
         )
     return result_payload
+
+
+def _enrich_result_payload_for_review(
+    retrieval_db_path: str | Path,
+    result_payload: dict[str, Any],
+    *,
+    max_results: int | None = None,
+) -> dict[str, Any]:
+    chapter_uids = _collect_result_payload_review_chapter_uids(
+        result_payload,
+        max_results=max_results,
+    )
+    if not chapter_uids:
+        return result_payload
+    return _enrich_result_payload_for_review_with_chapter_texts(
+        result_payload,
+        _fetch_chapter_contents_by_uids(retrieval_db_path, chapter_uids),
+        max_results=max_results,
+    )
 
 
 def _safe_rel_path(path: str | None) -> str | None:
@@ -574,7 +1224,7 @@ def _task_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _task_item_row_to_dict(row: sqlite3.Row, include_payload: bool = False) -> dict[str, Any]:
+def _task_item_row_to_dict(row: Any, include_payload: bool = False) -> dict[str, Any]:
     data = {
         "result_id": int(row["result_id"]),
         "task_id": row["task_id"],
@@ -604,12 +1254,23 @@ def _task_item_row_to_dict(row: sqlite3.Row, include_payload: bool = False) -> d
         "updated_at": row["updated_at"],
     }
     if include_payload:
-        data["query_text"] = row["query_text"]
-        data["result_payload"] = _loads_json(row["result_payload_json"])
+        row_keys = set(row.keys())
+        data["query_text"] = _prefer_payload_query_text(
+            row["query_text"] if "query_text" in row_keys else None,
+            row["payload_query_text"] if "payload_query_text" in row_keys else None,
+        )
+        data["result_payload"] = _loads_json(
+            _prefer_payload_result_payload_json(
+                row["result_payload_json"] if "result_payload_json" in row_keys else None,
+                row["payload_result_payload_json"]
+                if "payload_result_payload_json" in row_keys
+                else None,
+            )
+        )
     return data
 
 
-def _result_row_to_dict(row: sqlite3.Row, include_payload: bool = False) -> dict[str, Any]:
+def _result_row_to_dict(row: Any, include_payload: bool = False) -> dict[str, Any]:
     data = _task_item_row_to_dict(row, include_payload=include_payload)
     row_keys = set(row.keys())
     data["detection_mode"] = row["detection_mode"] if "detection_mode" in row_keys else ""
@@ -625,6 +1286,198 @@ def _result_row_to_dict(row: sqlite3.Row, include_payload: bool = False) -> dict
         "updated_at": row["review_updated_at"] if "review_updated_at" in row_keys else None,
     }
     return data
+
+
+def _load_compare_task_item_payload_entries_by_result_ids(
+    conn: sqlite3.Connection,
+    result_ids: list[int] | tuple[int, ...],
+    *,
+    owner_user_id: int | None = None,
+    batch_size: int = 500,
+) -> dict[int, dict[str, Any]]:
+    ordered_result_ids: list[int] = []
+    seen_result_ids: set[int] = set()
+    for value in result_ids:
+        result_id = int(value or 0)
+        if result_id <= 0 or result_id in seen_result_ids:
+            continue
+        seen_result_ids.add(result_id)
+        ordered_result_ids.append(result_id)
+    if not ordered_result_ids:
+        return {}
+
+    payload_rows_by_result_id: dict[int, dict[str, Any]] = {}
+    effective_batch_size = max(int(batch_size), 1)
+    for start in range(0, len(ordered_result_ids), effective_batch_size):
+        batch = ordered_result_ids[start : start + effective_batch_size]
+        placeholders = ",".join("?" for _ in batch)
+        owner_filter = ""
+        params: list[Any] = [*batch]
+        if owner_user_id is not None:
+            owner_filter = " AND t.owner_user_id = ?"
+            params.append(int(owner_user_id))
+        rows = conn.execute(
+            f"""
+            SELECT i.result_id,
+                   p.query_text AS payload_query_text,
+                   p.result_payload_json AS payload_result_payload_json
+              FROM compare_task_items i
+              JOIN compare_tasks t
+                ON t.task_id = i.task_id
+              LEFT JOIN compare_task_item_payloads p
+                ON p.result_id = i.result_id
+             WHERE i.result_id IN ({placeholders})
+               AND COALESCE(t.is_deleted, 0) = 0
+               {owner_filter}
+            """,
+            tuple(params),
+        ).fetchall()
+        for row in rows:
+            payload_rows_by_result_id[int(row["result_id"])] = {
+                "payload_query_text": row["payload_query_text"],
+                "payload_result_payload_json": row["payload_result_payload_json"],
+            }
+
+    fallback_result_ids = [
+        result_id
+        for result_id in ordered_result_ids
+        if not str(
+            (
+                payload_rows_by_result_id.get(result_id, {}).get("payload_query_text")
+                or ""
+            )
+        ).strip()
+        or not str(
+            (
+                payload_rows_by_result_id.get(result_id, {}).get("payload_result_payload_json")
+                or ""
+            )
+        ).strip()
+    ]
+    legacy_rows_by_result_id: dict[int, dict[str, Any]] = {}
+    for start in range(0, len(fallback_result_ids), effective_batch_size):
+        batch = fallback_result_ids[start : start + effective_batch_size]
+        if not batch:
+            continue
+        placeholders = ",".join("?" for _ in batch)
+        owner_filter = ""
+        params = [*batch]
+        if owner_user_id is not None:
+            owner_filter = " AND t.owner_user_id = ?"
+            params.append(int(owner_user_id))
+        rows = conn.execute(
+            f"""
+            SELECT i.result_id,
+                   i.query_text,
+                   i.result_payload_json
+              FROM compare_task_items i
+              JOIN compare_tasks t
+                ON t.task_id = i.task_id
+             WHERE i.result_id IN ({placeholders})
+               AND COALESCE(t.is_deleted, 0) = 0
+               {owner_filter}
+            """,
+            tuple(params),
+        ).fetchall()
+        for row in rows:
+            legacy_rows_by_result_id[int(row["result_id"])] = {
+                "query_text": row["query_text"],
+                "result_payload_json": row["result_payload_json"],
+            }
+
+    payload_entries: dict[int, dict[str, Any]] = {}
+    for result_id in ordered_result_ids:
+        payload_row = payload_rows_by_result_id.get(result_id, {})
+        legacy_row = legacy_rows_by_result_id.get(result_id, {})
+        payload_entries[result_id] = {
+            "query_text": _prefer_payload_query_text(
+                legacy_row.get("query_text"),
+                payload_row.get("payload_query_text"),
+            ),
+            "result_payload": _loads_json(
+                _prefer_payload_result_payload_json(
+                    legacy_row.get("result_payload_json"),
+                    payload_row.get("payload_result_payload_json"),
+                )
+            ),
+        }
+    return payload_entries
+
+
+def hydrate_compare_result_summaries(
+    db_path: str | Path,
+    items: list[dict[str, Any]],
+    *,
+    retrieval_db_path: str | Path | None = None,
+    owner_user_id: int | None = None,
+    batch_size: int = 500,
+    review_result_limit: int | None = None,
+) -> list[dict[str, Any]]:
+    if not items:
+        return []
+
+    ordered_result_ids: list[int] = []
+    summary_by_result_id: dict[int, dict[str, Any]] = {}
+    for item in items:
+        result_id = int(item.get("result_id") or 0)
+        if result_id <= 0 or result_id in summary_by_result_id:
+            continue
+        ordered_result_ids.append(result_id)
+        summary_by_result_id[result_id] = dict(item)
+    if not ordered_result_ids:
+        return []
+
+    conn = connect_business_db(db_path)
+    try:
+        payload_by_result_id = _load_compare_task_item_payload_entries_by_result_ids(
+            conn,
+            ordered_result_ids,
+            owner_user_id=owner_user_id,
+            batch_size=batch_size,
+        )
+    finally:
+        conn.close()
+
+    chapter_uids: list[int] = []
+    if retrieval_db_path is not None:
+        seen_chapter_uids: set[int] = set()
+        for result_id in ordered_result_ids:
+            payload_entry = payload_by_result_id.get(result_id)
+            if payload_entry is None:
+                continue
+            for chapter_uid in _collect_result_payload_review_chapter_uids(
+                payload_entry.get("result_payload") or {},
+                max_results=review_result_limit,
+            ):
+                if chapter_uid in seen_chapter_uids:
+                    continue
+                seen_chapter_uids.add(chapter_uid)
+                chapter_uids.append(chapter_uid)
+
+    chapter_text_map = (
+        _fetch_chapter_contents_by_uids(retrieval_db_path, chapter_uids)
+        if retrieval_db_path is not None and chapter_uids
+        else {}
+    )
+
+    details: list[dict[str, Any]] = []
+    for result_id in ordered_result_ids:
+        summary = summary_by_result_id.get(result_id)
+        payload_entry = payload_by_result_id.get(result_id)
+        if summary is None or payload_entry is None:
+            continue
+        detail = dict(summary)
+        detail["query_text"] = payload_entry["query_text"]
+        result_payload = payload_entry.get("result_payload") or {}
+        if chapter_text_map:
+            result_payload = _enrich_result_payload_for_review_with_chapter_texts(
+                result_payload,
+                chapter_text_map,
+                max_results=review_result_limit,
+            )
+        detail["result_payload"] = result_payload
+        details.append(detail)
+    return details
 
 
 def create_user(
@@ -973,6 +1826,7 @@ def create_compare_task(
     params: dict[str, Any],
     owner_user_id: int | None = None,
     created_by: str = "",
+    accepted_input_count: int = 0,
 ) -> dict[str, Any]:
     now = now_ts()
     conn = connect_business_db(db_path)
@@ -1012,6 +1866,15 @@ def create_compare_task(
                 now,
             ),
         )
+        conn.execute(
+            "UPDATE compare_tasks SET queue_entered_at = ? WHERE task_id = ?",
+            (now, task_id),
+        )
+        if accepted_input_count > 0:
+            conn.execute(
+                "UPDATE compare_tasks SET accepted_input_count = ? WHERE task_id = ?",
+                (int(accepted_input_count), task_id),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -1033,7 +1896,7 @@ def list_compare_tasks(
     try:
         rows = conn.execute(
             f"""
-            SELECT *
+            SELECT {_compare_task_projection_sql()}
               FROM compare_tasks
              {where_clause}
              ORDER BY created_at DESC, task_id DESC
@@ -1062,7 +1925,7 @@ def get_compare_task(
     conn = connect_business_db(db_path)
     try:
         row = conn.execute(
-            f"SELECT * FROM compare_tasks {where_clause}",
+            f"SELECT {_compare_task_projection_sql()} FROM compare_tasks {where_clause}",
             tuple(params),
         ).fetchone()
     finally:
@@ -1070,6 +1933,40 @@ def get_compare_task(
     if row is None:
         return None
     return _task_row_to_dict(row)
+
+
+def get_compare_task_runtime_state(
+    db_path: str | Path,
+    task_id: str,
+) -> dict[str, Any] | None:
+    conn = connect_business_db(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT task_id,
+                   status,
+                   accepted_input_count,
+                   completed_input_count,
+                   failed_input_count
+              FROM compare_tasks
+             WHERE task_id = ?
+               AND COALESCE(is_deleted, 0) = 0
+            """,
+            (task_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return {
+        "task_id": str(row["task_id"] or ""),
+        "status": str(row["status"] or ""),
+        "counts": {
+            "accepted": int(row["accepted_input_count"] or 0),
+            "completed": int(row["completed_input_count"] or 0),
+            "failed": int(row["failed_input_count"] or 0),
+        },
+    }
 
 
 def cancel_compare_task(
@@ -1161,7 +2058,7 @@ def retry_compare_task(
     conn = connect_business_db(db_path)
     try:
         source_task = conn.execute(
-            "SELECT * FROM compare_tasks WHERE task_id = ?",
+            f"SELECT {_compare_task_projection_sql()} FROM compare_tasks WHERE task_id = ?",
             (task_id,),
         ).fetchone()
         if source_task is None:
@@ -1318,12 +2215,14 @@ def resume_compare_task(
                        status_message = ?,
                        paused_at = NULL,
                        finished_at = NULL,
+                       queue_entered_at = ?,
                        updated_at = ?,
                        last_heartbeat_at = ?
                  WHERE task_id = ?
                 """,
                 (
                     reason or "task resumed and returned to queue",
+                    now,
                     now,
                     now,
                     task_id,
@@ -1447,8 +2346,8 @@ def list_compare_task_items(
     conn = connect_business_db(db_path)
     try:
         rows = conn.execute(
-            """
-            SELECT *
+            f"""
+            SELECT {_compare_task_item_list_projection_sql()}
               FROM compare_task_items
              WHERE task_id = ?
              ORDER BY item_order ASC
@@ -1480,7 +2379,7 @@ def get_compare_task_item_stats(
             """
             SELECT COUNT(*) AS item_total,
                    SUM(CASE WHEN top1_review_label = ? THEN 1 ELSE 0 END) AS high_risk_count,
-                   SUM(CASE WHEN semantic_status = 'fallback_lexical_only' THEN 1 ELSE 0 END) AS semantic_fallback_count
+                   SUM(CASE WHEN semantic_status IN ('fallback_lexical_only', 'fallback_semantic_timeout') THEN 1 ELSE 0 END) AS semantic_fallback_count
               FROM compare_task_items
              WHERE task_id = ?
             """,
@@ -1523,7 +2422,8 @@ def list_compare_task_input_items(
     try:
         rows = conn.execute(
             """
-            SELECT item_order,
+            SELECT result_id,
+                   item_order,
                    source_ref,
                    source_short_drama,
                    source_novel_name,
@@ -1533,18 +2433,23 @@ def list_compare_task_input_items(
                    source_platform,
                    source_display_title,
                    source_description,
-                   query_text,
-                   status
+                   status,
+                   created_at
               FROM compare_task_items
-             WHERE task_id = ?
+             WHERE compare_task_items.task_id = ?
              ORDER BY item_order ASC
             """,
             (task_id,),
         ).fetchall()
+        payload_entries = _load_compare_task_item_payload_entries_by_result_ids(
+            conn,
+            [int(row["result_id"]) for row in rows],
+        )
     finally:
         conn.close()
     return [
         {
+            "result_id": int(row["result_id"]),
             "item_order": int(row["item_order"]),
             "source_ref": str(row["source_ref"] or ""),
             "source_short_drama": str(row["source_short_drama"] or ""),
@@ -1555,8 +2460,53 @@ def list_compare_task_input_items(
             "source_platform": str(row["source_platform"] or ""),
             "source_display_title": str(row["source_display_title"] or ""),
             "source_description": str(row["source_description"] or ""),
-            "query_text": str(row["query_text"] or ""),
+            "query_text": str(
+                payload_entries.get(int(row["result_id"]), {}).get("query_text") or ""
+            ),
             "status": str(row["status"] or ""),
+            "created_at": str(row["created_at"] or ""),
+        }
+        for row in rows
+    ]
+
+
+def list_compare_task_result_payloads(
+    db_path: str | Path,
+    task_id: str,
+    owner_user_id: int | None = None,
+) -> list[dict[str, Any]]:
+    task = get_compare_task(db_path, task_id, owner_user_id=owner_user_id)
+    if task is None:
+        return []
+    conn = connect_business_db(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT i.result_id,
+                   i.item_order,
+                   i.source_ref
+              FROM compare_task_items i
+             WHERE i.task_id = ?
+               AND i.status = 'completed'
+             ORDER BY i.item_order ASC, i.result_id ASC
+            """,
+            (task_id,),
+        ).fetchall()
+        payload_entries = _load_compare_task_item_payload_entries_by_result_ids(
+            conn,
+            [int(row["result_id"]) for row in rows],
+            owner_user_id=owner_user_id,
+        )
+    finally:
+        conn.close()
+    return [
+        {
+            "result_id": int(row["result_id"]),
+            "item_order": int(row["item_order"]),
+            "source_ref": str(row["source_ref"] or ""),
+            "result_payload": dict(
+                payload_entries.get(int(row["result_id"]), {}).get("result_payload") or {}
+            ),
         }
         for row in rows
     ]
@@ -1565,12 +2515,92 @@ def list_compare_task_input_items(
 def requeue_running_task_items(
     db_path: str | Path,
     task_id: str,
+    worker_lease_token: str | None = None,
 ) -> None:
     now = now_ts()
     conn = connect_business_db(db_path)
     try:
-        _requeue_running_task_items_on_conn(conn, task_id=task_id, now=now)
+        _requeue_running_task_items_on_conn(
+            conn,
+            task_id=task_id,
+            now=now,
+            worker_lease_token=worker_lease_token,
+        )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def settle_compare_task_for_worker_shutdown(
+    db_path: str | Path,
+    task_id: str,
+    worker_lease_token: str | None = None,
+) -> str:
+    """Persist a deterministic resumable state when the process is stopping."""
+    now = now_ts()
+    conn = connect_business_db(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT status
+              FROM compare_tasks
+             WHERE task_id = ?
+               AND COALESCE(is_deleted, 0) = 0
+               AND (? IS NULL OR worker_lease_token = ?)
+            """,
+            (task_id, worker_lease_token, worker_lease_token),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return ""
+
+        _requeue_running_task_items_on_conn(conn, task_id=task_id, now=now)
+        current_status = str(row["status"] or "")
+        if current_status == "cancel_requested":
+            next_status = "cancelled"
+            status_message = "Task cancelled while the worker was stopping."
+            conn.execute(
+                """
+                UPDATE compare_tasks
+                   SET status = ?, worker_name = '', worker_lease_token = NULL, status_message = ?,
+                       finished_at = COALESCE(finished_at, ?), updated_at = ?,
+                       last_heartbeat_at = ?
+                 WHERE task_id = ?
+                """,
+                (next_status, status_message, now, now, now, task_id),
+            )
+        elif current_status == "pause_requested":
+            next_status = "paused"
+            status_message = "Task paused while the worker was stopping."
+            conn.execute(
+                """
+                UPDATE compare_tasks
+                   SET status = ?, worker_name = '', worker_lease_token = NULL, status_message = ?,
+                       paused_at = COALESCE(paused_at, ?), updated_at = ?,
+                       last_heartbeat_at = ?
+                 WHERE task_id = ?
+                """,
+                (next_status, status_message, now, now, now, task_id),
+            )
+        else:
+            next_status = "queued"
+            status_message = "Task returned to queue because the worker is stopping."
+            conn.execute(
+                """
+                UPDATE compare_tasks
+                   SET status = ?, worker_name = '', worker_lease_token = NULL, status_message = ?,
+                       paused_at = NULL, finished_at = NULL, queue_entered_at = ?,
+                       updated_at = ?, last_heartbeat_at = ?
+                 WHERE task_id = ?
+                """,
+                (next_status, status_message, now, now, now, task_id),
+            )
+        conn.commit()
+        return next_status
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -1580,6 +2610,7 @@ def _requeue_running_task_items_on_conn(
     *,
     task_id: str,
     now: str,
+    worker_lease_token: str | None = None,
 ) -> int:
     updated = conn.execute(
         """
@@ -1591,16 +2622,49 @@ def _requeue_running_task_items_on_conn(
                updated_at = ?
          WHERE task_id = ?
            AND status = 'running'
+           AND (? IS NULL OR EXISTS (
+               SELECT 1 FROM compare_tasks t
+                WHERE t.task_id = compare_task_items.task_id
+                  AND t.worker_lease_token = ?
+           ))
         """,
-        (now, task_id),
+        (now, task_id, worker_lease_token, worker_lease_token),
     )
     return max(int(updated.rowcount or 0), 0)
+
+
+def _parse_task_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text if "T" in text else text.replace(" ", "T")
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _is_task_heartbeat_stale(
+    *,
+    last_heartbeat_at: Any,
+    now: str,
+    stale_after_seconds: float,
+) -> bool:
+    normalized_threshold = max(float(stale_after_seconds or 0.0), 0.0)
+    if normalized_threshold <= 0:
+        return True
+    heartbeat_at = _parse_task_timestamp(last_heartbeat_at)
+    now_at = _parse_task_timestamp(now)
+    if heartbeat_at is None or now_at is None:
+        return True
+    return (now_at - heartbeat_at).total_seconds() >= normalized_threshold
 
 
 def _recover_interrupted_tasks_on_conn(
     conn: sqlite3.Connection,
     *,
     now: str,
+    stale_after_seconds: float = DEFAULT_TASK_RECOVERY_STALE_SECONDS,
 ) -> dict[str, int]:
     summary = {
         "running_to_queued": 0,
@@ -1610,7 +2674,7 @@ def _recover_interrupted_tasks_on_conn(
     }
     rows = conn.execute(
         """
-        SELECT task_id, status
+        SELECT task_id, status, last_heartbeat_at
           FROM compare_tasks
          WHERE COALESCE(is_deleted, 0) = 0
            AND status IN ('running', 'cancel_requested', 'pause_requested')
@@ -1621,6 +2685,12 @@ def _recover_interrupted_tasks_on_conn(
         task_id = str(row["task_id"] or "")
         current_status = str(row["status"] or "")
         if not task_id or not current_status:
+            continue
+        if not _is_task_heartbeat_stale(
+            last_heartbeat_at=row["last_heartbeat_at"],
+            now=now,
+            stale_after_seconds=stale_after_seconds,
+        ):
             continue
         summary["requeued_item_count"] += _requeue_running_task_items_on_conn(
             conn,
@@ -1633,8 +2703,10 @@ def _recover_interrupted_tasks_on_conn(
                 UPDATE compare_tasks
                    SET status = 'queued',
                        worker_name = '',
+                       worker_lease_token = NULL,
                        status_message = ?,
                        paused_at = NULL,
+                       queue_entered_at = ?,
                        updated_at = ?,
                        last_heartbeat_at = ?
                  WHERE task_id = ?
@@ -1642,6 +2714,7 @@ def _recover_interrupted_tasks_on_conn(
                 """,
                 (
                     "Task recovered after worker interruption and returned to queue.",
+                    now,
                     now,
                     now,
                     task_id,
@@ -1655,6 +2728,7 @@ def _recover_interrupted_tasks_on_conn(
                 UPDATE compare_tasks
                    SET status = 'cancelled',
                        worker_name = '',
+                       worker_lease_token = NULL,
                        status_message = ?,
                        paused_at = NULL,
                        error_message = '',
@@ -1679,6 +2753,7 @@ def _recover_interrupted_tasks_on_conn(
             UPDATE compare_tasks
                SET status = 'paused',
                    worker_name = '',
+                   worker_lease_token = NULL,
                    status_message = ?,
                    paused_at = COALESCE(paused_at, ?),
                    updated_at = ?,
@@ -1698,14 +2773,60 @@ def _recover_interrupted_tasks_on_conn(
     return summary
 
 
+def _has_stale_compare_tasks(
+    conn: sqlite3.Connection,
+    *,
+    now: str,
+    stale_after_seconds: float,
+) -> bool:
+    rows = conn.execute(
+        """
+        SELECT last_heartbeat_at
+          FROM compare_tasks
+         WHERE COALESCE(is_deleted, 0) = 0
+           AND status IN ('running', 'cancel_requested', 'pause_requested')
+        """
+    ).fetchall()
+    return any(
+        _is_task_heartbeat_stale(
+            last_heartbeat_at=row["last_heartbeat_at"],
+            now=now,
+            stale_after_seconds=stale_after_seconds,
+        )
+        for row in rows
+    )
+
+
 def recover_interrupted_tasks(
     db_path: str | Path,
+    *,
+    stale_after_seconds: float = DEFAULT_TASK_RECOVERY_STALE_SECONDS,
 ) -> dict[str, int]:
     now = now_ts()
-    conn = connect_business_db(db_path)
+    summary = {
+        "running_to_queued": 0,
+        "cancel_requested_to_cancelled": 0,
+        "pause_requested_to_paused": 0,
+        "requeued_item_count": 0,
+    }
+    conn = connect_business_db(
+        db_path,
+        busy_timeout_ms=BACKGROUND_DB_BUSY_TIMEOUT_MS,
+    )
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        summary = _recover_interrupted_tasks_on_conn(conn, now=now)
+        if not _has_stale_compare_tasks(
+            conn,
+            now=now,
+            stale_after_seconds=stale_after_seconds,
+        ):
+            return summary
+        if not try_begin_business_write(conn, operation="compare_recovery"):
+            return summary
+        summary = _recover_interrupted_tasks_on_conn(
+            conn,
+            now=now,
+            stale_after_seconds=stale_after_seconds,
+        )
         conn.commit()
         return summary
     finally:
@@ -1716,6 +2837,7 @@ def mark_task_paused(
     db_path: str | Path,
     task_id: str,
     status_message: str,
+    worker_lease_token: str | None = None,
 ) -> None:
     now = now_ts()
     conn = connect_business_db(db_path)
@@ -1724,12 +2846,15 @@ def mark_task_paused(
             """
             UPDATE compare_tasks
                SET status = 'paused',
+                   worker_name = '',
+                   worker_lease_token = NULL,
                    status_message = ?,
                    paused_at = ?,
                    updated_at = ?,
                    last_heartbeat_at = ?
              WHERE task_id = ?
                AND COALESCE(is_deleted, 0) = 0
+               AND (? IS NULL OR worker_lease_token = ?)
             """,
             (
                 status_message,
@@ -1737,6 +2862,8 @@ def mark_task_paused(
                 now,
                 now,
                 task_id,
+                worker_lease_token,
+                worker_lease_token,
             ),
         )
         conn.commit()
@@ -1759,7 +2886,34 @@ def get_compare_result(
     try:
         row = conn.execute(
             """
-            SELECT i.*,
+            SELECT i.result_id,
+                   i.task_id,
+                   i.item_order,
+                   i.source_ref,
+                   i.source_short_drama,
+                   i.source_novel_name,
+                   i.source_excel_row,
+                   i.source_episode,
+                    i.source_author,
+                    i.source_platform,
+                    i.source_display_title,
+                    i.source_description,
+                    i.query_text_preview,
+                    i.status,
+                    i.started_at,
+                   i.finished_at,
+                   i.duration_seconds,
+                   i.semantic_status,
+                   i.top1_book_name,
+                   i.top1_chapter_name,
+                   i.top1_review_label,
+                   i.top1_confidence_label,
+                   i.top1_fine_score,
+                   i.error_message,
+                   i.created_at,
+                   i.updated_at,
+                   p.query_text AS payload_query_text,
+                   p.result_payload_json AS payload_result_payload_json,
                    t.detection_mode,
                    t.source_file_name,
                    t.owner_user_id,
@@ -1771,6 +2925,8 @@ def get_compare_result(
                    r.review_note,
                    r.updated_at AS review_updated_at
              FROM compare_task_items i
+             LEFT JOIN compare_task_item_payloads p
+               ON p.result_id = i.result_id
              JOIN compare_tasks t
                 ON t.task_id = i.task_id
              LEFT JOIN compare_task_reviews r
@@ -1782,11 +2938,43 @@ def get_compare_result(
             + owner_filter,
             tuple(params),
         ).fetchone()
+        row_payload_json: str | None = None
+        row_query_text: str | None = None
+        if row is not None:
+            payload_query_text_present = str(row["payload_query_text"] or "").strip()
+            payload_json_present = str(row["payload_result_payload_json"] or "").strip()
+            if not payload_query_text_present or not payload_json_present:
+                fallback_columns: list[str] = []
+                if not payload_query_text_present:
+                    fallback_columns.append("query_text")
+                if not payload_json_present:
+                    fallback_columns.append("result_payload_json")
+                legacy_row = conn.execute(
+                    f"""
+                    SELECT {", ".join(fallback_columns)}
+                      FROM compare_task_items
+                     WHERE result_id = ?
+                    """,
+                    (int(result_id),),
+                ).fetchone()
+                if legacy_row is not None:
+                    if "query_text" in fallback_columns and legacy_row["query_text"] is not None:
+                        row_query_text = str(legacy_row["query_text"])
+                    if (
+                        "result_payload_json" in fallback_columns
+                        and legacy_row["result_payload_json"] is not None
+                    ):
+                        row_payload_json = str(legacy_row["result_payload_json"])
     finally:
         conn.close()
     if row is None:
         return None
-    result = _result_row_to_dict(row, include_payload=True)
+    row_data = {key: row[key] for key in row.keys()}
+    if row_query_text is not None:
+        row_data["query_text"] = row_query_text
+    if row_payload_json is not None:
+        row_data["result_payload_json"] = row_payload_json
+    result = _result_row_to_dict(row_data, include_payload=True)
     if retrieval_db_path:
         result["result_payload"] = _enrich_result_payload_for_review(
             retrieval_db_path,
@@ -1857,13 +3045,10 @@ def _build_compare_results_filters(
                 SELECT 1
                   FROM compare_task_items newer
                   JOIN compare_tasks newer_task
-                    ON newer_task.task_id = newer.task_id
+                   ON newer_task.task_id = newer.task_id
                  WHERE newer.result_id != i.result_id
-                   AND COALESCE(NULLIF(newer.source_short_drama, ''), '__EMPTY__') = COALESCE(NULLIF(i.source_short_drama, ''), '__EMPTY__')
-                   AND COALESCE(NULLIF(newer.source_novel_name, ''), '__EMPTY__') = COALESCE(NULLIF(i.source_novel_name, ''), '__EMPTY__')
-                   AND COALESCE(NULLIF(newer.source_ref, ''), '__EMPTY__') = COALESCE(NULLIF(i.source_ref, ''), '__EMPTY__')
-                   AND COALESCE(NULLIF(newer.query_text, ''), '__EMPTY__') = COALESCE(NULLIF(i.query_text, ''), '__EMPTY__')
-                   AND newer_task.owner_user_id = t.owner_user_id
+                   AND newer.dedupe_key = i.dedupe_key
+                   AND COALESCE(newer_task.owner_user_id, -1) = COALESCE(t.owner_user_id, -1)
                    AND (
                         newer.updated_at > i.updated_at
                         OR (newer.updated_at = i.updated_at AND newer.result_id > i.result_id)
@@ -2023,7 +3208,7 @@ def _list_compare_results_owner_fast(
                      ORDER BY i.top1_fine_score DESC, i.updated_at DESC, i.result_id DESC
                      LIMIT ? OFFSET ?
                 )
-                SELECT i.*,
+                SELECT {_compare_task_item_list_projection_sql("i")},
                        t.detection_mode,
                        t.source_file_name,
                        t.owner_user_id,
@@ -2058,7 +3243,7 @@ def _list_compare_results_owner_fast(
                      ORDER BY i.top1_fine_score DESC, i.updated_at DESC, i.result_id DESC
                      LIMIT ? OFFSET ?
                 )
-                SELECT i.*,
+                SELECT {_compare_task_item_list_projection_sql("i")},
                        t.detection_mode,
                        t.source_file_name,
                        t.owner_user_id,
@@ -2110,7 +3295,7 @@ def _list_compare_results_owner_fast(
              ORDER BY i.updated_at DESC, i.result_id DESC
              LIMIT ? OFFSET ?
         )
-        SELECT i.*,
+        SELECT {_compare_task_item_list_projection_sql("i")},
                t.detection_mode,
                t.source_file_name,
                t.owner_user_id,
@@ -2329,7 +3514,7 @@ def list_compare_results(
     try:
         rows = conn.execute(
             f"""
-            SELECT i.*,
+            SELECT {_compare_task_item_list_projection_sql("i")},
                    t.detection_mode,
                    t.source_file_name,
                    t.owner_user_id,
@@ -2603,11 +3788,32 @@ def clear_pending_review_results(
 def claim_next_compare_task(
     db_path: str | Path,
     worker_name: str,
+    stale_after_seconds: float = DEFAULT_TASK_RECOVERY_STALE_SECONDS,
 ) -> dict[str, Any] | None:
-    conn = connect_business_db(db_path)
+    # Standalone workers do not have the API recovery thread, so recover first
+    # in a separate transaction rather than extending the claim write lock.
+    recover_interrupted_tasks(
+        db_path,
+        stale_after_seconds=stale_after_seconds,
+    )
+    conn = connect_business_db(
+        db_path,
+        busy_timeout_ms=BACKGROUND_DB_BUSY_TIMEOUT_MS,
+    )
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        _recover_interrupted_tasks_on_conn(conn, now=now_ts())
+        queued = conn.execute(
+            """
+            SELECT 1
+              FROM compare_tasks
+             WHERE status = 'queued'
+               AND COALESCE(is_deleted, 0) = 0
+             LIMIT 1
+            """
+        ).fetchone()
+        if queued is None:
+            return None
+        if not try_begin_business_write(conn, operation="compare_claim"):
+            return None
         row = conn.execute(
             """
             SELECT task_id
@@ -2623,12 +3829,14 @@ def claim_next_compare_task(
             return None
         task_id = row["task_id"]
         now = now_ts()
+        lease_token = uuid4().hex
         updated = conn.execute(
             """
             UPDATE compare_tasks
                SET status = 'running',
                    worker_name = ?,
                    status_message = ?,
+                   worker_lease_token = ?,
                    paused_at = NULL,
                    started_at = COALESCE(started_at, ?),
                    updated_at = ?,
@@ -2640,6 +3848,7 @@ def claim_next_compare_task(
             (
                 worker_name,
                 "Task claimed by worker. Parsing input file.",
+                lease_token,
                 now,
                 now,
                 now,
@@ -2652,7 +3861,193 @@ def claim_next_compare_task(
         conn.commit()
     finally:
         conn.close()
-    return get_compare_task(db_path, task_id)
+    claimed = get_compare_task(db_path, task_id)
+    if claimed is not None:
+        claimed["_worker_lease_token"] = lease_token
+    return claimed
+
+
+def claim_next_queued_task_globally(
+    db_path: str | Path,
+    *,
+    worker_name: str,
+    stale_after_seconds: float = DEFAULT_TASK_RECOVERY_STALE_SECONDS,
+) -> dict[str, str] | None:
+    """Atomically claim the oldest executable task across both batch pipelines.
+
+    Stale recovery is intentionally handled by the maintenance thread. Keeping
+    it out of this transaction makes each worker claim a constant-size write.
+    """
+    _ = stale_after_seconds  # Retained for compatibility with existing callers.
+    conn = connect_business_db(
+        db_path,
+        busy_timeout_ms=BACKGROUND_DB_BUSY_TIMEOUT_MS,
+    )
+    try:
+        queued = conn.execute(
+            """
+            SELECT 1 FROM compare_tasks
+             WHERE status = 'queued' AND COALESCE(is_deleted, 0) = 0
+            UNION ALL
+            SELECT 1 FROM drama_subtitle_tasks
+             WHERE status = 'queued' AND is_deleted = 0
+            LIMIT 1
+            """
+        ).fetchone()
+        if queued is None:
+            return None
+        if not try_begin_business_write(conn, operation="global_task_claim"):
+            return None
+        row = conn.execute(
+            """
+            SELECT task_kind, task_id
+              FROM (
+                    SELECT 'compare' AS task_kind,
+                           task_id,
+                           COALESCE(queue_entered_at, created_at) AS queue_entered_at
+                      FROM compare_tasks
+                     WHERE status = 'queued' AND COALESCE(is_deleted, 0) = 0
+                    UNION ALL
+                    SELECT 'drama_subtitle' AS task_kind,
+                           task_id,
+                           COALESCE(queue_entered_at, created_at) AS queue_entered_at
+                      FROM drama_subtitle_tasks
+                     WHERE status = 'queued' AND COALESCE(is_deleted, 0) = 0
+              )
+             ORDER BY queue_entered_at ASC, task_id ASC
+             LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        task_kind = str(row["task_kind"])
+        task_id = str(row["task_id"])
+        now = now_ts()
+        lease_token = uuid4().hex
+        if task_kind == "compare":
+            updated = conn.execute(
+                """
+                UPDATE compare_tasks
+                   SET status = 'running', worker_name = ?,
+                       worker_lease_token = ?,
+                       status_message = 'Task claimed by worker. Parsing input file.',
+                       paused_at = NULL, started_at = COALESCE(started_at, ?),
+                       updated_at = ?, last_heartbeat_at = ?
+                 WHERE task_id = ? AND status = 'queued' AND COALESCE(is_deleted, 0) = 0
+                """,
+                (worker_name, lease_token, now, now, now, task_id),
+            ).rowcount
+        else:
+            updated = conn.execute(
+                """
+                UPDATE drama_subtitle_tasks
+                   SET status = 'running', worker_name = ?,
+                       worker_lease_token = ?,
+                       status_message = 'Preparing subtitle inputs.',
+                       started_at = COALESCE(started_at, ?), updated_at = ?, last_heartbeat_at = ?
+                 WHERE task_id = ? AND status = 'queued' AND is_deleted = 0
+                """,
+                (worker_name, lease_token, now, now, now, task_id),
+            ).rowcount
+        if updated != 1:
+            conn.rollback()
+            return None
+        conn.commit()
+        return {
+            "task_kind": task_kind,
+            "task_id": task_id,
+            "worker_lease_token": lease_token,
+        }
+    finally:
+        conn.close()
+
+
+def get_task_queue_metadata(
+    db_path: str | Path,
+    *,
+    task_kind: str,
+    task_id: str,
+    worker_count: int,
+    seconds_per_item: float = 5.0,
+) -> dict[str, Any]:
+    """Return aggregate-only queue feedback without exposing other users' task details."""
+    conn = connect_business_db(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT 'compare' AS task_kind, task_id, status,
+                   COALESCE(queue_entered_at, created_at) AS queue_entered_at,
+                   COALESCE(accepted_input_count, 0) AS accepted,
+                   COALESCE(completed_input_count, 0) AS completed,
+                   COALESCE(failed_input_count, 0) AS failed
+              FROM compare_tasks
+             WHERE COALESCE(is_deleted, 0) = 0
+               AND status IN ('queued', 'running', 'pause_requested', 'cancel_requested')
+            UNION ALL
+            SELECT 'drama_subtitle' AS task_kind, task_id, status,
+                   COALESCE(queue_entered_at, created_at) AS queue_entered_at,
+                   COALESCE(accepted_input_count, 0) AS accepted,
+                   COALESCE(completed_input_count, 0) AS completed,
+                   COALESCE(failed_input_count, 0) AS failed
+              FROM drama_subtitle_tasks
+             WHERE COALESCE(is_deleted, 0) = 0
+               AND status IN ('queued', 'running', 'pause_requested', 'cancel_requested')
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    normalized = [dict(row) for row in rows]
+    target = next(
+        (row for row in normalized if row["task_kind"] == task_kind and row["task_id"] == task_id),
+        None,
+    )
+    if target is None:
+        return {"state": "not_queued", "worker_count": max(int(worker_count), 1)}
+
+    def remaining(row: dict[str, Any]) -> int:
+        accepted = max(int(row.get("accepted") or 0), 0)
+        completed = max(int(row.get("completed") or 0), 0)
+        failed = max(int(row.get("failed") or 0), 0)
+        return max(accepted - completed - failed, 1)
+
+    active = [row for row in normalized if row["status"] in {"running", "pause_requested", "cancel_requested"}]
+    queued = sorted(
+        (row for row in normalized if row["status"] == "queued"),
+        key=lambda row: (str(row["queue_entered_at"]), str(row["task_id"])),
+    )
+    workers = max(int(worker_count), 1)
+    rate = max(float(seconds_per_item), 0.1)
+    if target["status"] != "queued":
+        return {
+            "state": "running" if target["status"] == "running" else "control_pending",
+            "worker_count": workers,
+            "seconds_per_item_baseline": rate,
+            "running_task_count": len(active),
+            "remaining_item_count": remaining(target),
+            "estimated_remaining_seconds": round(remaining(target) * rate),
+        }
+
+    target_key = (str(target["queue_entered_at"]), str(target["task_id"]))
+    queued_ahead = [row for row in queued if (str(row["queue_entered_at"]), str(row["task_id"])) < target_key]
+    active_work = sum(remaining(row) for row in active)
+    queued_work = sum(remaining(row) for row in queued_ahead)
+    wait_seconds = round(((active_work + queued_work) / workers) * rate)
+    own_remaining = remaining(target)
+    return {
+        "state": "queued",
+        "worker_count": workers,
+        "seconds_per_item_baseline": rate,
+        "queue_position": len(queued_ahead) + 1,
+        "tasks_ahead_count": len(active) + len(queued_ahead),
+        "queued_tasks_ahead_count": len(queued_ahead),
+        "running_task_count": len(active),
+        "items_ahead_count": active_work + queued_work,
+        "remaining_item_count": own_remaining,
+        "estimated_wait_seconds": wait_seconds,
+        "estimated_completion_seconds": wait_seconds + round(own_remaining * rate),
+    }
 
 
 def set_task_input_count(
@@ -2660,6 +4055,7 @@ def set_task_input_count(
     task_id: str,
     accepted_input_count: int,
     status_message: str = "",
+    worker_lease_token: str | None = None,
 ) -> None:
     now = now_ts()
     conn = connect_business_db(db_path)
@@ -2672,9 +4068,54 @@ def set_task_input_count(
                    updated_at = ?,
                    last_heartbeat_at = ?
              WHERE task_id = ?
+               AND (? IS NULL OR worker_lease_token = ?)
             """,
             (
                 int(accepted_input_count),
+                status_message,
+                now,
+                now,
+                task_id,
+                worker_lease_token,
+                worker_lease_token,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_task_counts(
+    db_path: str | Path,
+    task_id: str,
+    *,
+    accepted_input_count: int,
+    completed_input_count: int,
+    failed_input_count: int,
+    status_message: str = "",
+) -> None:
+    now = now_ts()
+    conn = connect_business_db(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE compare_tasks
+               SET accepted_input_count = ?,
+                   completed_input_count = ?,
+                   failed_input_count = ?,
+                   status_message = CASE
+                       WHEN COALESCE(?, '') <> '' THEN ?
+                       ELSE status_message
+                   END,
+                   updated_at = ?,
+                   last_heartbeat_at = ?
+             WHERE task_id = ?
+            """,
+            (
+                int(accepted_input_count),
+                int(completed_input_count),
+                int(failed_input_count),
+                status_message,
                 status_message,
                 now,
                 now,
@@ -2690,14 +4131,22 @@ def replace_task_items(
     db_path: str | Path,
     task_id: str,
     items: list[dict[str, Any]],
+    worker_lease_token: str | None = None,
 ) -> None:
     now = now_ts()
     conn = connect_business_db(db_path)
     try:
         task_row = conn.execute(
-            "SELECT owner_user_id FROM compare_tasks WHERE task_id = ?",
+            "SELECT owner_user_id, worker_lease_token FROM compare_tasks WHERE task_id = ?",
             (task_id,),
         ).fetchone()
+        if (
+            task_row is None
+            or worker_lease_token is not None
+            and str(task_row["worker_lease_token"] or "") != str(worker_lease_token)
+        ):
+            conn.commit()
+            return
         owner_user_id = (
             None
             if task_row is None or task_row["owner_user_id"] is None
@@ -2756,6 +4205,39 @@ def replace_task_items(
                 for item in items
             ],
         )
+        inserted_rows = conn.execute(
+            """
+            SELECT result_id,
+                   item_order,
+                   created_at,
+                   updated_at
+              FROM compare_task_items
+             WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchall()
+        inserted_by_order = {
+            int(row["item_order"]): (
+                int(row["result_id"]),
+                str(row["created_at"] or now),
+                str(row["updated_at"] or now),
+            )
+            for row in inserted_rows
+        }
+        _upsert_compare_task_item_payload_rows(
+            conn,
+            [
+                (
+                    inserted_by_order[int(item["item_order"])][0],
+                    str(item["query_text"]),
+                    None,
+                    inserted_by_order[int(item["item_order"])][1],
+                    inserted_by_order[int(item["item_order"])][2],
+                )
+                for item in items
+                if int(item["item_order"]) in inserted_by_order
+            ],
+        )
         conn.commit()
     finally:
         conn.close()
@@ -2765,6 +4247,7 @@ def mark_task_heartbeat(
     db_path: str | Path,
     task_id: str,
     status_message: str,
+    worker_lease_token: str | None = None,
 ) -> None:
     now = now_ts()
     conn = connect_business_db(db_path)
@@ -2776,8 +4259,126 @@ def mark_task_heartbeat(
                    updated_at = ?,
                    last_heartbeat_at = ?
              WHERE task_id = ?
+               AND (? IS NULL OR worker_lease_token = ?)
             """,
-            (status_message, now, now, task_id),
+            (status_message, now, now, task_id, worker_lease_token, worker_lease_token),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_task_items_running(
+    db_path: str | Path,
+    task_id: str,
+    item_orders: list[int] | tuple[int, ...],
+    status_message: str = "",
+    touch_task_progress: bool = True,
+    worker_lease_token: str | None = None,
+) -> None:
+    normalized_item_orders = [
+        int(item_order)
+        for item_order in item_orders
+        if int(item_order or 0) > 0
+    ]
+    if not normalized_item_orders:
+        return
+
+    now = now_ts()
+    conn = connect_business_db(db_path)
+    try:
+        lease_item_filter = ""
+        if worker_lease_token is not None:
+            lease_item_filter = """
+               AND EXISTS (
+                   SELECT 1 FROM compare_tasks t
+                    WHERE t.task_id = compare_task_items.task_id
+                      AND t.worker_lease_token = ?
+               )
+            """
+        conn.executemany(
+            f"""
+            UPDATE compare_task_items
+               SET started_at = COALESCE(started_at, ?),
+                   updated_at = ?,
+                   status = 'running'
+             WHERE task_id = ?
+               AND item_order = ?
+               {lease_item_filter}
+            """,
+            [
+                (now, now, task_id, item_order)
+                + ((worker_lease_token,) if worker_lease_token is not None else ())
+                for item_order in normalized_item_orders
+            ],
+        )
+        if touch_task_progress:
+            lease_task_filter = ""
+            lease_task_params: tuple[Any, ...] = ()
+            if worker_lease_token is not None:
+                lease_task_filter = " AND worker_lease_token = ?"
+                lease_task_params = (worker_lease_token,)
+            conn.execute(
+                f"""
+                UPDATE compare_tasks
+                   SET updated_at = ?,
+                       last_heartbeat_at = ?,
+                       status_message = CASE
+                           WHEN COALESCE(?, '') <> '' THEN ?
+                           ELSE status_message
+                       END
+                 WHERE task_id = ?
+                   {lease_task_filter}
+                """,
+                (now, now, status_message, status_message, task_id) + lease_task_params,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_task_progress(
+    db_path: str | Path,
+    task_id: str,
+    *,
+    completed_delta: int = 0,
+    failed_delta: int = 0,
+    status_message: str = "",
+    worker_lease_token: str | None = None,
+) -> None:
+    normalized_completed = max(int(completed_delta or 0), 0)
+    normalized_failed = max(int(failed_delta or 0), 0)
+    if normalized_completed <= 0 and normalized_failed <= 0 and not str(status_message or ""):
+        return
+
+    now = now_ts()
+    conn = connect_business_db(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE compare_tasks
+               SET completed_input_count = completed_input_count + ?,
+                   failed_input_count = failed_input_count + ?,
+                   status_message = CASE
+                       WHEN COALESCE(?, '') <> '' THEN ?
+                       ELSE status_message
+                   END,
+                   updated_at = ?,
+                   last_heartbeat_at = ?
+             WHERE task_id = ?
+               AND (? IS NULL OR worker_lease_token = ?)
+            """,
+            (
+                normalized_completed,
+                normalized_failed,
+                status_message,
+                status_message,
+                now,
+                now,
+                task_id,
+                worker_lease_token,
+                worker_lease_token,
+            ),
         )
         conn.commit()
     finally:
@@ -2795,10 +4396,46 @@ def save_task_item_success(
     top1_confidence_label: str,
     top1_fine_score: float | None,
     result_payload: dict[str, Any],
+    update_task_counts: bool = True,
+    payload_result_id: int | None = None,
+    payload_query_text: str = "",
+    payload_created_at: str = "",
+    worker_lease_token: str | None = None,
 ) -> None:
     now = now_ts()
+    payload_json = _dump_result_payload_json(result_payload)
     conn = connect_business_db(db_path)
     try:
+        if worker_lease_token is not None:
+            conn.execute("BEGIN IMMEDIATE")
+            lease_row = conn.execute(
+                "SELECT 1 FROM compare_tasks WHERE task_id = ? AND worker_lease_token = ? AND status IN ('running', 'pause_requested', 'cancel_requested')",
+                (task_id, worker_lease_token),
+            ).fetchone()
+            if lease_row is None:
+                conn.commit()
+                return
+        resolved_payload_result_id = int(payload_result_id or 0)
+        resolved_payload_query_text = str(payload_query_text or "")
+        resolved_payload_created_at = str(payload_created_at or "")
+        if resolved_payload_result_id <= 0 or not resolved_payload_created_at:
+            payload_row = conn.execute(
+                """
+                SELECT result_id,
+                       query_text,
+                       created_at
+                  FROM compare_task_items
+                 WHERE task_id = ?
+                   AND item_order = ?
+                """,
+                (task_id, int(item_order)),
+            ).fetchone()
+            if payload_row is not None:
+                resolved_payload_result_id = int(payload_row["result_id"] or 0)
+                if not resolved_payload_query_text:
+                    resolved_payload_query_text = str(payload_row["query_text"] or "")
+                if not resolved_payload_created_at:
+                    resolved_payload_created_at = str(payload_row["created_at"] or now)
         conn.execute(
             """
             UPDATE compare_task_items
@@ -2816,11 +4453,16 @@ def save_task_item_success(
                    top1_review_label = ?,
                    top1_confidence_label = ?,
                    top1_fine_score = ?,
-                   result_payload_json = ?,
+                   result_payload_json = '',
                    error_message = '',
                    updated_at = ?
              WHERE task_id = ?
                AND item_order = ?
+               AND (? IS NULL OR EXISTS (
+                   SELECT 1 FROM compare_tasks t
+                    WHERE t.task_id = compare_task_items.task_id
+                      AND t.worker_lease_token = ?
+               ))
             """,
             (
                 now,
@@ -2832,22 +4474,200 @@ def save_task_item_success(
                 top1_review_label,
                 top1_confidence_label,
                 top1_fine_score,
-                json.dumps(result_payload, ensure_ascii=False),
                 now,
                 task_id,
                 int(item_order),
+                worker_lease_token,
+                worker_lease_token,
             ),
         )
-        conn.execute(
+        if resolved_payload_result_id > 0:
+            _upsert_compare_task_item_payload_rows(
+                conn,
+                [
+                    (
+                        resolved_payload_result_id,
+                        resolved_payload_query_text,
+                        payload_json,
+                        resolved_payload_created_at or now,
+                        now,
+                    )
+                ],
+            )
+        if update_task_counts:
+            conn.execute(
+                """
+                UPDATE compare_tasks
+                   SET completed_input_count = completed_input_count + 1,
+                       updated_at = ?,
+                       last_heartbeat_at = ?
+                 WHERE task_id = ?
+                   AND (? IS NULL OR worker_lease_token = ?)
+                """,
+                (now, now, task_id, worker_lease_token, worker_lease_token),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_task_item_outcomes_batch(
+    db_path: str | Path,
+    task_id: str,
+    *,
+    successes: list[dict[str, Any]] | None = None,
+    failures: list[dict[str, Any]] | None = None,
+    update_task_counts: bool = True,
+    worker_lease_token: str | None = None,
+) -> None:
+    normalized_successes = list(successes or [])
+    normalized_failures = list(failures or [])
+    if not normalized_successes and not normalized_failures:
+        return
+
+    now = now_ts()
+    conn = connect_business_db(db_path)
+    try:
+        if worker_lease_token is not None:
+            conn.execute("BEGIN IMMEDIATE")
+            lease_row = conn.execute(
+                "SELECT 1 FROM compare_tasks WHERE task_id = ? AND worker_lease_token = ? AND status IN ('running', 'pause_requested', 'cancel_requested')",
+                (task_id, worker_lease_token),
+            ).fetchone()
+            if lease_row is None:
+                conn.commit()
+                return
+        lease_item_filter = ""
+        lease_item_params: tuple[Any, ...] = ()
+        if worker_lease_token is not None:
+            lease_item_filter = """
+                   AND EXISTS (
+                       SELECT 1 FROM compare_tasks t
+                        WHERE t.task_id = compare_task_items.task_id
+                          AND t.worker_lease_token = ?
+                   )
             """
-            UPDATE compare_tasks
-               SET completed_input_count = completed_input_count + 1,
-                   updated_at = ?,
-                   last_heartbeat_at = ?
-             WHERE task_id = ?
-            """,
-            (now, now, task_id),
-        )
+            lease_item_params = (worker_lease_token,)
+        if normalized_successes:
+            success_rows: list[tuple[Any, ...]] = []
+            payload_rows: list[tuple[int, str, str | None, str, str]] = []
+            for item in normalized_successes:
+                payload_json = _dump_result_payload_json(item.get("result_payload") or {})
+                success_rows.append(
+                    (
+                        now,
+                        now,
+                        now,
+                        str(item.get("semantic_status") or ""),
+                        str(item.get("top1_book_name") or ""),
+                        str(item.get("top1_chapter_name") or ""),
+                        str(item.get("top1_review_label") or ""),
+                        str(item.get("top1_confidence_label") or ""),
+                        item.get("top1_fine_score"),
+                        now,
+                        task_id,
+                        int(item["item_order"]),
+                    )
+                )
+                payload_result_id = int(item.get("payload_result_id") or 0)
+                if payload_result_id > 0:
+                    payload_rows.append(
+                        (
+                            payload_result_id,
+                            str(item.get("payload_query_text") or ""),
+                            payload_json,
+                            str(item.get("payload_created_at") or now),
+                            now,
+                        )
+                    )
+            conn.executemany(
+                f"""
+                UPDATE compare_task_items
+                   SET status = 'completed',
+                       started_at = COALESCE(started_at, ?),
+                       finished_at = ?,
+                       duration_seconds = CASE
+                           WHEN started_at IS NOT NULL THEN
+                               (julianday(?) - julianday(started_at)) * 86400.0
+                           ELSE duration_seconds
+                       END,
+                       semantic_status = ?,
+                       top1_book_name = ?,
+                       top1_chapter_name = ?,
+                       top1_review_label = ?,
+                       top1_confidence_label = ?,
+                       top1_fine_score = ?,
+                       result_payload_json = '',
+                       error_message = '',
+                       updated_at = ?
+                 WHERE task_id = ?
+                   AND item_order = ?
+                   {lease_item_filter}
+                """,
+                [row + lease_item_params for row in success_rows],
+            )
+            _upsert_compare_task_item_payload_rows(conn, payload_rows)
+
+        if normalized_failures:
+            conn.executemany(
+                f"""
+                UPDATE compare_task_items
+                   SET status = 'failed',
+                       started_at = COALESCE(started_at, ?),
+                       finished_at = ?,
+                       duration_seconds = CASE
+                           WHEN started_at IS NOT NULL THEN
+                               (julianday(?) - julianday(started_at)) * 86400.0
+                           ELSE duration_seconds
+                       END,
+                       error_message = ?,
+                       updated_at = ?
+                 WHERE task_id = ?
+                   AND item_order = ?
+                   {lease_item_filter}
+                """,
+                [
+                    (
+                        now,
+                        now,
+                        now,
+                        str(item.get("error_message") or ""),
+                        now,
+                        task_id,
+                        int(item["item_order"]),
+                    )
+                    + lease_item_params
+                    for item in normalized_failures
+                ],
+            )
+
+        if update_task_counts:
+            completed_delta = len(normalized_successes)
+            failed_delta = len(normalized_failures)
+            if completed_delta > 0 or failed_delta > 0:
+                lease_task_filter = ""
+                lease_task_params: tuple[Any, ...] = ()
+                if worker_lease_token is not None:
+                    lease_task_filter = " AND worker_lease_token = ?"
+                    lease_task_params = (worker_lease_token,)
+                conn.execute(
+                    f"""
+                    UPDATE compare_tasks
+                       SET completed_input_count = completed_input_count + ?,
+                           failed_input_count = failed_input_count + ?,
+                           updated_at = ?,
+                           last_heartbeat_at = ?
+                     WHERE task_id = ?
+                       {lease_task_filter}
+                    """,
+                    (
+                        completed_delta,
+                        failed_delta,
+                        now,
+                        now,
+                        task_id,
+                    ) + lease_task_params,
+                )
         conn.commit()
     finally:
         conn.close()
@@ -2858,10 +4678,20 @@ def save_task_item_failure(
     task_id: str,
     item_order: int,
     error_message: str,
+    update_task_counts: bool = True,
+    worker_lease_token: str | None = None,
 ) -> None:
     now = now_ts()
     conn = connect_business_db(db_path)
     try:
+        if worker_lease_token is not None:
+            lease_row = conn.execute(
+                "SELECT 1 FROM compare_tasks WHERE task_id = ? AND worker_lease_token = ? AND status IN ('running', 'pause_requested', 'cancel_requested')",
+                (task_id, worker_lease_token),
+            ).fetchone()
+            if lease_row is None:
+                conn.commit()
+                return
         conn.execute(
             """
             UPDATE compare_task_items
@@ -2877,6 +4707,11 @@ def save_task_item_failure(
                    updated_at = ?
              WHERE task_id = ?
                AND item_order = ?
+               AND (? IS NULL OR EXISTS (
+                   SELECT 1 FROM compare_tasks t
+                    WHERE t.task_id = compare_task_items.task_id
+                      AND t.worker_lease_token = ?
+               ))
             """,
             (
                 now,
@@ -2886,18 +4721,22 @@ def save_task_item_failure(
                 now,
                 task_id,
                 int(item_order),
+                worker_lease_token,
+                worker_lease_token,
             ),
         )
-        conn.execute(
-            """
-            UPDATE compare_tasks
-               SET failed_input_count = failed_input_count + 1,
-                   updated_at = ?,
-                   last_heartbeat_at = ?
-             WHERE task_id = ?
-            """,
-            (now, now, task_id),
-        )
+        if update_task_counts:
+            conn.execute(
+                """
+                UPDATE compare_tasks
+                   SET failed_input_count = failed_input_count + 1,
+                       updated_at = ?,
+                       last_heartbeat_at = ?
+                 WHERE task_id = ?
+                   AND (? IS NULL OR worker_lease_token = ?)
+                """,
+                (now, now, task_id, worker_lease_token, worker_lease_token),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -2912,6 +4751,7 @@ def finish_task(
     summary_export_path: str = "",
     review_export_path: str = "",
     result_json_path: str = "",
+    worker_lease_token: str | None = None,
 ) -> None:
     now = now_ts()
     conn = connect_business_db(db_path)
@@ -2925,10 +4765,12 @@ def finish_task(
                    summary_export_path = ?,
                    review_export_path = ?,
                    result_json_path = ?,
+                   worker_lease_token = NULL,
                    finished_at = ?,
                    updated_at = ?,
                    last_heartbeat_at = ?
              WHERE task_id = ?
+               AND (? IS NULL OR worker_lease_token = ?)
             """,
             (
                 status,
@@ -2941,6 +4783,8 @@ def finish_task(
                 now,
                 now,
                 task_id,
+                worker_lease_token,
+                worker_lease_token,
             ),
         )
         conn.commit()

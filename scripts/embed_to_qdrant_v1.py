@@ -8,13 +8,11 @@ import time
 from typing import Any, Iterable
 from urllib import error, parse, request
 
-from v2_common import connect_db
-
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from scripts.v2_common import connect_db  # noqa: E402
 from scripts.gitee_embedding_client_v1 import (  # noqa: E402
     DEFAULT_GITEE_API_ENDPOINT,
     DEFAULT_GITEE_TOKEN_ENV,
@@ -141,6 +139,9 @@ def embed_texts_by_backend(
     gitee_endpoint: str,
     gitee_token: str,
     gitee_dimensions: int,
+    timeout_seconds: int = 600,
+    max_attempts: int = 4,
+    total_timeout_seconds: float | None = None,
 ) -> list[list[float]]:
     if backend == "ollama":
         return embed_texts(ollama_url, model, texts)
@@ -152,7 +153,9 @@ def embed_texts_by_backend(
                 model=model,
                 texts=texts,
                 dimensions=gitee_dimensions,
-                timeout=600,
+                timeout=timeout_seconds,
+                max_attempts=max_attempts,
+                total_timeout_seconds=total_timeout_seconds,
             )
         except GiteeEmbeddingError as exc:
             raise SyncError(str(exc)) from exc

@@ -19,6 +19,7 @@ TEXT_HEADER_CANDIDATES = (
     "内容",
     "字幕",
     "字幕全文",
+    "完整字幕",
     "待检测文本",
     "待检测文案",
 )
@@ -32,6 +33,7 @@ SOURCE_REF_HEADER_CANDIDATES = (
     "line_no",
     "id",
     "分享链接",
+    "视频链接",
     "序号",
     "编号",
     "标题",
@@ -95,6 +97,79 @@ DESCRIPTION_HEADER_CANDIDATES = (
 )
 
 
+VIDEO_ID_HEADER_CANDIDATES = (
+    "source_video_id",
+    "video_id",
+    "youtube_video_id",
+    "视频ID",
+)
+
+CHANNEL_HEADER_CANDIDATES = (
+    "source_channel",
+    "channel",
+    "channel_name",
+    "uploader",
+    "频道",
+)
+
+UPLOAD_DATE_HEADER_CANDIDATES = (
+    "source_upload_date",
+    "upload_date",
+    "published_at",
+    "published_date",
+    "上传日期",
+)
+
+CAPTION_LANGUAGE_HEADER_CANDIDATES = (
+    "source_caption_language",
+    "caption_language",
+    "subtitle_language",
+    "language_code",
+    "字幕语言",
+)
+
+CAPTION_SOURCE_HEADER_CANDIDATES = (
+    "source_caption_source",
+    "caption_source",
+    "subtitle_source",
+    "字幕来源",
+)
+
+SEGMENT_ORDER_HEADER_CANDIDATES = (
+    "source_segment_order",
+    "segment_order",
+    "segment_index",
+    "cue_order",
+)
+
+TIME_START_HEADER_CANDIDATES = (
+    "source_time_start",
+    "time_start",
+    "start_time",
+    "start_seconds",
+)
+
+TIME_END_HEADER_CANDIDATES = (
+    "source_time_end",
+    "time_end",
+    "end_time",
+    "end_seconds",
+)
+
+TIME_RANGE_HEADER_CANDIDATES = (
+    "caption_range_seconds",
+    "字幕范围（秒）",
+    "字幕范围(秒)",
+    "字幕范围",
+)
+
+ORIGINAL_TEXT_HEADER_CANDIDATES = (
+    "source_text_original",
+    "original_text",
+    "raw_text",
+)
+
+
 PREFERRED_XLSX_SHEET_NAMES = (
     "batch_input",
     "结果总表",
@@ -115,6 +190,15 @@ class ParsedTaskInput:
     source_platform: str = ""
     source_display_title: str = ""
     source_description: str = ""
+    source_video_id: str = ""
+    source_channel: str = ""
+    source_upload_date: str = ""
+    source_caption_language: str = ""
+    source_caption_source: str = ""
+    source_segment_order: str = ""
+    source_time_start: str = ""
+    source_time_end: str = ""
+    source_text_original: str = ""
 
 
 def _normalize_header(value: str) -> str:
@@ -290,6 +374,11 @@ def _parse_inline_source_parts(query_text: str) -> tuple[str, str, str] | None:
     return source_ref, display_title, body
 
 
+def _split_time_range(value: str) -> tuple[str, str]:
+    parts = [part.strip() for part in re.split(r"\s*(?:-|~|至|到)\s*", str(value or ""), maxsplit=1)]
+    return (parts[0], parts[1]) if len(parts) == 2 and all(parts) else ("", "")
+
+
 def _looks_like_header_row(first_row: list[str], second_row: list[str] | None = None) -> bool:
     normalized_headers = {_normalize_header(value) for value in first_row if value}
     known_header_hits = sum(
@@ -305,6 +394,16 @@ def _looks_like_header_row(first_row: list[str], second_row: list[str] | None = 
             *PLATFORM_HEADER_CANDIDATES,
             *DISPLAY_TITLE_HEADER_CANDIDATES,
             *DESCRIPTION_HEADER_CANDIDATES,
+            *VIDEO_ID_HEADER_CANDIDATES,
+            *CHANNEL_HEADER_CANDIDATES,
+            *UPLOAD_DATE_HEADER_CANDIDATES,
+            *CAPTION_LANGUAGE_HEADER_CANDIDATES,
+            *CAPTION_SOURCE_HEADER_CANDIDATES,
+            *SEGMENT_ORDER_HEADER_CANDIDATES,
+            *TIME_START_HEADER_CANDIDATES,
+            *TIME_END_HEADER_CANDIDATES,
+            *TIME_RANGE_HEADER_CANDIDATES,
+            *ORIGINAL_TEXT_HEADER_CANDIDATES,
         )
         if _normalize_header(candidate) in normalized_headers
     )
@@ -397,6 +496,25 @@ def _build_rows_from_dicts(rows: list[dict[str, str]]) -> list[ParsedTaskInput]:
         DESCRIPTION_HEADER_CANDIDATES,
         excluded=excluded_headers,
     )
+    if description_column:
+        excluded_headers.add(description_column)
+
+    def optional_column(candidates: Iterable[str]) -> str | None:
+        column = _detect_optional_column(rows[0].keys(), candidates, excluded=excluded_headers)
+        if column:
+            excluded_headers.add(column)
+        return column
+
+    video_id_column = optional_column(VIDEO_ID_HEADER_CANDIDATES)
+    channel_column = optional_column(CHANNEL_HEADER_CANDIDATES)
+    upload_date_column = optional_column(UPLOAD_DATE_HEADER_CANDIDATES)
+    caption_language_column = optional_column(CAPTION_LANGUAGE_HEADER_CANDIDATES)
+    caption_source_column = optional_column(CAPTION_SOURCE_HEADER_CANDIDATES)
+    segment_order_column = optional_column(SEGMENT_ORDER_HEADER_CANDIDATES)
+    time_start_column = optional_column(TIME_START_HEADER_CANDIDATES)
+    time_end_column = optional_column(TIME_END_HEADER_CANDIDATES)
+    time_range_column = optional_column(TIME_RANGE_HEADER_CANDIDATES)
+    original_text_column = optional_column(ORIGINAL_TEXT_HEADER_CANDIDATES)
     parsed: list[ParsedTaskInput] = []
     for row_index, row in enumerate(rows, start=1):
         query_text = str(row.get(text_column, "") or "").strip()
@@ -431,6 +549,17 @@ def _build_rows_from_dicts(rows: list[dict[str, str]]) -> list[ParsedTaskInput]:
         source_description = ""
         if description_column:
             source_description = str(row.get(description_column, "") or "").strip()
+        source_video_id = str(row.get(video_id_column, "") or "").strip() if video_id_column else ""
+        source_channel = str(row.get(channel_column, "") or "").strip() if channel_column else ""
+        source_upload_date = str(row.get(upload_date_column, "") or "").strip() if upload_date_column else ""
+        source_caption_language = str(row.get(caption_language_column, "") or "").strip() if caption_language_column else ""
+        source_caption_source = str(row.get(caption_source_column, "") or "").strip() if caption_source_column else ""
+        source_segment_order = str(row.get(segment_order_column, "") or "").strip() if segment_order_column else ""
+        source_time_start = str(row.get(time_start_column, "") or "").strip() if time_start_column else ""
+        source_time_end = str(row.get(time_end_column, "") or "").strip() if time_end_column else ""
+        if time_range_column and not source_time_start and not source_time_end:
+            source_time_start, source_time_end = _split_time_range(str(row.get(time_range_column, "") or ""))
+        source_text_original = str(row.get(original_text_column, "") or "").strip() if original_text_column else query_text
         inline_source_parts = _parse_inline_source_parts(query_text)
         if inline_source_parts is not None:
             inline_source_ref, inline_display_title, inline_query_text = inline_source_parts
@@ -452,6 +581,15 @@ def _build_rows_from_dicts(rows: list[dict[str, str]]) -> list[ParsedTaskInput]:
                 source_platform=source_platform,
                 source_display_title=source_display_title,
                 source_description=source_description,
+                source_video_id=source_video_id,
+                source_channel=source_channel,
+                source_upload_date=source_upload_date,
+                source_caption_language=source_caption_language,
+                source_caption_source=source_caption_source,
+                source_segment_order=source_segment_order,
+                source_time_start=source_time_start,
+                source_time_end=source_time_end,
+                source_text_original=source_text_original,
             )
         )
     return parsed

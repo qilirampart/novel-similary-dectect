@@ -4,17 +4,17 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import time
 from typing import Any
 from uuid import uuid4
 
 try:
     from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 except ImportError as exc:  # pragma: no cover
     raise RuntimeError("Review export requires openpyxl to be installed") from exc
 
-from service.business_store import get_compare_result, list_compare_results
+from service.business_store import hydrate_compare_result_summaries, list_compare_results
 
 
 PROCESSED_REVIEW_STATUSES = (
@@ -114,6 +114,41 @@ def build_review_export_xlsx(
     processed_only: bool = True,
     candidate_score_threshold: float | None = None,
 ) -> tuple[Path, str]:
+    file_path, export_filename, _ = build_review_export_xlsx_with_metrics(
+        business_db_path=business_db_path,
+        retrieval_db_path=retrieval_db_path,
+        export_root=export_root,
+        owner_user_id=owner_user_id,
+        task_id=task_id,
+        item_status=item_status,
+        review_status=review_status,
+        sort_by=sort_by,
+        dedupe_latest=dedupe_latest,
+        text_filter=text_filter,
+        processed_only=processed_only,
+        candidate_score_threshold=candidate_score_threshold,
+    )
+    return file_path, export_filename
+
+
+def build_review_export_xlsx_with_metrics(
+    *,
+    business_db_path: str | Path,
+    retrieval_db_path: str | Path,
+    export_root: str | Path,
+    owner_user_id: int,
+    task_id: str = "",
+    item_status: str = "",
+    review_status: str = "",
+    sort_by: str = "updated_at_desc",
+    dedupe_latest: bool = False,
+    text_filter: str = "",
+    processed_only: bool = True,
+    candidate_score_threshold: float | None = None,
+) -> tuple[Path, str, dict[str, Any]]:
+    total_started = time.perf_counter()
+
+    stage_started = time.perf_counter()
     summaries = _load_result_summaries(
         business_db_path=business_db_path,
         owner_user_id=owner_user_id,
@@ -126,20 +161,19 @@ def build_review_export_xlsx(
         processed_only=processed_only,
         candidate_score_threshold=candidate_score_threshold,
     )
-    details = [
-        detail
-        for detail in (
-            get_compare_result(
-                business_db_path,
-                int(item["result_id"]),
-                retrieval_db_path=retrieval_db_path,
-                owner_user_id=owner_user_id,
-            )
-            for item in summaries
-        )
-        if detail is not None
-    ]
+    load_result_summaries_seconds = time.perf_counter() - stage_started
 
+    stage_started = time.perf_counter()
+    details = hydrate_compare_result_summaries(
+        business_db_path,
+        summaries,
+        retrieval_db_path=retrieval_db_path,
+        owner_user_id=owner_user_id,
+        review_result_limit=1,
+    )
+    hydrate_result_details_seconds = time.perf_counter() - stage_started
+
+    stage_started = time.perf_counter()
     workbook = _build_workbook(
         details=details,
         owner_user_id=owner_user_id,
@@ -152,13 +186,32 @@ def build_review_export_xlsx(
         processed_only=processed_only,
         candidate_score_threshold=candidate_score_threshold,
     )
+    build_workbook_seconds = time.perf_counter() - stage_started
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stage_started = time.perf_counter()
     export_dir = (Path(export_root) / "review_exports" / f"user_{owner_user_id}").resolve()
     export_dir.mkdir(parents=True, exist_ok=True)
     file_path = export_dir / f"review_export_{timestamp}_{uuid4().hex[:8]}.xlsx"
     workbook.save(file_path)
-    return file_path, f"{REVIEW_EXPORT_FILENAME_PREFIX}_{timestamp}.xlsx"
+    save_workbook_seconds = time.perf_counter() - stage_started
+    total_elapsed_seconds = time.perf_counter() - total_started
+
+    metrics = {
+        "summary_count": len(summaries),
+        "detail_count": len(details),
+        "processed_only": bool(processed_only),
+        "task_id": str(task_id or ""),
+        "owner_user_id": int(owner_user_id),
+        "stages": {
+            "load_result_summaries_seconds": round(load_result_summaries_seconds, 6),
+            "hydrate_result_details_seconds": round(hydrate_result_details_seconds, 6),
+            "build_workbook_seconds": round(build_workbook_seconds, 6),
+            "save_workbook_seconds": round(save_workbook_seconds, 6),
+        },
+        "total_elapsed_seconds": round(total_elapsed_seconds, 6),
+    }
+    return file_path, f"{REVIEW_EXPORT_FILENAME_PREFIX}_{timestamp}.xlsx", metrics
 
 
 def _load_result_summaries(
@@ -247,11 +300,10 @@ def _build_workbook(
     processed_only: bool,
     candidate_score_threshold: float | None,
 ) -> Workbook:
-    workbook = Workbook()
+    workbook = Workbook(write_only=True)
     grouped_rows = _group_export_rows(details)
 
-    summary_sheet = workbook.active
-    summary_sheet.title = "导出说明"
+    summary_sheet = workbook.create_sheet(title="导出说明")
     _populate_summary_sheet(
         summary_sheet,
         grouped_rows=grouped_rows,
@@ -396,11 +448,6 @@ def _populate_summary_sheet(
     processed_only: bool,
     candidate_score_threshold: float | None,
 ) -> None:
-    header_font = Font(name="Arial", bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    body_font = Font(name="Arial")
-    wrap_alignment = Alignment(vertical="top", wrap_text=True)
-
     rows = [
         ("导出时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ("导出范围", "当前登录账号下的复核结果导出"),
@@ -424,47 +471,21 @@ def _populate_summary_sheet(
         sheet.append(list(row))
 
     sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = f"A1:B{len(rows) + 1}"
     sheet.column_dimensions["A"].width = 24
     sheet.column_dimensions["B"].width = 88
-    sheet["A1"].font = header_font
-    sheet["B1"].font = header_font
-    sheet["A1"].fill = header_fill
-    sheet["B1"].fill = header_fill
-
-    for row in sheet.iter_rows(min_row=2, max_row=sheet.max_row, min_col=1, max_col=2):
-        for cell in row:
-            cell.font = body_font
-            cell.alignment = wrap_alignment
 
 
 def _populate_data_sheet(sheet, rows: list[list[Any]]) -> None:
-    header_font = Font(name="Arial", bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    body_font = Font(name="Arial")
-    default_alignment = Alignment(vertical="top")
-    wrapped_alignment = Alignment(vertical="top", wrap_text=True)
-
     sheet.append([column.header for column in REVIEW_EXPORT_COLUMNS])
     for row in rows:
         sheet.append(row)
 
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = sheet.dimensions
+    sheet.auto_filter.ref = f"A1:{get_column_letter(len(REVIEW_EXPORT_COLUMNS))}{len(rows) + 1}"
 
     for index, column in enumerate(REVIEW_EXPORT_COLUMNS, start=1):
-        cell = sheet.cell(row=1, column=index)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = wrapped_alignment
         sheet.column_dimensions[get_column_letter(index)].width = column.width
-
-    for row in sheet.iter_rows(min_row=2, max_row=sheet.max_row, min_col=1, max_col=len(REVIEW_EXPORT_COLUMNS)):
-        for column_index, cell in enumerate(row, start=1):
-            column = REVIEW_EXPORT_COLUMNS[column_index - 1]
-            cell.font = body_font
-            cell.alignment = wrapped_alignment if column.wrap_text else default_alignment
-            if column.number_format:
-                cell.number_format = column.number_format
 
 
 def _pick_first_non_empty(*values: Any) -> Any:

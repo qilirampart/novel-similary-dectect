@@ -54,6 +54,8 @@ def upload_parts(
     remote_name: str,
     part_size_mib: int,
     io_chunk_mib: int,
+    part_start: int = 0,
+    part_end: int | None = None,
 ) -> None:
     file_size = local_path.stat().st_size
     part_size = part_size_mib * 1024 * 1024
@@ -67,7 +69,11 @@ def upload_parts(
     print(f"part_size={part_size}")
     print(f"part_count={part_count}")
 
-    for part_index in range(part_count):
+    effective_start = max(0, int(part_start))
+    effective_end = part_count if part_end is None else min(part_count, int(part_end))
+    if effective_start >= effective_end:
+        raise ValueError(f"invalid part range: {effective_start}:{effective_end}")
+    for part_index in range(effective_start, effective_end):
         offset = part_index * part_size
         expected_size = min(part_size, file_size - offset)
         remote_part_path = f"{remote_parts_dir}/{remote_name}.part{part_index:05d}"
@@ -96,6 +102,8 @@ def upload_parts(
                 sftp = client.open_sftp()
                 try:
                     with sftp.open(remote_part_path, "wb") as dst:
+                        # Pipeline SFTP writes to avoid waiting for every packet round trip.
+                        dst.set_pipelined(True)
                         remaining = expected_size
                         while remaining > 0:
                             buf = src.read(min(io_chunk, remaining))
@@ -129,23 +137,31 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", required=True)
     parser.add_argument("--user", required=True)
-    parser.add_argument("--password", required=True)
+    parser.add_argument("--password", default="")
+    parser.add_argument("--password-env", default="")
     parser.add_argument("--local-path", required=True)
     parser.add_argument("--remote-dir", required=True)
     parser.add_argument("--remote-name", required=True)
     parser.add_argument("--part-size-mib", type=int, default=512)
     parser.add_argument("--io-chunk-mib", type=int, default=8)
+    parser.add_argument("--part-start", type=int, default=0)
+    parser.add_argument("--part-end", type=int)
     args = parser.parse_args()
 
+    password = args.password or os.environ.get(args.password_env, "")
+    if not password:
+        raise SystemExit("Provide --password or --password-env with a populated environment variable.")
     upload_parts(
         host=args.host,
         user=args.user,
-        password=args.password,
+        password=password,
         local_path=Path(args.local_path),
         remote_dir=args.remote_dir,
         remote_name=args.remote_name,
         part_size_mib=args.part_size_mib,
         io_chunk_mib=args.io_chunk_mib,
+        part_start=args.part_start,
+        part_end=args.part_end,
     )
 
 

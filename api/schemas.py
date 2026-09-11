@@ -20,6 +20,62 @@ class CompareSingleResponse(BaseModel):
     payload: dict[str, Any]
 
 
+class DramaSubtitleCompareRequest(BaseModel):
+    query_text: str = Field(..., min_length=1, description="Subtitle text to compare against drama subtitles.")
+    top_k: Optional[int] = Field(default=None, ge=1, le=20)
+    window_limit: Optional[int] = Field(default=None, ge=1, le=500)
+    language_code: Optional[str] = Field(default=None, description="Optional corpus language override: zh, en, ko or ja. Portuguese can be auto-detected.")
+    semantic_enabled: Optional[bool] = Field(default=None, description="Enable same-language semantic recall.")
+    semantic_window_limit: Optional[int] = Field(default=None, ge=1, le=500)
+    translation_fallback: Optional[bool] = Field(default=None, description="Translate only after a native-language no-match.")
+
+
+class DramaSubtitleCompareResponse(BaseModel):
+    request_id: str
+    duration_seconds: float
+    payload: dict[str, Any]
+
+
+class DramaSubtitleCue(BaseModel):
+    start_seconds: float = Field(..., ge=0, description="Cue start time in seconds.")
+    end_seconds: float = Field(..., ge=0, description="Cue end time in seconds.")
+    text: str = Field(..., min_length=1, description="Original cue text.")
+
+
+class DramaSubtitleVideoCompareRequest(BaseModel):
+    query_text: str = Field(..., min_length=1, description="Complete subtitle text for the video-level fast screen.")
+    cues: list[DramaSubtitleCue] = Field(..., min_length=1, description="Cue timeline used for server-side fallback segmentation.")
+    top_k: Optional[int] = Field(default=None, ge=1, le=20)
+    window_limit: Optional[int] = Field(default=None, ge=1, le=500)
+    language_code: Optional[str] = Field(default=None, description="Optional corpus language override: zh, en, ko or ja. Portuguese can be auto-detected.")
+    semantic_enabled: Optional[bool] = Field(default=None, description="Enable same-language semantic recall.")
+    semantic_window_limit: Optional[int] = Field(default=None, ge=1, le=500)
+    translation_fallback: Optional[bool] = Field(default=None, description="Translate only after a native-language no-match.")
+
+
+class DramaSubtitleVideoCompareResponse(BaseModel):
+    request_id: str
+    duration_seconds: float
+    payload: dict[str, Any]
+
+
+class DramaSubtitleTaskCreateResponse(BaseModel):
+    task_id: str
+    status: str
+    source_file_name: str
+
+
+class DramaSubtitleTaskListResponse(BaseModel):
+    items: list[dict[str, Any]]
+    limit: int
+    offset: int
+
+
+class DramaSubtitleTaskDetailResponse(BaseModel):
+    task: dict[str, Any]
+    items: list[dict[str, Any]]
+
+
 class TaskCreateResponse(BaseModel):
     task_id: str
     status: str
@@ -105,3 +161,10 @@ class HealthResponse(BaseModel):
     status: str
     service: str
     version: str
+
+
+class ReadinessResponse(BaseModel):
+    status: str
+    service: str
+    version: str
+    checks: dict[str, str]

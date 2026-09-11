@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import sys
 from urllib.parse import quote
@@ -81,7 +82,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", required=True)
     parser.add_argument("--user", required=True)
-    parser.add_argument("--password", required=True)
+    parser.add_argument("--password", default="")
+    parser.add_argument("--password-env", default="")
     parser.add_argument("--qdrant-url", default="http://127.0.0.1:6333")
     parser.add_argument("--collection-name", required=True)
     parser.add_argument("--snapshot-path", required=True)
@@ -91,10 +93,13 @@ def main() -> int:
     parser.add_argument("--checksum")
     args = parser.parse_args()
 
+    password = args.password or os.environ.get(args.password_env, "")
+    if not password:
+        raise SystemExit("Provide --password or --password-env with a populated environment variable.")
     restore_snapshot(
         host=args.host,
         user=args.user,
-        password=args.password,
+        password=password,
         qdrant_url=args.qdrant_url,
         collection_name=args.collection_name,
         snapshot_path=args.snapshot_path,

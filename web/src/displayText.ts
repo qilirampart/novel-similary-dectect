@@ -23,7 +23,8 @@ const SEMANTIC_STATUS_LABELS: Record<string, string> = {
   waiting: "待执行",
   disabled: "未启用",
   semantic_ready: "语义可用",
-  fallback_lexical_only: "仅词法回退"
+  fallback_lexical_only: "仅词法回退",
+  fallback_semantic_timeout: "语义超时回退"
 };
 
 const REVIEW_LABELS: Record<string, string> = {
@@ -76,6 +77,7 @@ const SYSTEM_ITEM_LABELS: Record<string, string> = {
   results: "结果数",
   reviews: "复核数",
   backend: "后端",
+  "embedding provider": "向量服务",
   model: "模型",
   Qdrant: "Qdrant 地址",
   "chunk collection": "分片集合",
@@ -165,7 +167,7 @@ export function formatSystemHint(value: string): string {
   if (normalized === "Check runtime storage and worker dependencies") return "请检查运行目录和 Worker 依赖";
   if (normalized === "Live workers") return "当前 Worker";
   if (normalized === "Top1 review labels") return "Top1 风险标签";
-  if (normalized === "rewrite fallback") return "rewrite 回退";
+  if (normalized === "rewrite fallback") return "改写检测回退";
   if (normalized === "No recent task failures. Runtime indicators are stable.") return "最近没有任务失败，运行指标稳定。";
   if (normalized === "latest task update") return "最近一次任务更新";
 
@@ -193,7 +195,7 @@ export function formatSystemHint(value: string): string {
 export function formatTaskMessage(value: string): string {
   const normalized = value.trim();
   if (!normalized) return "-";
-  if (/[一-龥]/.test(normalized)) return normalized;
+  if (/[\u4e00-\u9fff]/.test(normalized)) return normalized;
   if (normalized === "Task claimed by worker. Parsing input file.") return "任务已被 Worker 接手，正在解析输入文件。";
   if (normalized === "Task execution failed with an unhandled exception.") return "任务执行时发生未处理异常。";
   if (normalized === "Task cancelled during execution.") return "任务在执行过程中已取消。";

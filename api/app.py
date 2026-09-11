@@ -1,9 +1,13 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import faulthandler
 from contextlib import asynccontextmanager
 from datetime import datetime
 from hashlib import sha256
+import logging
+import os
 from pathlib import Path
+import signal
 import shutil
 import time
 from typing import Optional
@@ -19,6 +23,7 @@ except Exception:
     import sqlite3
 
 from api.config import SETTINGS
+from api.cover_routes import build_cover_monitor_router
 from api.runtime_worker import start_auto_worker, stop_auto_worker
 from api.schemas import (
     BasicTaskResponse,
@@ -27,9 +32,17 @@ from api.schemas import (
     CompareSingleRequest,
     CompareSingleResponse,
     CreateUserRequest,
+    DramaSubtitleCompareRequest,
+    DramaSubtitleCompareResponse,
+    DramaSubtitleVideoCompareRequest,
+    DramaSubtitleVideoCompareResponse,
+    DramaSubtitleTaskCreateResponse,
+    DramaSubtitleTaskDetailResponse,
+    DramaSubtitleTaskListResponse,
     HealthResponse,
     LoginRequest,
     ResultListResponse,
+    ReadinessResponse,
     SystemStatusResponse,
     TaskCreateResponse,
     TaskDetailResponse,
@@ -51,6 +64,8 @@ from service.business_store import (
     get_compare_result,
     get_compare_task,
     get_compare_task_item_stats,
+    get_business_db_lock_metrics,
+    get_task_queue_metadata,
     get_session_user,
     init_business_db,
     list_compare_results,
@@ -65,25 +80,105 @@ from service.business_store import (
     update_user,
     upsert_compare_task_review,
 )
+from service.cover_monitor.store import init_cover_db
 from service.compare_pipeline import ComparePipelineRequest, run_compare_pipeline
+from service.drama_subtitle_evidence_context import (
+    DramaSubtitleEvidenceContextError,
+    get_drama_subtitle_evidence_context,
+)
+from service.drama_subtitle_hybrid_retrieval import search_drama_subtitle_hybrid_candidates
+from service.drama_subtitle_retrieval import DramaSubtitleRetrievalError
+from service.drama_subtitle_video_compare import compare_drama_subtitle_video
+from service.drama_subtitle_translation import apply_translation_fallback
+from service.drama_subtitle_export import build_drama_subtitle_review_export_xlsx
+from service.drama_subtitle_task_store import (
+    create_drama_subtitle_task,
+    get_drama_subtitle_task,
+    list_drama_subtitle_task_items,
+    list_drama_subtitle_tasks,
+    upsert_drama_subtitle_task_review,
+    update_drama_subtitle_task_control,
+)
 from service.review_export import build_review_export_xlsx
+from service.task_input_parser import parse_task_input_file
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SEMANTIC_DISABLED_BACKENDS = {"", "0", "false", "off", "none", "disabled"}
 SESSION_COOKIE_NAME = "novel_similarity_session"
 SESSION_TTL_HOURS = 12
+logger = logging.getLogger(__name__)
+_FAULT_DIAGNOSTICS_SIGNAL_NUM: int | None = None
+_FAULT_DIAGNOSTICS_ARMED = False
+
+
+def _resolve_fault_diagnostics_signal() -> tuple[int | None, str]:
+    signal_name = str(SETTINGS.fault_diagnostics_signal or "").strip().upper()
+    if not SETTINGS.fault_diagnostics_enabled or not signal_name:
+        return None, signal_name
+    signal_value = getattr(signal, signal_name, None)
+    if signal_value is None:
+        return None, signal_name
+    return int(signal_value), signal_name
+
+
+def _configure_fault_diagnostics() -> None:
+    global _FAULT_DIAGNOSTICS_SIGNAL_NUM, _FAULT_DIAGNOSTICS_ARMED
+    if _FAULT_DIAGNOSTICS_ARMED:
+        return
+    if not hasattr(faulthandler, "register") or not hasattr(faulthandler, "unregister"):
+        logger.info("fault diagnostics signal hooks are unavailable on this platform")
+        return
+    signal_num, signal_name = _resolve_fault_diagnostics_signal()
+    if signal_num is None:
+        if SETTINGS.fault_diagnostics_enabled:
+            logger.warning(
+                "fault diagnostics signal is unavailable: %s",
+                signal_name or "<empty>",
+            )
+        return
+    try:
+        faulthandler.enable(all_threads=True)
+        try:
+            faulthandler.unregister(signal_num)
+        except RuntimeError:
+            pass
+        faulthandler.register(signal_num, all_threads=True, chain=False)
+        _FAULT_DIAGNOSTICS_SIGNAL_NUM = signal_num
+        _FAULT_DIAGNOSTICS_ARMED = True
+        logger.info(
+            "fault diagnostics armed signal=%s pid=%s",
+            signal_name,
+            os.getpid(),
+        )
+    except Exception:  # pragma: no cover - defensive startup instrumentation
+        logger.exception("failed to configure fault diagnostics")
+
+
+def _teardown_fault_diagnostics() -> None:
+    global _FAULT_DIAGNOSTICS_SIGNAL_NUM, _FAULT_DIAGNOSTICS_ARMED
+    if not _FAULT_DIAGNOSTICS_ARMED or _FAULT_DIAGNOSTICS_SIGNAL_NUM is None:
+        return
+    try:
+        faulthandler.unregister(_FAULT_DIAGNOSTICS_SIGNAL_NUM)
+    except RuntimeError:
+        pass
+    _FAULT_DIAGNOSTICS_SIGNAL_NUM = None
+    _FAULT_DIAGNOSTICS_ARMED = False
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     SETTINGS.ensure_runtime_dirs()
     init_business_db(SETTINGS.business_db_path)
+    init_cover_db(SETTINGS.cover_monitor_db_path)
+    _configure_fault_diagnostics()
     app.state.auto_worker_handle = start_auto_worker()
     try:
         yield
     finally:
         stop_auto_worker(getattr(app.state, "auto_worker_handle", None))
         app.state.auto_worker_handle = None
+        _teardown_fault_diagnostics()
 
 
 app = FastAPI(
@@ -257,8 +352,19 @@ def _build_system_status_payload() -> dict[str, object]:
           JOIN compare_tasks t
             ON t.task_id = i.task_id
          WHERE COALESCE(t.is_deleted, 0) = 0
-           AND i.semantic_status = 'fallback_lexical_only'
+           AND i.semantic_status IN ('fallback_lexical_only', 'fallback_semantic_timeout')
         """,
+    )
+    db_lock_metrics = get_business_db_lock_metrics()
+    db_lock_event_count = sum(
+        int(metric.get("lock_events", 0)) for metric in db_lock_metrics.values()
+    )
+    db_lock_skipped_count = sum(
+        int(metric.get("skipped", 0)) for metric in db_lock_metrics.values()
+    )
+    db_lock_wait_max = max(
+        (float(metric.get("wait_seconds_max", 0.0)) for metric in db_lock_metrics.values()),
+        default=0.0,
     )
 
     status_value = "healthy" if retrieval_db_exists and business_db_exists else "degraded"
@@ -298,6 +404,9 @@ def _build_system_status_payload() -> dict[str, object]:
                 ["tasks", str(total_tasks)],
                 ["results", f"{result_count:,}"],
                 ["reviews", f"{review_count:,}"],
+                ["SQLite lock events", str(db_lock_event_count)],
+                ["max lock wait", f"{db_lock_wait_max:.3f}s"],
+                ["skipped background writes", str(db_lock_skipped_count)],
             ],
         },
         {
@@ -389,6 +498,19 @@ def _require_current_user(session_id: Optional[str] = Cookie(default=None, alias
     return user
 
 
+def _with_task_queue_metadata(task: dict[str, object], *, task_kind: str) -> dict[str, object]:
+    """Attach aggregate queue feedback without disclosing other users' task details."""
+    enriched = dict(task)
+    enriched["queue"] = get_task_queue_metadata(
+        SETTINGS.business_db_path,
+        task_kind=task_kind,
+        task_id=str(task.get("task_id") or ""),
+        worker_count=SETTINGS.auto_worker_count,
+        seconds_per_item=SETTINGS.task_queue_eta_seconds_per_item,
+    )
+    return enriched
+
+
 def _current_user_id(user: dict[str, object]) -> int:
     return int(user["user_id"])
 
@@ -397,6 +519,16 @@ def _require_admin_user(user: dict[str, object] = Depends(_require_current_user)
     if str(user.get("role") or "") != "admin":
         raise HTTPException(status_code=403, detail="admin permission required")
     return user
+
+
+app.include_router(
+    build_cover_monitor_router(
+        db_path=SETTINGS.cover_monitor_db_path,
+        import_root=SETTINGS.cover_monitor_import_root,
+        import_max_bytes=SETTINGS.cover_monitor_import_max_bytes,
+        current_user_dependency=_require_current_user,
+    )
+)
 
 
 @app.post("/api/v1/auth/login", response_model=UserProfileResponse)
@@ -481,11 +613,48 @@ def update_user_api(
 
 @app.get("/api/v1/health", response_model=HealthResponse)
 @app.get("/api/v1/system/health", response_model=HealthResponse)
-def health() -> HealthResponse:
+async def health() -> HealthResponse:
     return HealthResponse(
         status="ok",
         service="novel-similarity-compare-api",
         version="0.1.0",
+    )
+
+
+@app.get("/api/v1/health/live", response_model=HealthResponse)
+@app.get("/api/v1/health/livez", response_model=HealthResponse)
+async def health_live() -> HealthResponse:
+    """Return a dependency-free liveness response for the process watchdog."""
+    return HealthResponse(
+        status="ok",
+        service="novel-similarity-compare-api",
+        version="0.1.0",
+    )
+
+
+def _runtime_file_status(path_text: str) -> str:
+    path = Path(path_text)
+    if not path.is_absolute():
+        path = (ROOT_DIR / path).resolve()
+    return "ready" if path.is_file() else "missing"
+
+
+@app.get("/api/v1/health/ready", response_model=ReadinessResponse)
+async def health_ready(response: Response) -> ReadinessResponse:
+    """Check local runtime prerequisites without probing external services."""
+    checks = {
+        "business_db": _runtime_file_status(SETTINGS.business_db_path),
+        "novel_retrieval_db": _runtime_file_status(SETTINGS.db_path),
+        "drama_subtitle_db": _runtime_file_status(SETTINGS.drama_subtitle_db_path),
+    }
+    required_checks = ("business_db", "novel_retrieval_db")
+    ready = all(checks[name] == "ready" for name in required_checks)
+    response.status_code = 200 if ready else 503
+    return ReadinessResponse(
+        status="ready" if ready else "not_ready",
+        service="novel-similarity-compare-api",
+        version="0.1.0",
+        checks=checks,
     )
 
 
@@ -528,6 +697,365 @@ def compare_single(
     )
 
 
+@app.post("/api/v1/drama-subtitles/compare", response_model=DramaSubtitleCompareResponse)
+def compare_drama_subtitles(
+    body: DramaSubtitleCompareRequest,
+    user: dict[str, object] = Depends(_require_current_user),
+) -> DramaSubtitleCompareResponse:
+    query_text = body.query_text.strip()
+    if not query_text:
+        raise HTTPException(status_code=400, detail="query_text is empty")
+
+    started_at = time.perf_counter()
+    try:
+        payload = search_drama_subtitle_hybrid_candidates(
+            db_path=SETTINGS.drama_subtitle_db_path,
+            query_text=query_text,
+            candidate_limit=body.top_k or 10,
+            window_limit=body.window_limit or 200,
+            include_window_text=True,
+            language_code=body.language_code or "",
+            semantic_enabled=(
+                SETTINGS.drama_subtitle_semantic_enabled
+                if body.semantic_enabled is None
+                else body.semantic_enabled
+            ),
+            semantic_config=SETTINGS.build_drama_subtitle_semantic_config(),
+            semantic_window_limit=body.semantic_window_limit or 100,
+        )
+        translation_config = SETTINGS.build_drama_subtitle_translation_config()
+        if body.translation_fallback is not None:
+            translation_config = type(translation_config)(
+                **{**translation_config.__dict__, "enabled": bool(body.translation_fallback)}
+            )
+        payload = apply_translation_fallback(
+            native_payload=payload,
+            query_text=query_text,
+            search_function=search_drama_subtitle_hybrid_candidates,
+            search_kwargs={
+                "db_path": SETTINGS.drama_subtitle_db_path,
+                "candidate_limit": body.top_k or 10,
+                "window_limit": body.window_limit or 200,
+                "include_window_text": True,
+                "semantic_enabled": (
+                    SETTINGS.drama_subtitle_semantic_enabled
+                    if body.semantic_enabled is None
+                    else body.semantic_enabled
+                ),
+                "semantic_config": SETTINGS.build_drama_subtitle_semantic_config(),
+                "semantic_window_limit": body.semantic_window_limit or 100,
+            },
+            config=translation_config,
+            business_db_path=SETTINGS.business_db_path,
+            owner_user_id=_current_user_id(user),
+        )
+    except (ValueError, DramaSubtitleRetrievalError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return DramaSubtitleCompareResponse(
+        request_id=str(uuid4()),
+        duration_seconds=round(time.perf_counter() - started_at, 4),
+        payload=payload,
+    )
+
+
+@app.post("/api/v1/drama-subtitles/video-compare", response_model=DramaSubtitleVideoCompareResponse)
+def compare_drama_subtitle_video_api(
+    body: DramaSubtitleVideoCompareRequest,
+    user: dict[str, object] = Depends(_require_current_user),
+) -> DramaSubtitleVideoCompareResponse:
+    # Translation cache entries are isolated per authenticated user.
+    owner_user_id = _current_user_id(user)
+    started_at = time.perf_counter()
+    try:
+        payload = compare_drama_subtitle_video(
+            db_path=SETTINGS.drama_subtitle_db_path,
+            query_text=body.query_text,
+            cues=[cue.model_dump() for cue in body.cues],
+            candidate_limit=body.top_k or 10,
+            window_limit=body.window_limit or 200,
+            language_code=body.language_code or "",
+            semantic_enabled=(
+                SETTINGS.drama_subtitle_semantic_enabled
+                if body.semantic_enabled is None
+                else body.semantic_enabled
+            ),
+            semantic_config=SETTINGS.build_drama_subtitle_semantic_config(),
+            semantic_window_limit=body.semantic_window_limit or 100,
+        )
+        native_decision = payload.get("video_decision") if isinstance(payload.get("video_decision"), dict) else {}
+        fast_screen = payload.get("fast_screen") if isinstance(payload.get("fast_screen"), dict) else {}
+        translation_config = SETTINGS.build_drama_subtitle_translation_config()
+        if body.translation_fallback is not None:
+            translation_config = type(translation_config)(
+                **{**translation_config.__dict__, "enabled": bool(body.translation_fallback)}
+            )
+        translated_payload = apply_translation_fallback(
+            native_payload={
+                "query_text": body.query_text,
+                "query_language_code": fast_screen.get("query_language_code") or body.language_code or "unknown",
+                "decision": native_decision,
+                "candidates": fast_screen.get("candidates") or [],
+            },
+            query_text=body.query_text,
+            search_function=search_drama_subtitle_hybrid_candidates,
+            search_kwargs={
+                "db_path": SETTINGS.drama_subtitle_db_path,
+                "candidate_limit": body.top_k or 10,
+                "window_limit": body.window_limit or 200,
+                "include_window_text": True,
+                "semantic_enabled": (
+                    SETTINGS.drama_subtitle_semantic_enabled
+                    if body.semantic_enabled is None
+                    else body.semantic_enabled
+                ),
+                "semantic_config": SETTINGS.build_drama_subtitle_semantic_config(),
+                "semantic_window_limit": body.semantic_window_limit or 100,
+            },
+            config=translation_config,
+            business_db_path=SETTINGS.business_db_path,
+            owner_user_id=owner_user_id,
+        )
+        payload["translation_fallback"] = translated_payload.get("translation_fallback")
+        if str(translated_payload.get("decision", {}).get("outcome") or "") == "translation_assisted_match":
+            payload["translation_candidates"] = translated_payload.get("candidates") or []
+            payload["translated_query_text"] = translated_payload.get("translated_query_text") or ""
+            payload["video_decision"] = {
+                **translated_payload["decision"],
+                "decision_scope": "video",
+                "decision_source": "translation_fallback",
+                "matched_segment_order": None,
+                "video_reason": "native_no_match_translation_candidate",
+            }
+    except (ValueError, DramaSubtitleRetrievalError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return DramaSubtitleVideoCompareResponse(
+        request_id=str(uuid4()),
+        duration_seconds=round(time.perf_counter() - started_at, 4),
+        payload=payload,
+    )
+
+
+@app.get("/api/v1/drama-subtitles/evidence-context/{window_uid}")
+def get_drama_subtitle_evidence_context_api(
+    window_uid: str,
+    context_chars: int = Query(default=2400, ge=600, le=5000),
+    before_lines: int = Query(default=6, ge=0, le=30),
+    user: dict[str, object] = Depends(_require_current_user),
+) -> dict[str, object]:
+    del user  # The subtitle corpus is shared; authentication gates review access.
+    try:
+        context = get_drama_subtitle_evidence_context(
+            db_path=SETTINGS.drama_subtitle_db_path,
+            window_uid=window_uid,
+            context_chars=context_chars,
+            before_lines=before_lines,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except DramaSubtitleEvidenceContextError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"context": context}
+
+
+@app.post("/api/v1/drama-subtitles/tasks", response_model=DramaSubtitleTaskCreateResponse)
+async def create_drama_subtitle_task_api(
+    file: UploadFile = File(...),
+    top_k: Optional[int] = Form(default=None),
+    window_limit: Optional[int] = Form(default=None),
+    semantic_enabled: Optional[bool] = Form(default=None),
+    semantic_window_limit: Optional[int] = Form(default=None),
+    translation_fallback: Optional[bool] = Form(default=None),
+    user: dict[str, object] = Depends(_require_current_user),
+) -> DramaSubtitleTaskCreateResponse:
+    task_id = str(uuid4())
+    target_path, file_size, file_sha256 = await _save_upload_file(task_id, file)
+    parsed_inputs = parse_task_input_file(target_path)
+    if not parsed_inputs:
+        raise HTTPException(status_code=400, detail="上传文件中没有可执行的字幕文本")
+    task = create_drama_subtitle_task(
+        db_path=SETTINGS.business_db_path,
+        task_id=task_id,
+        source_file_name=Path(file.filename or "drama_subtitle_input.xlsx").name,
+        source_file_ext=Path(file.filename or "drama_subtitle_input.xlsx").suffix.lower(),
+        source_file_path=str(target_path),
+        source_file_sha256=file_sha256,
+        source_file_size=file_size,
+        owner_user_id=_current_user_id(user),
+        created_by=str(user.get("username") or SETTINGS.task_created_by_default),
+        accepted_input_count=len(parsed_inputs),
+        params={
+            "top_k": top_k or 10,
+            "window_limit": window_limit or 200,
+            "semantic_enabled": (
+                SETTINGS.drama_subtitle_semantic_enabled
+                if semantic_enabled is None
+                else semantic_enabled
+            ),
+            "semantic_window_limit": semantic_window_limit or 100,
+            "translation_fallback": (
+                SETTINGS.drama_subtitle_translation_enabled
+                if translation_fallback is None
+                else translation_fallback
+            ),
+        },
+    )
+    return DramaSubtitleTaskCreateResponse(
+        task_id=str(task["task_id"]),
+        status=str(task["status"]),
+        source_file_name=str(task["source_file_name"]),
+    )
+
+
+@app.get("/api/v1/drama-subtitles/tasks", response_model=DramaSubtitleTaskListResponse)
+def get_drama_subtitle_tasks(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    user: dict[str, object] = Depends(_require_current_user),
+) -> DramaSubtitleTaskListResponse:
+    return DramaSubtitleTaskListResponse(
+        items=[
+            _with_task_queue_metadata(task, task_kind="drama_subtitle")
+            for task in list_drama_subtitle_tasks(
+                SETTINGS.business_db_path,
+                owner_user_id=_current_user_id(user),
+                limit=limit,
+                offset=offset,
+            )
+        ],
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/api/v1/drama-subtitles/tasks/{task_id}", response_model=DramaSubtitleTaskDetailResponse)
+def get_drama_subtitle_task_api(
+    task_id: str,
+    user: dict[str, object] = Depends(_require_current_user),
+) -> DramaSubtitleTaskDetailResponse:
+    task = get_drama_subtitle_task(
+        SETTINGS.business_db_path,
+        task_id,
+        owner_user_id=_current_user_id(user),
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="subtitle task not found")
+    return DramaSubtitleTaskDetailResponse(
+        task=_with_task_queue_metadata(task, task_kind="drama_subtitle"),
+        items=list_drama_subtitle_task_items(SETTINGS.business_db_path, task_id),
+    )
+
+
+@app.post("/api/v1/drama-subtitles/tasks/items/{task_item_id}/review", response_model=TaskResultResponse)
+def save_drama_subtitle_task_review_api(
+    task_item_id: int,
+    body: CompareReviewRequest,
+    user: dict[str, object] = Depends(_require_current_user),
+) -> TaskResultResponse:
+    try:
+        item = upsert_drama_subtitle_task_review(
+            db_path=SETTINGS.business_db_path,
+            task_item_id=task_item_id,
+            review_status=body.review_status,
+            reviewer_name=str(user.get("display_name") or user.get("username") or ""),
+            review_note=body.review_note,
+            owner_user_id=_current_user_id(user),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if item is None:
+        raise HTTPException(status_code=404, detail="subtitle task item not found")
+    return TaskResultResponse(result=item)
+
+
+@app.get("/api/v1/drama-subtitles/tasks/{task_id}/exports/review-xlsx")
+def download_drama_subtitle_review_export(
+    task_id: str,
+    user: dict[str, object] = Depends(_require_current_user),
+) -> FileResponse:
+    try:
+        export_path, export_filename = build_drama_subtitle_review_export_xlsx(
+            business_db_path=SETTINGS.business_db_path,
+            export_root=SETTINGS.task_export_root,
+            owner_user_id=_current_user_id(user),
+            task_id=task_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(
+        path=export_path,
+        filename=export_filename,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.post("/api/v1/drama-subtitles/tasks/{task_id}/pause", response_model=BasicTaskResponse)
+def pause_drama_subtitle_task_api(
+    task_id: str,
+    user: dict[str, object] = Depends(_require_current_user),
+) -> BasicTaskResponse:
+    try:
+        task = update_drama_subtitle_task_control(
+            db_path=SETTINGS.business_db_path, task_id=task_id, action="pause", owner_user_id=_current_user_id(user)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail="subtitle task not found")
+    return BasicTaskResponse(task=task)
+
+
+@app.post("/api/v1/drama-subtitles/tasks/{task_id}/resume", response_model=BasicTaskResponse)
+def resume_drama_subtitle_task_api(
+    task_id: str,
+    user: dict[str, object] = Depends(_require_current_user),
+) -> BasicTaskResponse:
+    try:
+        task = update_drama_subtitle_task_control(
+            db_path=SETTINGS.business_db_path, task_id=task_id, action="resume", owner_user_id=_current_user_id(user)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail="subtitle task not found")
+    return BasicTaskResponse(task=task)
+
+
+@app.post("/api/v1/drama-subtitles/tasks/{task_id}/cancel", response_model=BasicTaskResponse)
+def cancel_drama_subtitle_task_api(
+    task_id: str,
+    user: dict[str, object] = Depends(_require_current_user),
+) -> BasicTaskResponse:
+    try:
+        task = update_drama_subtitle_task_control(
+            db_path=SETTINGS.business_db_path, task_id=task_id, action="cancel", owner_user_id=_current_user_id(user)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail="subtitle task not found")
+    return BasicTaskResponse(task=task)
+
+
+@app.delete("/api/v1/drama-subtitles/tasks/{task_id}", response_model=BasicTaskResponse)
+def delete_drama_subtitle_task_api(
+    task_id: str,
+    user: dict[str, object] = Depends(_require_current_user),
+) -> BasicTaskResponse:
+    try:
+        task = update_drama_subtitle_task_control(
+            db_path=SETTINGS.business_db_path, task_id=task_id, action="delete", owner_user_id=_current_user_id(user)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail="subtitle task not found")
+    return BasicTaskResponse(task=task)
+
+
 @app.post("/api/v1/tasks", response_model=TaskCreateResponse)
 async def create_task(
     file: UploadFile = File(...),
@@ -543,6 +1071,9 @@ async def create_task(
 
     task_id = str(uuid4())
     target_path, file_size, file_sha256 = await _save_upload_file(task_id, file)
+    parsed_inputs = parse_task_input_file(target_path)
+    if not parsed_inputs:
+        raise HTTPException(status_code=400, detail="上传文件中没有可执行的待检测文本")
     task = create_compare_task(
         db_path=SETTINGS.business_db_path,
         task_id=task_id,
@@ -564,6 +1095,7 @@ async def create_task(
             ),
         },
         created_by=str(user.get("username") or SETTINGS.task_created_by_default),
+        accepted_input_count=len(parsed_inputs),
     )
     return TaskCreateResponse(
         task_id=task["task_id"],
@@ -585,7 +1117,11 @@ def get_tasks(
         offset=offset,
         owner_user_id=_current_user_id(user),
     )
-    return TaskListResponse(items=items, limit=limit, offset=offset)
+    return TaskListResponse(
+        items=[_with_task_queue_metadata(task, task_kind="compare") for task in items],
+        limit=limit,
+        offset=offset,
+    )
 
 
 @app.get("/api/v1/tasks/{task_id}", response_model=TaskDetailResponse)
@@ -599,6 +1135,7 @@ def get_task_detail(
     task = get_compare_task(SETTINGS.business_db_path, task_id, owner_user_id=current_user_id)
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
+    task = _with_task_queue_metadata(task, task_kind="compare")
     items = list_compare_task_items(
         db_path=SETTINGS.business_db_path,
         task_id=task_id,

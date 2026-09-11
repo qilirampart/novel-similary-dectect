@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import time
+from http import client as http_client
 from typing import Any
 from urllib import error, request
 
 
 DEFAULT_GITEE_API_ENDPOINT = "https://ai.gitee.com/v1/embeddings"
 DEFAULT_GITEE_TOKEN_ENV = "GITEE_AI_TOKEN"
+RETRYABLE_HTTP_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 
 class GiteeEmbeddingError(RuntimeError):
@@ -28,7 +32,12 @@ def gitee_http_json(
     token: str,
     payload: dict[str, Any],
     timeout: int = 300,
+    max_attempts: int = 4,
+    retry_backoff_seconds: float = 2.0,
+    total_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be > 0")
     req = request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -38,15 +47,44 @@ def gitee_http_json(
             "Authorization": f"Bearer {token}",
         },
     )
-    try:
-        with request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8")
-            return json.loads(body) if body else {}
-    except error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise GiteeEmbeddingError(f"HTTP {exc.code} for {url}: {body}") from exc
-    except error.URLError as exc:
-        raise GiteeEmbeddingError(f"Request failed for {url}: {exc}") from exc
+    last_error: GiteeEmbeddingError | None = None
+    deadline = (
+        time.monotonic() + max(float(total_timeout_seconds), 0.001)
+        if total_timeout_seconds is not None
+        else None
+    )
+    for attempt in range(1, max_attempts + 1):
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            break
+        attempt_timeout = max(
+            min(float(timeout), remaining) if remaining is not None else float(timeout),
+            0.001,
+        )
+        try:
+            with request.urlopen(req, timeout=attempt_timeout) as resp:
+                body = resp.read().decode("utf-8")
+                return json.loads(body) if body else {}
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            last_error = GiteeEmbeddingError(f"HTTP {exc.code} for {url}: {body}")
+            retryable = exc.code in RETRYABLE_HTTP_STATUS_CODES
+        except (error.URLError, TimeoutError, ConnectionError, http_client.HTTPException) as exc:
+            last_error = GiteeEmbeddingError(f"Request failed for {url}: {exc}")
+            retryable = True
+
+        if not retryable or attempt == max_attempts:
+            raise last_error
+
+        # Add a small jitter so concurrent batches do not retry in lockstep.
+        delay = retry_backoff_seconds * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+        if deadline is not None:
+            delay = min(delay, max(deadline - time.monotonic(), 0.0))
+        time.sleep(delay)
+
+    if last_error is not None:
+        raise last_error
+    raise GiteeEmbeddingError(f"Request budget exhausted for {url}")
 
 
 def probe_gitee_embedding_dimension(
@@ -83,6 +121,8 @@ def gitee_embed_texts(
     texts: list[str],
     dimensions: int,
     timeout: int = 300,
+    max_attempts: int = 4,
+    total_timeout_seconds: float | None = None,
 ) -> list[list[float]]:
     if not texts:
         return []
@@ -96,6 +136,8 @@ def gitee_embed_texts(
             "dimensions": dimensions,
         },
         timeout=timeout,
+        max_attempts=max_attempts,
+        total_timeout_seconds=total_timeout_seconds,
     )
     data = resp.get("data")
     if not isinstance(data, list):

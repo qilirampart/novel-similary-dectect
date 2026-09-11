@@ -1,5 +1,24 @@
 export type DetectionMode = "reuse" | "rewrite";
 
+export type CoverImportKind = "channels" | "videos" | "baseline";
+
+export type CoverImportResponse = {
+  import_id: string;
+  import_kind: CoverImportKind;
+  status: string;
+  source_file_name: string;
+  source_file_sha256: string;
+  sheet_name: string | null;
+  mapping: Record<string, string>;
+  stats: Record<string, number>;
+  error_message: string | null;
+  conflict_samples: Array<Record<string, unknown>>;
+  created_at: string;
+  updated_at: string;
+  confirmed_at: string | null;
+  finished_at: string | null;
+};
+
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const LONG_REQUEST_TIMEOUT_MS = 60_000;
 const DOWNLOAD_REQUEST_TIMEOUT_MS = 120_000;
@@ -135,6 +154,21 @@ export type CompareSingleResponse = {
   payload: ComparePayload;
 };
 
+export type DramaSubtitleTaskCreateResponse = {
+  task_id: string;
+  status: string;
+  source_file_name: string;
+};
+
+export type DramaSubtitleTaskDetailResponse = {
+  task: Record<string, any>;
+  items: Record<string, any>[];
+};
+
+export type DramaSubtitleEvidenceContextResponse = {
+  context: Record<string, any>;
+};
+
 export type TaskListResponse = {
   items: Record<string, any>[];
   limit: number;
@@ -209,6 +243,27 @@ export type SystemStatusResponse = {
   };
 };
 
+export type CoverMonitorOverviewResponse = {
+  channel_count: number;
+  video_count: number;
+  risk_count: number;
+  pending_review_count: number;
+  risk_distribution: Record<"safe" | "review" | "risk" | "unknown", number>;
+  latest_run: null | {
+    run_id: string;
+    status: string;
+    trigger_type: string;
+    intensity: string;
+    total_item_count: number;
+    completed_item_count: number;
+    failed_item_count: number;
+    status_message?: string | null;
+    created_at: string;
+    started_at?: string | null;
+    finished_at?: string | null;
+  };
+};
+
 export function compareSingle(params: {
   queryText: string;
   detectionMode: DetectionMode;
@@ -231,6 +286,91 @@ export function compareSingle(params: {
   });
 }
 
+export function compareDramaSubtitles(params: {
+  queryText: string;
+  topK?: number;
+  windowLimit?: number;
+  languageCode?: string;
+}): Promise<CompareSingleResponse> {
+  return requestJson<CompareSingleResponse>("/api/v1/drama-subtitles/compare", {
+    method: "POST",
+    timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    body: JSON.stringify({
+      query_text: params.queryText,
+      top_k: params.topK,
+      window_limit: params.windowLimit,
+      language_code: params.languageCode || undefined
+    })
+  });
+}
+
+export function getDramaSubtitleEvidenceContext(windowUid: string, contextChars = 2400): Promise<DramaSubtitleEvidenceContextResponse> {
+  return requestJson<DramaSubtitleEvidenceContextResponse>(
+    `/api/v1/drama-subtitles/evidence-context/${encodeURIComponent(windowUid)}`,
+    { query: { context_chars: contextChars, before_lines: 6 }, timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS }
+  );
+}
+
+export function createDramaSubtitleTask(params: {
+  file: File;
+  topK?: number;
+  windowLimit?: number;
+}): Promise<DramaSubtitleTaskCreateResponse> {
+  const formData = new FormData();
+  formData.append("file", params.file);
+  if (params.topK !== undefined) formData.append("top_k", String(params.topK));
+  if (params.windowLimit !== undefined) formData.append("window_limit", String(params.windowLimit));
+  return requestJson<DramaSubtitleTaskCreateResponse>("/api/v1/drama-subtitles/tasks", {
+    method: "POST",
+    timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    body: formData
+  });
+}
+
+export function listDramaSubtitleTasks(limit = 20, offset = 0): Promise<TaskListResponse> {
+  return requestJson<TaskListResponse>("/api/v1/drama-subtitles/tasks", {
+    query: { limit, offset }
+  });
+}
+
+export function getDramaSubtitleTaskDetail(taskId: string): Promise<DramaSubtitleTaskDetailResponse> {
+  return requestJson<DramaSubtitleTaskDetailResponse>(`/api/v1/drama-subtitles/tasks/${encodeURIComponent(taskId)}`);
+}
+
+export function controlDramaSubtitleTask(taskId: string, action: "pause" | "resume" | "cancel" | "delete"): Promise<BasicTaskResponse> {
+  const path = `/api/v1/drama-subtitles/tasks/${encodeURIComponent(taskId)}`;
+  if (action === "delete") {
+    return requestJson<BasicTaskResponse>(path, { method: "DELETE" });
+  }
+  return requestJson<BasicTaskResponse>(`${path}/${action}`, { method: "POST" });
+}
+
+export function saveDramaSubtitleReview(taskItemId: number, reviewStatus: string, reviewNote = ""): Promise<TaskResultResponse> {
+  return requestJson<TaskResultResponse>(`/api/v1/drama-subtitles/tasks/items/${taskItemId}/review`, {
+    method: "POST",
+    body: JSON.stringify({ review_status: reviewStatus, review_note: reviewNote })
+  });
+}
+
+export async function downloadDramaSubtitleReviewExport(taskId: string): Promise<string> {
+  const response = await fetchWithTimeout(
+    resolveApiPath(`/api/v1/drama-subtitles/tasks/${encodeURIComponent(taskId)}/exports/review-xlsx`),
+    { credentials: "include" }
+  );
+  if (!response.ok) {
+    throw new Error(parseErrorDetail(await response.text(), response.statusText || "导出短剧复核结果失败"));
+  }
+  const fileName = parseDownloadFilename(response.headers.get("content-disposition"), "短剧字幕复核导出.xlsx");
+  const blobUrl = window.URL.createObjectURL(await response.blob());
+  const anchor = document.createElement("a");
+  anchor.href = blobUrl;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => window.URL.revokeObjectURL(blobUrl), 1000);
+  return fileName;
+}
 export function createCompareTask(params: {
   file: File;
   detectionMode: DetectionMode;
@@ -400,7 +540,6 @@ export async function downloadReviewExport(params: {
   window.setTimeout(() => window.URL.revokeObjectURL(blobUrl), 1000);
   return fileName;
 }
-
 export async function deleteTasks(taskIds: string[]): Promise<BulkTaskDeleteResponse> {
   const normalizedTaskIds = Array.from(
     new Set(taskIds.map((taskId) => String(taskId || "").trim()).filter(Boolean))
@@ -456,6 +595,35 @@ export function getSystemStatus(): Promise<SystemStatusResponse> {
   return requestJson<SystemStatusResponse>("/api/v1/system/status", {
     timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
   });
+}
+
+export function getCoverMonitorOverview(): Promise<CoverMonitorOverviewResponse> {
+  return requestJson<CoverMonitorOverviewResponse>("/api/v1/cover-monitor/overview", {
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+  });
+}
+
+export function previewCoverMonitorImport(params: {
+  file: File;
+  importKind: CoverImportKind;
+  sheetName?: string;
+}): Promise<CoverImportResponse> {
+  const formData = new FormData();
+  formData.append("file", params.file);
+  formData.append("import_kind", params.importKind);
+  if (params.sheetName?.trim()) formData.append("sheet_name", params.sheetName.trim());
+  return requestJson<CoverImportResponse>("/api/v1/cover-monitor/imports/preview", {
+    method: "POST",
+    body: formData,
+    timeoutMs: 5 * 60_000
+  });
+}
+
+export function confirmCoverMonitorImport(importId: string): Promise<CoverImportResponse> {
+  return requestJson<CoverImportResponse>(
+    `/api/v1/cover-monitor/imports/${encodeURIComponent(importId)}/confirm`,
+    { method: "POST", timeoutMs: 5 * 60_000 }
+  );
 }
 
 export function exportTaskUrl(taskId: string, kind: "summary" | "review" | "json"): string {

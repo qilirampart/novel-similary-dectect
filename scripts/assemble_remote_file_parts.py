@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import textwrap
 
@@ -105,16 +106,20 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", required=True)
     parser.add_argument("--user", required=True)
-    parser.add_argument("--password", required=True)
+    parser.add_argument("--password", default="")
+    parser.add_argument("--password-env", default="")
     parser.add_argument("--remote-dir", required=True)
     parser.add_argument("--remote-name", required=True)
     parser.add_argument("--expected-size", type=int)
     args = parser.parse_args()
 
+    password = args.password or os.environ.get(args.password_env, "")
+    if not password:
+        raise SystemExit("Provide --password or --password-env with a populated environment variable.")
     assemble_parts(
         host=args.host,
         user=args.user,
-        password=args.password,
+        password=password,
         remote_dir=args.remote_dir,
         remote_name=args.remote_name,
         expected_size=args.expected_size,

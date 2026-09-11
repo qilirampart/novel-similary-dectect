@@ -37,5 +37,26 @@ snapshots/
 .qdrant-initialized
 review-net.txt
 .env.local.ps1
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
 .deploy_stage/
 third_party/
+
+# Internal upstream reference documents
+/中台批量查询剧集信息接口文档.md
+
+# Local operational utilities and confidential handoff artifacts
+/scripts/create_youtube_match_accounts_doc.py
+/scripts/run_cloud_v2_subtitle_speed10_probe.py
+/docs/*账号配置说明*.docx
+
+# Raw task responses and generated result payloads
+/docs/**/*.json
+/docs/**/*.csv

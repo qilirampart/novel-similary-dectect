@@ -10,6 +10,8 @@ import { TaskRecordsPage } from "./pages/TaskRecordsPage";
 import { SystemStatusPage } from "./pages/SystemStatusPage";
 import { PlaceholderPage } from "./pages/PlaceholderPage";
 import { LoginPage } from "./pages/LoginPage";
+import { DramaSubtitlePage } from "./pages/DramaSubtitlePage";
+import { CoverMonitorPage } from "./pages/CoverMonitorPage";
 
 export function App() {
   return (
@@ -20,6 +22,9 @@ export function App() {
           <Route index element={<DashboardPage />} />
           <Route path="/single-compare" element={<SingleComparePage />} />
           <Route path="/batch-tasks" element={<BatchTasksPage />} />
+          <Route path="/drama-subtitles" element={<DramaSubtitlePage mode="single" />} />
+          <Route path="/drama-subtitles/batch" element={<DramaSubtitlePage mode="batch" />} />
+          <Route path="/cover-monitor" element={<CoverMonitorPage />} />
           <Route path="/review" element={<ReviewPage />} />
           <Route path="/task-records" element={<TaskRecordsPage />} />
           <Route path="/rules" element={<PlaceholderPage kind="rules" />} />

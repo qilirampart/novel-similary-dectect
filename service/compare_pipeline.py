@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any
 
 from service.candidate_slicing import slice_candidate_chapters
@@ -16,6 +17,20 @@ from service.semantic_retrieval import (
 
 
 SEMANTIC_DISABLED_BACKENDS = {"", "0", "false", "off", "none", "disabled"}
+SEMANTIC_TIMEOUT_STATUS = "fallback_semantic_timeout"
+
+
+def _is_semantic_timeout_error(message: str) -> bool:
+    normalized = str(message or "").strip().lower()
+    if not normalized:
+        return False
+    timeout_markers = (
+        "timed out",
+        "timeout",
+        "read operation timed out",
+        "request timed out",
+    )
+    return any(marker in normalized for marker in timeout_markers)
 
 
 def _semantic_backend_enabled(config: SemanticRetrievalConfig | None) -> bool:
@@ -109,6 +124,7 @@ def build_rewrite_detection_section(
     semantic_recall_status: str,
     semantic_recall_message: str,
     semantic_candidate_count: int,
+    semantic_duration_seconds: float = 0.0,
 ) -> dict[str, object]:
     suspicious_results: list[dict[str, object]] = []
     for item in fine_results:
@@ -125,6 +141,7 @@ def build_rewrite_detection_section(
         "semantic_recall_enabled": semantic_recall_enabled,
         "message": semantic_recall_message,
         "semantic_candidate_count": semantic_candidate_count,
+        "semantic_duration_seconds": round(max(float(semantic_duration_seconds), 0.0), 4),
         "suspicious_result_count": len(suspicious_results),
         "results": suspicious_results,
     }
@@ -176,6 +193,7 @@ def run_compare_pipeline(request: ComparePipelineRequest) -> dict[str, Any]:
     semantic_recall_status = "disabled"
     semantic_recall_message = "Semantic recall is currently disabled."
     semantic_recall_runtime_enabled = False
+    semantic_duration_seconds = 0.0
 
     if preset.semantic_recall_enabled and request.disable_semantic_recall:
         semantic_recall_status = "disabled"
@@ -184,6 +202,7 @@ def run_compare_pipeline(request: ComparePipelineRequest) -> dict[str, Any]:
         semantic_recall_status = "disabled"
         semantic_recall_message = "Semantic recall is disabled by runtime configuration."
     elif preset.semantic_recall_enabled and request.semantic_config is not None:
+        semantic_started_at = time.perf_counter()
         try:
             semantic_payload = semantic_retrieve_candidates(
                 db_path=request.db_path,
@@ -202,14 +221,26 @@ def run_compare_pipeline(request: ComparePipelineRequest) -> dict[str, Any]:
                 )
             semantic_recall_runtime_enabled = True
         except SemanticRetrievalError as exc:
+            semantic_error_message = str(exc)
+            if _is_semantic_timeout_error(semantic_error_message):
+                semantic_recall_status = SEMANTIC_TIMEOUT_STATUS
+                semantic_recall_message = (
+                    "Semantic recall timed out on the external embedding service. "
+                    "The pipeline automatically fell back to lexical recall only for this request."
+                )
+            else:
+                semantic_recall_status = "fallback_lexical_only"
+                semantic_recall_message = (
+                    "Semantic recall is unavailable. The pipeline automatically fell back to lexical recall only."
+                )
             semantic_payload = {
-                "status": "fallback_lexical_only",
+                "status": semantic_recall_status,
                 "candidate_count": 0,
                 "results": [],
-                "error": str(exc),
+                "error": semantic_error_message,
             }
-            semantic_recall_status = "fallback_lexical_only"
-            semantic_recall_message = "Semantic recall is unavailable. The pipeline automatically fell back to lexical recall only."
+        finally:
+            semantic_duration_seconds = time.perf_counter() - semantic_started_at
 
     merged_candidates = (
         merge_recall_candidates(
@@ -245,6 +276,7 @@ def run_compare_pipeline(request: ComparePipelineRequest) -> dict[str, Any]:
         semantic_recall_status=semantic_recall_status,
         semantic_recall_message=semantic_recall_message,
         semantic_candidate_count=int(semantic_payload["candidate_count"]),
+        semantic_duration_seconds=semantic_duration_seconds,
     )
     top_results = list(reuse_detection["results"])
     review_rows = build_review_rows(

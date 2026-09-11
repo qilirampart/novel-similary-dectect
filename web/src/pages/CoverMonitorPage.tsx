@@ -1,0 +1,306 @@
+import { useEffect, useRef, useState, type DragEvent } from "react";
+
+import {
+  confirmCoverMonitorImport,
+  getCoverMonitorOverview,
+  previewCoverMonitorImport,
+  type CoverImportKind,
+  type CoverImportResponse,
+  type CoverMonitorOverviewResponse
+} from "../api";
+import { Icon } from "../icons";
+
+
+const EMPTY_OVERVIEW: CoverMonitorOverviewResponse = {
+  channel_count: 0,
+  video_count: 0,
+  risk_count: 0,
+  pending_review_count: 0,
+  risk_distribution: { safe: 0, review: 0, risk: 0, unknown: 0 },
+  latest_run: null
+};
+
+const tabs = ["工作台", "频道清单", "巡检批次", "风险复核", "历史整改"];
+
+function formatNumber(value: number): string {
+  return new Intl.NumberFormat("zh-CN").format(Math.max(Number(value) || 0, 0));
+}
+
+function runProgress(overview: CoverMonitorOverviewResponse): number {
+  const run = overview.latest_run;
+  if (!run || run.total_item_count <= 0) return 0;
+  return Math.min(Math.round((run.completed_item_count / run.total_item_count) * 100), 100);
+}
+
+function statusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    queued: "排队中",
+    running: "执行中",
+    pause_requested: "暂停处理中",
+    paused: "已暂停",
+    cancel_requested: "取消处理中",
+    cancelled: "已取消",
+    completed: "已完成",
+    partial_failed: "部分失败",
+    failed: "失败"
+  };
+  return labels[status] || status || "未知";
+}
+
+export function CoverMonitorPage() {
+  const [overview, setOverview] = useState<CoverMonitorOverviewResponse>(EMPTY_OVERVIEW);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [isImportOpen, setIsImportOpen] = useState(false);
+  const [importKind, setImportKind] = useState<CoverImportKind>("channels");
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importPreview, setImportPreview] = useState<CoverImportResponse | null>(null);
+  const [importError, setImportError] = useState("");
+  const [importBusy, setImportBusy] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
+
+  async function loadOverview() {
+    setLoading(true);
+    setError("");
+    try {
+      setOverview(await getCoverMonitorOverview());
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "封面巡检概览加载失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadOverview();
+  }, []);
+
+  function closeImport() {
+    if (importBusy) return;
+    setIsImportOpen(false);
+    setImportFile(null);
+    setImportPreview(null);
+    setImportError("");
+  }
+
+  function selectImportFile(file: File | null) {
+    setImportFile(file);
+    setImportPreview(null);
+    setImportError("");
+  }
+
+  function handleImportDrop(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    setIsDragging(false);
+    selectImportFile(event.dataTransfer.files?.[0] ?? null);
+  }
+
+  async function runImportPreview() {
+    if (!importFile) {
+      setImportError("请先选择 Excel 文件");
+      return;
+    }
+    setImportBusy(true);
+    setImportError("");
+    try {
+      setImportPreview(await previewCoverMonitorImport({ file: importFile, importKind }));
+    } catch (previewError) {
+      setImportError(previewError instanceof Error ? previewError.message : "导入预检失败");
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  async function confirmImport() {
+    if (!importPreview) return;
+    setImportBusy(true);
+    setImportError("");
+    try {
+      const completed = await confirmCoverMonitorImport(importPreview.import_id);
+      setImportPreview(completed);
+      await loadOverview();
+    } catch (confirmError) {
+      setImportError(confirmError instanceof Error ? confirmError.message : "确认导入失败");
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  const run = overview.latest_run;
+  const progress = runProgress(overview);
+  const distributionTotal = Object.values(overview.risk_distribution).reduce(
+    (total, value) => total + value,
+    0
+  );
+
+  return (
+    <div className="page-grid cover-monitor-page">
+      <header className="cover-monitor-heading">
+        <div>
+          <span className="eyebrow">COVER MONITOR</span>
+          <h1>封面巡检工作台</h1>
+          <p>持续追踪频道新增视频与历史风险整改，检测任务和数据与现有匹配业务独立运行。</p>
+        </div>
+        <div className="cover-monitor-heading-actions">
+          <button className="outline-button" type="button" onClick={() => setIsImportOpen(true)}>
+            <Icon name="upload" />导入频道表
+          </button>
+          <button className="primary-button" type="button" disabled title="完成频道导入后可创建巡检">
+            <span className="cover-button-plus">+</span>新建巡检
+          </button>
+        </div>
+      </header>
+
+      <nav className="cover-monitor-tabs" aria-label="封面巡检模块">
+        {tabs.map((tab, index) => (
+          <button key={tab} type="button" className={index === 0 ? "active" : ""} disabled={index !== 0}>
+            {tab}{index !== 0 && <small>待接入</small>}
+          </button>
+        ))}
+      </nav>
+
+      {error && (
+        <div className="cover-monitor-error" role="alert">
+          <div><strong>概览加载失败</strong><span>{error}</span></div>
+          <button className="ghost-button slim" type="button" onClick={() => void loadOverview()}>重新加载</button>
+        </div>
+      )}
+
+      <section className="cover-monitor-kpis" aria-label="封面巡检概览">
+        <article>
+          <div className="cover-kpi-icon green"><Icon name="queue" /></div>
+          <div><span>在管频道</span><strong>{loading ? "--" : formatNumber(overview.channel_count)}</strong><small>已启用监测的频道</small></div>
+        </article>
+        <article>
+          <div className="cover-kpi-icon blue"><Icon name="file" /></div>
+          <div><span>已归档视频</span><strong>{loading ? "--" : formatNumber(overview.video_count)}</strong><small>按视频 ID 去重</small></div>
+        </article>
+        <article>
+          <div className="cover-kpi-icon red"><Icon name="warning" /></div>
+          <div><span>风险结果</span><strong>{loading ? "--" : formatNumber(overview.risk_count)}</strong><small>模型初筛，不代替人工结论</small></div>
+        </article>
+        <article>
+          <div className="cover-kpi-icon orange"><Icon name="review" /></div>
+          <div><span>待人工处理</span><strong>{loading ? "--" : formatNumber(overview.pending_review_count)}</strong><small>风险与不确定项</small></div>
+        </article>
+      </section>
+
+      <section className="cover-monitor-overview-grid">
+        <article className="card-panel cover-current-run">
+          <div className="section-heading">
+            <div><h2>当前巡检批次</h2><p>采集、封面下载和模型检测将分别记录进度。</p></div>
+            {run && <span className={`cover-run-status ${run.status}`}>{statusLabel(run.status)}</span>}
+          </div>
+          {run ? (
+            <div className="cover-run-body">
+              <div className="cover-run-title-row">
+                <strong>{run.run_id.slice(0, 12)}</strong><span>{progress}%</span>
+              </div>
+              <div className="cover-progress-track"><i style={{ width: `${progress}%` }} /></div>
+              <div className="cover-run-metrics">
+                <div><span>任务总量</span><strong>{formatNumber(run.total_item_count)}</strong></div>
+                <div><span>已完成</span><strong>{formatNumber(run.completed_item_count)}</strong></div>
+                <div><span>失败项</span><strong>{formatNumber(run.failed_item_count)}</strong></div>
+                <div><span>检测档位</span><strong>{run.intensity}</strong></div>
+              </div>
+              {run.status_message && <p className="cover-run-message">{run.status_message}</p>}
+            </div>
+          ) : (
+            <div className="cover-empty-run">
+              <div className="cover-empty-symbol"><Icon name="pulse" /></div>
+              <div><strong>尚未创建巡检批次</strong><p>先导入频道总表并完成预检，之后即可创建首次手动巡检。</p></div>
+              <span>等待 C2 频道导入</span>
+            </div>
+          )}
+        </article>
+
+        <article className="card-panel cover-risk-summary">
+          <div className="section-heading">
+            <div><h2>风险概览</h2><p>仅统计已经产生有效模型响应的检测。</p></div>
+          </div>
+          <div className="cover-risk-body">
+            <div className={`cover-risk-ring${distributionTotal === 0 ? " empty" : ""}`}>
+              <div><strong>{formatNumber(distributionTotal)}</strong><span>检测结果</span></div>
+            </div>
+            <div className="cover-risk-legend">
+              <div><i className="safe" /><span>安全</span><strong>{formatNumber(overview.risk_distribution.safe)}</strong></div>
+              <div><i className="risk" /><span>风险</span><strong>{formatNumber(overview.risk_distribution.risk)}</strong></div>
+              <div><i className="review" /><span>待复核</span><strong>{formatNumber(overview.risk_distribution.review)}</strong></div>
+              <div><i className="unknown" /><span>未知/异常</span><strong>{formatNumber(overview.risk_distribution.unknown)}</strong></div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section className="card-panel cover-monitor-results">
+        <div className="section-heading">
+          <div><h2>风险与待复核</h2><p>后续将在这里集中展示封面证据、模型理由和人工处置记录。</p></div>
+          <button className="outline-button slim" type="button" disabled><Icon name="file" />导出结果</button>
+        </div>
+        <div className="cover-results-toolbar">
+          <div className="cover-filter-chips"><button className="active" type="button">全部 0</button><button type="button" disabled>风险 0</button><button type="button" disabled>待复核 0</button><button type="button" disabled>检测异常 0</button></div>
+          <div className="cover-toolbar-note"><Icon name="shield" />当前为独立数据空间，不读取字幕或小说任务结果</div>
+        </div>
+        <div className="cover-results-empty">
+          <div className="cover-results-empty-art"><Icon name="review" /></div>
+          <strong>还没有封面检测结果</strong>
+          <p>完成频道导入和首次巡检后，结果会按风险优先级进入这里。</p>
+          <div className="cover-setup-steps">
+            <span className="done"><b>1</b>独立数据层</span>
+            <i />
+            <span><b>2</b>导入频道</span>
+            <i />
+            <span><b>3</b>创建巡检</span>
+            <i />
+            <span><b>4</b>人工复核</span>
+          </div>
+        </div>
+      </section>
+
+      {isImportOpen && (
+        <div className="cover-import-overlay" role="dialog" aria-modal="true" aria-label="导入封面巡检数据" onClick={closeImport}>
+          <section className="cover-import-dialog" onClick={(event) => event.stopPropagation()}>
+            <header>
+              <div><span className="eyebrow">IMPORT PREVIEW</span><h2>导入封面巡检数据</h2><p>先预检、后确认。预检不会写入频道和视频主表。</p></div>
+              <button className="icon-button" type="button" aria-label="关闭导入窗口" onClick={closeImport} disabled={importBusy}>×</button>
+            </header>
+
+            <div className="cover-import-controls">
+              <label><span>数据类型</span><select value={importKind} onChange={(event) => { setImportKind(event.target.value as CoverImportKind); setImportPreview(null); }} disabled={importBusy || Boolean(importPreview?.status === "completed")}><option value="channels">频道总表</option><option value="videos">视频明细</option><option value="baseline">历史检测基准</option></select></label>
+              <input ref={importInputRef} type="file" accept=".xlsx" onChange={(event) => selectImportFile(event.target.files?.[0] ?? null)} hidden />
+              <label className={`cover-import-dropzone${isDragging ? " is-dragging" : ""}`} onDragEnter={() => setIsDragging(true)} onDragLeave={() => setIsDragging(false)} onDragOver={(event) => event.preventDefault()} onDrop={handleImportDrop} onClick={() => importInputRef.current?.click()}>
+                <Icon name="upload" />
+                <div><strong>{importFile?.name || "拖入 Excel，或点击选择文件"}</strong><span>{importFile ? `${(importFile.size / 1024 / 1024).toFixed(2)} MB` : "仅支持 .xlsx，最大 150 MB"}</span></div>
+              </label>
+            </div>
+
+            {importError && <div className="cover-import-message error" role="alert">{importError}</div>}
+            {importPreview && (
+              <div className={`cover-import-preview ${importPreview.status}`}>
+                <div className="cover-import-preview-title"><div><strong>{importPreview.status === "completed" ? "导入已完成" : "预检完成"}</strong><span>工作表：{importPreview.sheet_name || "默认首个工作表"}</span></div><code>{importPreview.import_id.slice(0, 8)}</code></div>
+                <div className="cover-import-stats">
+                  <div><span>来源行</span><strong>{formatNumber(importPreview.stats.total_rows || 0)}</strong></div>
+                  <div><span>有效行</span><strong>{formatNumber(importPreview.stats.valid_rows || 0)}</strong></div>
+                  <div><span>唯一频道</span><strong>{formatNumber(importPreview.stats.unique_channels || 0)}</strong></div>
+                  <div><span>唯一视频</span><strong>{formatNumber(importPreview.stats.unique_videos || 0)}</strong></div>
+                  <div className="muted"><span>重复</span><strong>{formatNumber(importPreview.stats.duplicate_rows || 0)}</strong></div>
+                  <div className={(importPreview.stats.conflict_rows || 0) > 0 ? "danger" : "muted"}><span>冲突</span><strong>{formatNumber(importPreview.stats.conflict_rows || 0)}</strong></div>
+                  <div className={(importPreview.stats.missing_rows || 0) > 0 ? "warning" : "muted"}><span>缺字段</span><strong>{formatNumber(importPreview.stats.missing_rows || 0)}</strong></div>
+                  {importPreview.status === "completed" && <div className="success"><span>已落库视频</span><strong>{formatNumber(importPreview.stats.applied_videos || 0)}</strong></div>}
+                </div>
+                {(importPreview.stats.conflict_rows || 0) > 0 && <p className="cover-import-caution">存在归属冲突的行不会自动覆盖，将保留在冲突记录中等待人工处理。</p>}
+              </div>
+            )}
+
+            <footer>
+              <button className="ghost-button" type="button" onClick={closeImport} disabled={importBusy}>{importPreview?.status === "completed" ? "关闭" : "取消"}</button>
+              {!importPreview && <button className="primary-button" type="button" onClick={() => void runImportPreview()} disabled={importBusy || !importFile}>{importBusy ? "正在预检..." : "开始预检"}</button>}
+              {importPreview?.status === "previewed" && <button className="primary-button" type="button" onClick={() => void confirmImport()} disabled={importBusy}>{importBusy ? "正在导入..." : "确认并导入"}</button>}
+            </footer>
+          </section>
+        </div>
+      )}
+    </div>
+  );
+}

@@ -101,7 +101,9 @@ export function SingleComparePage() {
     ],
     [displayCandidates.length, mode, result, rewriteEnabled, semanticStatus]
   );
-  const isSemanticFallback = mode === "rewrite" && semanticStatus === "fallback_lexical_only";
+  const isSemanticFallback =
+    mode === "rewrite" &&
+    (semanticStatus === "fallback_lexical_only" || semanticStatus === "fallback_semantic_timeout");
   const semanticFallbackMessage = String(result?.rewrite_detection?.message || "").trim();
 
   const evidenceMetrics: MetricRow[] = selectedMatch

@@ -184,3 +184,58 @@ def test_parse_xlsx_with_sequence_and_fragment_content_headers(tmp_path: Path) -
     assert parsed[0].query_text == "First fragment body for parser validation."
     assert parsed[1].source_ref == "2"
     assert parsed[1].query_text == "Second fragment body for parser validation."
+
+
+def test_parse_structured_youtube_subtitle_segment_csv(tmp_path: Path) -> None:
+    file_path = tmp_path / "youtube_segments.csv"
+    file_path.write_text(
+        "source_ref,source_video_id,source_channel,source_upload_date,source_caption_language,source_caption_source,source_segment_order,source_time_start,source_time_end,source_display_title,query_text,source_text_original\n"
+        "https://youtu.be/abc,abc,Channel A,2026-08-01,en,manual,2,00:01:20.000,00:01:45.000,Video A,normalized query,Original cue text\n",
+        encoding="utf-8",
+    )
+
+    parsed = parse_task_input_file(file_path)
+
+    assert len(parsed) == 1
+    assert parsed[0].source_video_id == "abc"
+    assert parsed[0].source_channel == "Channel A"
+    assert parsed[0].source_caption_language == "en"
+    assert parsed[0].source_segment_order == "2"
+    assert parsed[0].source_time_start == "00:01:20.000"
+    assert parsed[0].source_text_original == "Original cue text"
+
+
+def test_parse_youtube_subtitle_export_xlsx(tmp_path: Path) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "字幕"
+    sheet.append(["视频标题", "视频链接", "视频 ID", "频道", "上传日期", "字幕范围（秒）", "字幕语言", "字幕来源", "完整字幕"])
+    sheet.append(
+        [
+            "A dramatic title",
+            "https://www.youtube.com/watch?v=abc123",
+            "abc123",
+            "Channel A",
+            "2026-08-03",
+            "0-180",
+            "en",
+            "youtube_transcript_panel",
+            "This is the full subtitle text used as the actual batch comparison input.",
+        ]
+    )
+    file_path = tmp_path / "youtube_subtitles.xlsx"
+    workbook.save(file_path)
+
+    parsed = parse_task_input_file(file_path)
+
+    assert len(parsed) == 1
+    assert parsed[0].query_text == "This is the full subtitle text used as the actual batch comparison input."
+    assert parsed[0].source_ref == "https://www.youtube.com/watch?v=abc123"
+    assert parsed[0].source_display_title == "A dramatic title"
+    assert parsed[0].source_video_id == "abc123"
+    assert parsed[0].source_channel == "Channel A"
+    assert parsed[0].source_upload_date == "2026-08-03"
+    assert parsed[0].source_caption_language == "en"
+    assert parsed[0].source_caption_source == "youtube_transcript_panel"
+    assert parsed[0].source_time_start == "0"
+    assert parsed[0].source_time_end == "180"

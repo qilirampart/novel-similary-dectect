@@ -25,6 +25,11 @@ const topNavItems: TopNavItem[] = [
   { label: "系统状态", path: "/system-status" }
 ];
 
+sideNavItems.push({ label: "\u77ed\u5267\u5b57\u5e55\u6bd4\u5bf9", path: "/drama-subtitles", icon: "layers" });
+topNavItems.push({ label: "\u77ed\u5267\u5b57\u5e55", path: "/drama-subtitles" });
+sideNavItems.push({ label: "封面巡检", path: "/cover-monitor", icon: "shield" });
+topNavItems.push({ label: "封面巡检", path: "/cover-monitor" });
+
 function matchesPath(target: string, current: string) {
   return target === "/" ? current === "/" : current.startsWith(target);
 }

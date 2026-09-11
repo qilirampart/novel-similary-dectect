@@ -47,10 +47,12 @@ assert.equal(
 
 assert.deepEqual(parseReviewQueryState(params), {
   taskId: "task-2",
+  taskIds: [],
   resultId: 88,
   status: "completed",
   reviewStatus: "needs_followup",
-  q: "keyword"
+  q: "keyword",
+  threshold: ""
 });
 
 console.log("workflowLinks tests passed");
