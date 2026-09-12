@@ -13,7 +13,12 @@ from typing import Any, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
-from service.cover_monitor.prompts import PROMPT_VERSION, build_cover_prompt, cover_prompt_hash
+from service.cover_monitor.prompts import (
+    PROMPT_VERSION,
+    build_cover_prompt,
+    build_cover_risk_verification_prompt,
+    cover_prompt_hash,
+)
 
 
 RISK_VALUES = {"safe", "review", "risk", "unknown"}
@@ -99,13 +104,20 @@ class CoverVisionReviewer:
             payload = self._request_payload(
                 image_bytes=image_bytes,
                 mime_type=mimetypes.guess_type(path.name)[0] or "image/jpeg",
-                video_title=video_title,
                 prompt=prompt,
             )
             body, status = self._post_json(payload)
             response_status = status
             raw_content = self._extract_content(body)
             normalized = self._validate_model_result(self._parse_json_object(raw_content))
+            if normalized["overall_risk"] == "risk":
+                normalized, raw_content, response_status = self._confirm_risk(
+                    image_bytes=image_bytes,
+                    mime_type=mimetypes.guess_type(path.name)[0] or "image/jpeg",
+                    primary=normalized,
+                    primary_raw=raw_content,
+                    primary_status=status,
+                )
             duration = time.perf_counter() - started
             return CoverReviewOutcome(
                 status="succeeded",
@@ -139,7 +151,6 @@ class CoverVisionReviewer:
         *,
         image_bytes: bytes,
         mime_type: str,
-        video_title: str,
         prompt: str,
     ) -> dict[str, Any]:
         image_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
@@ -151,11 +162,88 @@ class CoverVisionReviewer:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": f"请检测这张视频封面。视频标题仅作参考：{video_title[:300]}"},
+                        {"type": "text", "text": "请仅根据图片中的可见证据检测这张视频封面。"},
                         {"type": "image_url", "image_url": {"url": image_url}},
                     ],
                 },
             ],
+        }
+
+    def _confirm_risk(
+        self,
+        *,
+        image_bytes: bytes,
+        mime_type: str,
+        primary: dict[str, Any],
+        primary_raw: str,
+        primary_status: int,
+    ) -> tuple[dict[str, Any], str, int]:
+        try:
+            payload = self._request_payload(
+                image_bytes=image_bytes,
+                mime_type=mime_type,
+                prompt=build_cover_risk_verification_prompt(),
+            )
+            body, status = self._post_json(payload)
+            verification_raw = self._extract_content(body)
+            verification = self._validate_risk_verification(
+                self._parse_json_object(verification_raw),
+                primary_tags=set(primary["risk_tags"]),
+            )
+            combined_raw = json.dumps(
+                {"primary": primary_raw, "verification": verification_raw},
+                ensure_ascii=False,
+            )
+            if verification["decision"] == "confirm":
+                confirmed = dict(primary)
+                confirmed["risk_tags"] = verification["confirmed_risk_tags"]
+                confirmed["confidence"] = min(primary["confidence"], verification["confidence"])
+                return confirmed, combined_raw, status
+            return self._demote_unconfirmed_risk(primary, verification["reason"]), combined_raw, status
+        except Exception as exc:
+            reason = f"二次核验不可用（{type(exc).__name__}），风险证据需人工复核"
+            return self._demote_unconfirmed_risk(primary, reason), primary_raw, primary_status
+
+    @staticmethod
+    def _demote_unconfirmed_risk(primary: dict[str, Any], reason: str) -> dict[str, Any]:
+        demoted = dict(primary)
+        demoted["overall_risk"] = "review"
+        demoted["summary"] = "风险证据尚未通过二次确认，建议人工复核"
+        demoted["evidence"] = f"二次核验未确认：{str(reason).strip()[:800]}"
+        return demoted
+
+    @staticmethod
+    def _validate_risk_verification(
+        payload: dict[str, Any],
+        *,
+        primary_tags: set[str],
+    ) -> dict[str, Any]:
+        decision = str(payload.get("decision") or "").strip().lower()
+        if decision not in {"confirm", "review"}:
+            raise ValueError("二次核验 decision 非法")
+        raw_tags = payload.get("confirmed_risk_tags")
+        if not isinstance(raw_tags, list):
+            raise ValueError("二次核验 confirmed_risk_tags 必须是数组")
+        tags = tuple(dict.fromkeys(str(tag).strip() for tag in raw_tags if str(tag).strip()))
+        if set(tags) - RISK_TAGS or set(tags) - primary_tags:
+            raise ValueError("二次核验包含非法或新增风险标签")
+        if decision == "confirm" and not tags:
+            raise ValueError("二次核验确认风险时必须包含标签")
+        if decision == "confirm" and set(tags) != primary_tags:
+            raise ValueError("二次核验未完整确认首轮风险标签")
+        if decision == "review" and tags:
+            raise ValueError("二次核验待复核时标签必须为空")
+        reason = str(payload.get("reason") or "").strip()
+        if not reason:
+            raise ValueError("二次核验 reason 不能为空")
+        confidence = float(payload.get("confidence"))
+        if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+            raise ValueError("二次核验 confidence 非法")
+        return {
+            "decision": decision,
+            "confirmed_risk_tags": tags,
+            "reason": reason,
+            "confidence": confidence,
         }
 
     def _post_json(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
