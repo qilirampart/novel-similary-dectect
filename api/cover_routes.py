@@ -15,6 +15,7 @@ from openpyxl.utils.exceptions import InvalidFileException
 from pydantic import BaseModel, Field, PositiveInt
 
 from service.cover_monitor.prompts import PROMPT_VERSION
+from service.cover_monitor.exporter import build_cover_report_xlsx
 from service.cover_monitor.store import CoverAccessScope, CoverMonitorStore
 
 
@@ -220,6 +221,7 @@ def build_cover_monitor_router(
     db_path: str,
     import_root: str = "runtime/cover_monitor/imports",
     asset_root: str = "runtime/cover_monitor/assets",
+    export_root: str = "runtime/cover_monitor/exports",
     import_max_bytes: int = 150 * 1024 * 1024,
     current_user_dependency: Callable[..., dict[str, Any]],
     vision_provider: str = "",
@@ -330,6 +332,27 @@ def build_cover_monitor_router(
         if result is None:
             raise HTTPException(status_code=404, detail="巡检批次不存在")
         return CoverRunDetailResponse.model_validate(result)
+
+    @router.get("/runs/{run_id}/exports/{export_kind}", response_class=FileResponse)
+    def export_run_report(
+        run_id: str,
+        export_kind: Literal["new-findings", "historical-rectification"],
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> FileResponse:
+        report = store.get_run_report_data(access_scope(user), run_id)
+        if report is None:
+            raise HTTPException(status_code=404, detail="巡检批次不存在")
+        path, download_name = build_cover_report_xlsx(
+            report=report,
+            export_kind=export_kind,
+            export_root=export_root,
+            user_id=int(user["user_id"]),
+        )
+        return FileResponse(
+            path=path,
+            filename=download_name,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     def control_run(action: str, run_id: str, user: dict[str, Any]) -> CoverRunSummary:
         try:

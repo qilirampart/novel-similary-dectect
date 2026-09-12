@@ -60,6 +60,9 @@ class ApiSettings:
     cover_monitor_import_root: str = os.environ.get(
         "COVER_MONITOR_IMPORT_ROOT", "runtime/cover_monitor/imports"
     )
+    cover_monitor_export_root: str = os.environ.get(
+        "COVER_MONITOR_EXPORT_ROOT", "runtime/cover_monitor/exports"
+    )
     cover_monitor_import_max_bytes: int = int(
         os.environ.get("COVER_MONITOR_IMPORT_MAX_BYTES", str(150 * 1024 * 1024))
     )

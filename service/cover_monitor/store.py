@@ -1379,6 +1379,90 @@ class CoverMonitorStore:
             "item_offset": safe_offset,
         }
 
+    def get_run_report_data(
+        self,
+        scope: CoverAccessScope,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        run = self.get_run(scope, run_id)
+        if run is None:
+            return None
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        with self._connect() as conn:
+            channel_rows = conn.execute(
+                """
+                SELECT channel_pk, operator_snapshot_json, scan_status, completeness,
+                       discovered_count, error_message
+                  FROM cover_run_channels
+                 WHERE run_id = ?
+                 ORDER BY run_channel_id
+                """,
+                (run_id,),
+            ).fetchall()
+            rows = conn.execute(
+                """
+                SELECT item.task_item_id, item.reason, item.stage, item.status,
+                       item.attempts, item.error_type, item.error_message,
+                       item.created_at AS item_created_at, item.finished_at AS item_finished_at,
+                       video.channel_pk, video.video_pk, video.video_id,
+                       video.title AS video_title, video.video_url, video.thumbnail_url,
+                       video.upload_date,
+                       detection.detection_id, detection.overall_risk,
+                       detection.risk_tags_json, detection.summary, detection.evidence,
+                       detection.confidence, detection.provider, detection.model,
+                       detection.prompt_version, detection.duration_seconds,
+                       detection.finished_at AS detected_at,
+                       asset.asset_id, asset.content_sha256, asset.original_url,
+                       asset.fetched_url, asset.width, asset.height, asset.fetched_at,
+                       risk_case.case_id, risk_case.current_status AS case_status,
+                       risk_case.opened_at AS case_opened_at,
+                       (SELECT event.event_type
+                          FROM cover_case_events AS event
+                         WHERE event.case_id = risk_case.case_id
+                         ORDER BY event.created_at DESC, event.case_event_id DESC
+                         LIMIT 1) AS latest_case_event
+                  FROM cover_task_items AS item
+                  JOIN cover_videos AS video ON video.video_pk = item.video_pk
+                  LEFT JOIN cover_detections AS detection
+                    ON detection.task_item_id = item.task_item_id
+                  LEFT JOIN cover_assets AS asset ON asset.asset_id = detection.asset_id
+                  LEFT JOIN cover_risk_cases AS risk_case
+                    ON risk_case.case_id = (
+                        SELECT candidate.case_id
+                          FROM cover_risk_cases AS candidate
+                         WHERE candidate.workspace_key = ?
+                           AND candidate.video_pk = item.video_pk
+                         ORDER BY candidate.updated_at DESC, candidate.case_id DESC
+                         LIMIT 1
+                    )
+                 WHERE item.run_id = ? AND video.workspace_key = ?
+                 ORDER BY item.task_item_id
+                """,
+                (workspace_key, run_id, workspace_key),
+            ).fetchall()
+        channels: list[dict[str, Any]] = []
+        snapshots: dict[int, dict[str, Any]] = {}
+        for channel_row in channel_rows:
+            channel = dict(channel_row)
+            try:
+                snapshot = json.loads(str(channel.pop("operator_snapshot_json") or "{}"))
+            except json.JSONDecodeError:
+                snapshot = {}
+            channel["snapshot"] = snapshot if isinstance(snapshot, dict) else {}
+            channels.append(channel)
+            snapshots[int(channel["channel_pk"])] = channel["snapshot"]
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                risk_tags = json.loads(str(item.pop("risk_tags_json") or "[]"))
+            except json.JSONDecodeError:
+                risk_tags = []
+            item["risk_tags"] = risk_tags if isinstance(risk_tags, list) else []
+            item["channel_snapshot"] = dict(snapshots.get(int(item["channel_pk"]), {}))
+            items.append(item)
+        return {"run": run, "channels": channels, "items": items}
+
     def claim_next_run(self, *, worker_name: str) -> dict[str, Any] | None:
         worker_name = _required_text(worker_name, "worker_name")
         lease_token = uuid4().hex

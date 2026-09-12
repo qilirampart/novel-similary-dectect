@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 import sqlite3
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from api.cover_routes import build_cover_monitor_router
 from service.cover_monitor.store import CoverAccessScope, CoverMonitorStore
@@ -457,3 +458,67 @@ def test_cover_risk_case_routes_list_detail_and_confirm_rectification(tmp_path: 
         json={"action": "confirm_rectified", "reason": "重复确认应被拒绝"},
     ).status_code == 409
     assert client.get("/api/v1/cover-monitor/risk-cases/missing-case").status_code == 404
+
+
+def test_cover_run_exports_use_snapshot_and_separate_new_from_rectification(tmp_path: Path) -> None:
+    client, db_path = _cover_run_client(tmp_path)
+    case_id = _seed_cover_risk_candidate(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        run_rows = conn.execute(
+            "SELECT run_id FROM cover_runs ORDER BY created_at, rowid"
+        ).fetchall()
+        new_run_id = str(run_rows[0]["run_id"])
+        rectification_run_id = str(run_rows[-1]["run_id"])
+        conn.execute(
+            "UPDATE cover_task_items SET reason = 'historical_risk' WHERE run_id = ?",
+            (rectification_run_id,),
+        )
+        conn.execute(
+            """
+            UPDATE cover_videos SET title = '=HYPERLINK("https://invalid.test","风险标题")'
+             WHERE video_pk IN (SELECT video_pk FROM cover_task_items WHERE run_id = ?)
+            """,
+            (rectification_run_id,),
+        )
+        conn.execute(
+            """
+            UPDATE cover_run_channels
+               SET operator_snapshot_json = '{"operator_name":"冻结代理","channel_id":"UC-snapshot","channel_name":"冻结频道","source_url":"https://example.test/frozen"}'
+             WHERE run_id = ?
+            """,
+            (rectification_run_id,),
+        )
+
+    new_response = client.get(
+        f"/api/v1/cover-monitor/runs/{new_run_id}/exports/new-findings"
+    )
+    rectification_response = client.get(
+        f"/api/v1/cover-monitor/runs/{rectification_run_id}/exports/historical-rectification"
+    )
+
+    assert new_response.status_code == 200
+    assert "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in new_response.headers["content-type"]
+    new_workbook = load_workbook(BytesIO(new_response.content), read_only=True)
+    assert new_workbook.sheetnames == ["新增视频明细", "新增风险", "待复核与失败", "代理商汇总"]
+    assert list(next(new_workbook["新增视频明细"].iter_rows(values_only=True)))[:3] == [
+        "频道 ID", "频道名", "代理商"
+    ]
+    new_summary_rows = list(new_workbook["代理商汇总"].iter_rows(values_only=True))
+    assert new_summary_rows[1][-1] == 0
+
+    assert rectification_response.status_code == 200
+    rectification_workbook = load_workbook(BytesIO(rectification_response.content), read_only=True)
+    assert rectification_workbook.sheetnames == ["历史风险整改明细", "代理商整改汇总"]
+    detail_rows = list(rectification_workbook["历史风险整改明细"].iter_rows(values_only=True))
+    assert detail_rows[1][:3] == ("UC-snapshot", "冻结频道", "冻结代理")
+    assert str(detail_rows[1][4]).startswith("'=")
+    summary_rows = list(rectification_workbook["代理商整改汇总"].iter_rows(values_only=True))
+    assert summary_rows[1][0] == "冻结代理"
+    assert summary_rows[1][1] == 1
+    assert case_id
+
+    missing = client.get(
+        "/api/v1/cover-monitor/runs/missing-run/exports/new-findings"
+    )
+    assert missing.status_code == 404

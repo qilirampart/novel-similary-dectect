@@ -808,6 +808,32 @@ export function getCoverMonitorRunDetail(
   );
 }
 
+export async function downloadCoverMonitorRunExport(
+  runId: string,
+  kind: "new-findings" | "historical-rectification"
+): Promise<string> {
+  const response = await fetchWithTimeout(
+    resolveApiPath(`/api/v1/cover-monitor/runs/${encodeURIComponent(runId)}/exports/${kind}`),
+    { credentials: "include" },
+    DOWNLOAD_REQUEST_TIMEOUT_MS
+  );
+  if (!response.ok) {
+    throw new Error(parseErrorDetail(await response.text(), response.statusText || "封面巡检报告导出失败"));
+  }
+  const fallback = kind === "new-findings" ? "封面新增检测报告.xlsx" : "封面历史整改报告.xlsx";
+  const fileName = parseDownloadFilename(response.headers.get("content-disposition"), fallback);
+  const blobUrl = window.URL.createObjectURL(await response.blob());
+  const anchor = document.createElement("a");
+  anchor.href = blobUrl;
+  anchor.download = fileName;
+  anchor.rel = "noopener";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => window.URL.revokeObjectURL(blobUrl), 1000);
+  return fileName;
+}
+
 export function listCoverRiskCases(
   status = "needs_review",
   limit = 50,

@@ -4,6 +4,7 @@ import {
   confirmCoverMonitorImport,
   controlCoverMonitorRun,
   createCoverMonitorRun,
+  downloadCoverMonitorRunExport,
   getCoverMonitorOverview,
   getCoverMonitorRunDetail,
   listCoverMonitorRuns,
@@ -83,6 +84,8 @@ export function CoverMonitorPage() {
   const [runMaxItems, setRunMaxItems] = useState(0);
   const [runBusy, setRunBusy] = useState(false);
   const [runError, setRunError] = useState("");
+  const [exportBusy, setExportBusy] = useState<"new-findings" | "historical-rectification" | "">("");
+  const [exportMessage, setExportMessage] = useState("");
   const [runs, setRuns] = useState<CoverRunSummary[]>([]);
   const [runTotal, setRunTotal] = useState(0);
   const [selectedRunId, setSelectedRunId] = useState("");
@@ -97,6 +100,21 @@ export function CoverMonitorPage() {
   const [isDragging, setIsDragging] = useState(false);
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const runDetailRequestRef = useRef(0);
+
+  async function exportRun(kind: "new-findings" | "historical-rectification") {
+    if (!runDetail || exportBusy) return;
+    setExportBusy(kind);
+    setExportMessage("");
+    setError("");
+    try {
+      const fileName = await downloadCoverMonitorRunExport(runDetail.run.run_id, kind);
+      setExportMessage(`${fileName} 已开始下载`);
+    } catch (exportError) {
+      setError(exportError instanceof Error ? exportError.message : "封面巡检报告导出失败");
+    } finally {
+      setExportBusy("");
+    }
+  }
 
   async function loadOverview(silent = false) {
     if (!silent) setLoading(true);
@@ -427,8 +445,13 @@ export function CoverMonitorPage() {
             {runDetail ? <>
               <div className="section-heading">
                 <div><h2>批次 {runDetail.run.run_id.slice(0, 8)}</h2><p>{runDetail.run.status_message || "等待状态更新"}</p></div>
-                <span className={`cover-run-status ${runDetail.run.status}`}>{statusLabel(runDetail.run.status)}</span>
+                <div className="cover-run-heading-actions">
+                  <button className="outline-button slim" type="button" disabled={Boolean(exportBusy)} onClick={() => void exportRun("new-findings")}>{exportBusy === "new-findings" ? "生成中..." : "导出新增报告"}</button>
+                  <button className="outline-button slim" type="button" disabled={Boolean(exportBusy)} onClick={() => void exportRun("historical-rectification")}>{exportBusy === "historical-rectification" ? "生成中..." : "导出整改报告"}</button>
+                  <span className={`cover-run-status ${runDetail.run.status}`}>{statusLabel(runDetail.run.status)}</span>
+                </div>
               </div>
+              {exportMessage && <div className="cover-channel-message" role="status">{exportMessage}</div>}
               <div className="cover-run-detail-summary">
                 <div><span>频道</span><strong>{runDetail.channels.length}</strong></div>
                 <div><span>任务项</span><strong>{formatNumber(runDetail.item_total)}</strong></div>

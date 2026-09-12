@@ -526,6 +526,7 @@ app.include_router(
         db_path=SETTINGS.cover_monitor_db_path,
         import_root=SETTINGS.cover_monitor_import_root,
         asset_root=SETTINGS.cover_monitor_asset_root,
+        export_root=SETTINGS.cover_monitor_export_root,
         import_max_bytes=SETTINGS.cover_monitor_import_max_bytes,
         current_user_dependency=_require_current_user,
         vision_provider=SETTINGS.cover_monitor_vision_api_base,
