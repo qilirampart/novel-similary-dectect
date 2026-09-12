@@ -279,6 +279,9 @@ CREATE TABLE IF NOT EXISTS cover_detections (
 CREATE INDEX IF NOT EXISTS idx_cover_detections_workspace_risk
     ON cover_detections (workspace_key, overall_risk, created_at DESC);
 
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cover_detections_task_item
+    ON cover_detections (task_item_id);
+
 CREATE TABLE IF NOT EXISTS cover_attempts (
     attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_item_id INTEGER NOT NULL,

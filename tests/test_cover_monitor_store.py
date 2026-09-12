@@ -31,9 +31,10 @@ def test_init_cover_db_is_idempotent_and_enables_required_tables(tmp_path: Path)
             ).fetchall()
         }
 
-    assert version == 4
+    assert version == 5
     assert "idx_cover_runs_claim" in indexes
     assert "idx_cover_task_items_run_claim" in indexes
+    assert "uq_cover_detections_task_item" in indexes
     assert {
         "cover_channels",
         "cover_videos",

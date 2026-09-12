@@ -17,7 +17,7 @@ except Exception:
 
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_BUSY_TIMEOUT_MS = 30_000
 
 
@@ -1038,6 +1038,103 @@ class CoverMonitorStore:
             conn.commit()
         return inserted
 
+    def list_run_channels(self, run_id: str, worker_lease_token: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            run = conn.execute(
+                """
+                SELECT workspace_key FROM cover_runs
+                 WHERE run_id = ? AND worker_lease_token = ?
+                   AND status IN ('running', 'pause_requested', 'cancel_requested')
+                """,
+                (_required_text(run_id, "run_id"), _required_text(worker_lease_token, "worker_lease_token")),
+            ).fetchone()
+            if run is None:
+                return []
+            rows = conn.execute(
+                """
+                SELECT run_channel.*, channel.platform, channel.channel_id,
+                       channel.name AS channel_name, channel.source_url
+                  FROM cover_run_channels AS run_channel
+                  JOIN cover_channels AS channel ON channel.channel_pk = run_channel.channel_pk
+                 WHERE run_channel.run_id = ? AND channel.workspace_key = ?
+                 ORDER BY run_channel.run_channel_id
+                """,
+                (run_id, str(run["workspace_key"])),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def finish_run_channel(
+        self,
+        run_id: str,
+        worker_lease_token: str,
+        run_channel_id: int,
+        *,
+        completeness: str,
+        discovered_count: int,
+        checkpoint: dict[str, Any],
+        error_message: str = "",
+    ) -> bool:
+        if completeness not in {"complete", "partial", "failed"}:
+            raise ValueError("unsupported channel completeness")
+        now = _now()
+        with self._connect() as conn:
+            updated = conn.execute(
+                """
+                UPDATE cover_run_channels
+                   SET scan_status = ?, completeness = ?, discovered_count = ?,
+                       checkpoint_json = ?, error_message = ?
+                 WHERE run_channel_id = ? AND run_id = ?
+                   AND EXISTS (
+                       SELECT 1 FROM cover_runs
+                        WHERE run_id = ? AND worker_lease_token = ?
+                          AND status IN ('running', 'pause_requested', 'cancel_requested')
+                   )
+                """,
+                (
+                    "failed" if completeness == "failed" else "completed",
+                    completeness,
+                    max(int(discovered_count), 0),
+                    json.dumps(dict(checkpoint or {}), ensure_ascii=False, sort_keys=True),
+                    str(error_message or "")[:1000] or None,
+                    int(run_channel_id),
+                    _required_text(run_id, "run_id"),
+                    run_id,
+                    _required_text(worker_lease_token, "worker_lease_token"),
+                ),
+            ).rowcount
+            if updated == 1:
+                conn.execute(
+                    """
+                    UPDATE cover_channels SET last_scan_at = ?, updated_at = ?
+                     WHERE channel_pk = (
+                         SELECT channel_pk FROM cover_run_channels WHERE run_channel_id = ?
+                     )
+                    """,
+                    (now, now, int(run_channel_id)),
+                )
+        return updated == 1
+
+    def get_video_by_identity(
+        self,
+        scope: CoverAccessScope,
+        *,
+        platform: str,
+        video_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM cover_videos
+                 WHERE workspace_key = ? AND platform = ? AND video_id = ?
+                """,
+                (
+                    scope.workspace_key.strip(),
+                    _required_text(platform, "platform").lower(),
+                    _required_text(video_id, "video_id"),
+                ),
+            ).fetchone()
+        return self._row(row)
+
     def claim_next_task_item(
         self,
         run_id: str,
@@ -1115,6 +1212,314 @@ class CoverMonitorStore:
                 (int(task_item_id),),
             ).fetchone()
         return self._row(row)
+
+    def get_task_item_context(self, task_item_id: int, worker_lease_token: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT item.*, run.workspace_key, run.intensity, run.prompt_version,
+                       video.video_id, video.title, video.thumbnail_url, video.video_url
+                  FROM cover_task_items AS item
+                  JOIN cover_runs AS run ON run.run_id = item.run_id
+                  JOIN cover_videos AS video ON video.video_pk = item.video_pk
+                 WHERE item.task_item_id = ? AND item.worker_lease_token = ?
+                   AND item.status = 'running'
+                """,
+                (int(task_item_id), _required_text(worker_lease_token, "worker_lease_token")),
+            ).fetchone()
+        return self._row(row)
+
+    def get_run_item_state(self, run_id: str, worker_lease_token: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            run = conn.execute(
+                """
+                SELECT 1 FROM cover_runs
+                 WHERE run_id = ? AND worker_lease_token = ? AND status = 'running'
+                """,
+                (_required_text(run_id, "run_id"), _required_text(worker_lease_token, "worker_lease_token")),
+            ).fetchone()
+            if run is None:
+                return None
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS unfinished_count,
+                       MIN(CASE WHEN status = 'retry_wait' THEN next_retry_at END) AS next_retry_at
+                  FROM cover_task_items
+                 WHERE run_id = ? AND status IN ('queued', 'running', 'retry_wait')
+                """,
+                (run_id,),
+            ).fetchone()
+        return self._row(row)
+
+    def save_asset(
+        self,
+        scope: CoverAccessScope,
+        *,
+        video_pk: int,
+        asset: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = _now()
+        asset_id = str(uuid4())
+        content_sha256 = _required_text(str(asset.get("content_sha256") or ""), "content_sha256")
+        with self._connect() as conn:
+            video = conn.execute(
+                "SELECT 1 FROM cover_videos WHERE video_pk = ? AND workspace_key = ?",
+                (int(video_pk), scope.workspace_key.strip()),
+            ).fetchone()
+            if video is None:
+                raise ValueError("video is not visible in this workspace")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO cover_assets (
+                    asset_id, workspace_key, video_pk, content_sha256, storage_key,
+                    original_url, fetched_url, mime_type, byte_size, width, height,
+                    fetched_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    asset_id,
+                    scope.workspace_key.strip(),
+                    int(video_pk),
+                    content_sha256,
+                    _required_text(str(asset.get("storage_key") or ""), "storage_key"),
+                    _required_text(str(asset.get("original_url") or ""), "original_url"),
+                    _required_text(str(asset.get("fetched_url") or ""), "fetched_url"),
+                    _required_text(str(asset.get("mime_type") or ""), "mime_type"),
+                    int(asset.get("byte_size") or 0),
+                    int(asset.get("width") or 0),
+                    int(asset.get("height") or 0),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM cover_assets
+                 WHERE workspace_key = ? AND video_pk = ? AND content_sha256 = ?
+                """,
+                (scope.workspace_key.strip(), int(video_pk), content_sha256),
+            ).fetchone()
+        result = self._row(row)
+        if result is None:
+            raise RuntimeError("asset save did not return a row")
+        return result
+
+    def get_latest_asset(self, scope: CoverAccessScope, video_pk: int) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM cover_assets
+                 WHERE workspace_key = ? AND video_pk = ?
+                 ORDER BY fetched_at DESC, asset_id DESC LIMIT 1
+                """,
+                (scope.workspace_key.strip(), int(video_pk)),
+            ).fetchone()
+        return self._row(row)
+
+    def start_task_attempt(
+        self,
+        task_item_id: int,
+        worker_lease_token: str,
+        *,
+        stage: str,
+        provider: str = "",
+    ) -> dict[str, Any] | None:
+        now = _now()
+        with self._connect() as conn:
+            item = conn.execute(
+                """
+                SELECT attempts FROM cover_task_items
+                 WHERE task_item_id = ? AND worker_lease_token = ? AND status = 'running'
+                """,
+                (int(task_item_id), _required_text(worker_lease_token, "worker_lease_token")),
+            ).fetchone()
+            if item is None:
+                return None
+            attempt_no = int(item["attempts"])
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO cover_attempts (
+                    task_item_id, attempt_no, stage, status, provider, started_at
+                ) VALUES (?, ?, ?, 'running', ?, ?)
+                """,
+                (
+                    int(task_item_id),
+                    attempt_no,
+                    _required_text(stage, "stage"),
+                    str(provider or "")[:200] or None,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM cover_attempts
+                 WHERE task_item_id = ? AND attempt_no = ? AND stage = ?
+                """,
+                (int(task_item_id), attempt_no, stage),
+            ).fetchone()
+        return self._row(row)
+
+    def finish_task_attempt(
+        self,
+        attempt_id: int,
+        *,
+        succeeded: bool,
+        duration_seconds: float,
+        error_type: str = "",
+        error_message: str = "",
+        usage: dict[str, Any] | None = None,
+    ) -> bool:
+        with self._connect() as conn:
+            updated = conn.execute(
+                """
+                UPDATE cover_attempts
+                   SET status = ?, error_type = ?, error_message = ?, usage_json = ?,
+                       duration_seconds = ?, finished_at = ?
+                 WHERE attempt_id = ? AND status = 'running'
+                """,
+                (
+                    "succeeded" if succeeded else "failed",
+                    None if succeeded else str(error_type or "unexpected")[:100],
+                    None if succeeded else str(error_message or "")[:1000],
+                    json.dumps(dict(usage or {}), ensure_ascii=False, sort_keys=True),
+                    max(float(duration_seconds), 0),
+                    _now(),
+                    int(attempt_id),
+                ),
+            ).rowcount
+        return updated == 1
+
+    def save_detection_and_case(
+        self,
+        scope: CoverAccessScope,
+        *,
+        task_item_id: int,
+        worker_lease_token: str,
+        asset_id: str,
+        detection: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = _now()
+        detection_id = str(uuid4())
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            item = conn.execute(
+                """
+                SELECT item.run_id, item.video_pk
+                  FROM cover_task_items AS item
+                  JOIN cover_runs AS run ON run.run_id = item.run_id
+                 WHERE item.task_item_id = ? AND item.worker_lease_token = ?
+                   AND item.status = 'running' AND run.workspace_key = ?
+                """,
+                (
+                    int(task_item_id),
+                    _required_text(worker_lease_token, "worker_lease_token"),
+                    scope.workspace_key.strip(),
+                ),
+            ).fetchone()
+            if item is None:
+                conn.rollback()
+                raise ValueError("task item lease is no longer valid")
+            overall_risk = _required_text(str(detection.get("overall_risk") or ""), "overall_risk")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO cover_detections (
+                    detection_id, workspace_key, run_id, task_item_id, video_pk, asset_id,
+                    overall_risk, risk_tags_json, summary, evidence, confidence,
+                    provider, model, prompt_version, prompt_hash, intensity,
+                    input_snapshot_json, raw_response, started_at, finished_at,
+                    duration_seconds, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    detection_id,
+                    scope.workspace_key.strip(),
+                    str(item["run_id"]),
+                    int(task_item_id),
+                    int(item["video_pk"]),
+                    _required_text(asset_id, "asset_id"),
+                    overall_risk,
+                    json.dumps(list(detection.get("risk_tags") or []), ensure_ascii=False),
+                    _required_text(str(detection.get("summary") or ""), "summary"),
+                    _required_text(str(detection.get("evidence") or ""), "evidence"),
+                    float(detection.get("confidence") or 0),
+                    _required_text(str(detection.get("provider") or ""), "provider"),
+                    _required_text(str(detection.get("model") or ""), "model"),
+                    _required_text(str(detection.get("prompt_version") or ""), "prompt_version"),
+                    _required_text(str(detection.get("prompt_hash") or ""), "prompt_hash"),
+                    _required_text(str(detection.get("intensity") or ""), "intensity"),
+                    json.dumps(dict(detection.get("input_snapshot") or {}), ensure_ascii=False, sort_keys=True),
+                    str(detection.get("raw_response") or "")[:20_000],
+                    str(detection.get("started_at") or now),
+                    str(detection.get("finished_at") or now),
+                    max(float(detection.get("duration_seconds") or 0), 0),
+                    now,
+                ),
+            )
+            saved_detection = conn.execute(
+                "SELECT detection_id, overall_risk FROM cover_detections WHERE task_item_id = ?",
+                (int(task_item_id),),
+            ).fetchone()
+            if saved_detection is None:
+                conn.rollback()
+                raise RuntimeError("detection save did not return a row")
+            detection_id = str(saved_detection["detection_id"])
+            overall_risk = str(saved_detection["overall_risk"])
+            if overall_risk in {"risk", "review", "unknown"}:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO cover_risk_cases (
+                        case_id, workspace_key, video_pk, opened_detection_id,
+                        current_status, opened_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'needs_review', ?, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        scope.workspace_key.strip(),
+                        int(item["video_pk"]),
+                        detection_id,
+                        now,
+                        now,
+                    ),
+                )
+            conn.commit()
+        return {"detection_id": detection_id, "overall_risk": overall_risk}
+
+    def finish_run_without_items(self, run_id: str, worker_lease_token: str) -> bool:
+        now = _now()
+        with self._connect() as conn:
+            failed_channels = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM cover_run_channels WHERE run_id = ? AND completeness = 'failed'",
+                    (_required_text(run_id, "run_id"),),
+                ).fetchone()[0]
+            )
+            total_channels = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM cover_run_channels WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+            )
+            status = "failed" if total_channels > 0 and failed_channels == total_channels else "completed"
+            updated = conn.execute(
+                """
+                UPDATE cover_runs
+                   SET status = ?, status_message = ?, worker_name = NULL,
+                       worker_lease_token = NULL, last_heartbeat_at = NULL,
+                       finished_at = ?, updated_at = ?
+                 WHERE run_id = ? AND worker_lease_token = ? AND status = 'running'
+                   AND NOT EXISTS (SELECT 1 FROM cover_task_items WHERE run_id = ?)
+                """,
+                (
+                    status,
+                    "未发现需要检测的新视频" if status == "completed" else "频道扫描失败",
+                    now,
+                    now,
+                    run_id,
+                    _required_text(worker_lease_token, "worker_lease_token"),
+                    run_id,
+                ),
+            ).rowcount
+        return updated == 1
 
     def retry_task_item(
         self,
