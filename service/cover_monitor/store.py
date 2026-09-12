@@ -17,7 +17,7 @@ except Exception:
 
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_BUSY_TIMEOUT_MS = 30_000
 
 
@@ -143,6 +143,174 @@ class CoverMonitorStore:
             "risk_distribution": distribution,
             "latest_run": latest_run,
         }
+
+    def list_risk_cases(
+        self,
+        scope: CoverAccessScope,
+        *,
+        status: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        normalized_status = str(status or "").strip()
+        allowed_statuses = {
+            "open",
+            "needs_review",
+            "confirmed_rectified",
+            "false_positive",
+            "unavailable",
+            "closed",
+        }
+        if normalized_status and normalized_status not in allowed_statuses:
+            raise ValueError("unsupported risk case status")
+        safe_limit = min(max(int(limit), 1), 100)
+        safe_offset = max(int(offset), 0)
+        where = "risk_case.workspace_key = ?"
+        params: list[Any] = [workspace_key]
+        if normalized_status:
+            where += " AND risk_case.current_status = ?"
+            params.append(normalized_status)
+        with self._connect() as conn:
+            total = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM cover_risk_cases AS risk_case WHERE {where}",
+                    params,
+                ).fetchone()[0]
+            )
+            rows = conn.execute(
+                f"""
+                SELECT risk_case.*, video.video_id, video.title AS video_title,
+                       video.video_url, video.thumbnail_url,
+                       opened.overall_risk AS opened_risk,
+                       opened.summary AS opened_summary,
+                       opened.evidence AS opened_evidence,
+                       opened.confidence AS opened_confidence,
+                       opened.asset_id AS opened_asset_id,
+                       (
+                           SELECT event.event_type FROM cover_case_events AS event
+                            WHERE event.case_id = risk_case.case_id
+                            ORDER BY event.created_at DESC, event.case_event_id DESC LIMIT 1
+                       ) AS latest_event_type
+                  FROM cover_risk_cases AS risk_case
+                  JOIN cover_videos AS video ON video.video_pk = risk_case.video_pk
+                  JOIN cover_detections AS opened ON opened.detection_id = risk_case.opened_detection_id
+                 WHERE {where}
+                 ORDER BY risk_case.updated_at DESC, risk_case.case_id DESC
+                 LIMIT ? OFFSET ?
+                """,
+                (*params, safe_limit, safe_offset),
+            ).fetchall()
+        return {
+            "items": [dict(row) for row in rows],
+            "total": total,
+            "limit": safe_limit,
+            "offset": safe_offset,
+        }
+
+    def review_risk_case(
+        self,
+        scope: CoverAccessScope,
+        case_id: str,
+        *,
+        action: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        case_id = _required_text(case_id, "case_id")
+        action = _required_text(action, "action")
+        reason = _required_text(reason, "reason")[:1000]
+        transitions = {
+            "confirm_rectified": "confirmed_rectified",
+            "false_positive": "false_positive",
+            "keep_open": "needs_review",
+            "mark_unavailable": "unavailable",
+            "reopen": "needs_review",
+        }
+        if action not in transitions:
+            raise ValueError("unsupported risk case review action")
+        event_types = {
+            "confirm_rectified": "confirmed_rectified",
+            "false_positive": "false_positive",
+            "keep_open": "kept_open",
+            "mark_unavailable": "marked_unavailable",
+            "reopen": "reopened",
+        }
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            risk_case = conn.execute(
+                """
+                SELECT * FROM cover_risk_cases
+                 WHERE case_id = ? AND workspace_key = ?
+                """,
+                (case_id, workspace_key),
+            ).fetchone()
+            if risk_case is None:
+                conn.rollback()
+                raise LookupError("cover risk case not found")
+            current_status = str(risk_case["current_status"])
+            active = current_status in {"open", "needs_review"}
+            if action == "reopen":
+                if active:
+                    conn.rollback()
+                    raise ValueError("risk case is already open")
+            elif not active:
+                conn.rollback()
+                raise ValueError("risk case is already closed")
+
+            candidate = conn.execute(
+                """
+                SELECT detection_id FROM cover_case_events
+                 WHERE case_id = ? AND event_type = 'rectification_candidate'
+                 ORDER BY created_at DESC, case_event_id DESC LIMIT 1
+                """,
+                (case_id,),
+            ).fetchone()
+            if action == "confirm_rectified" and candidate is None:
+                conn.rollback()
+                raise ValueError("当前案件没有可确认的换图整改候选")
+            detection_id = (
+                str(candidate["detection_id"])
+                if action == "confirm_rectified" and candidate is not None
+                else str(risk_case["opened_detection_id"])
+            )
+            target_status = transitions[action]
+            closed_at = None if target_status == "needs_review" else now
+            conn.execute(
+                """
+                UPDATE cover_risk_cases
+                   SET current_status = ?, updated_at = ?, closed_at = ?
+                 WHERE case_id = ? AND workspace_key = ?
+                """,
+                (target_status, now, closed_at, case_id, workspace_key),
+            )
+            conn.execute(
+                """
+                INSERT INTO cover_case_reviews (
+                    case_id, detection_id, action, reason,
+                    reviewed_by_user_id, reviewed_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (case_id, detection_id, action, reason, int(scope.user_id), now),
+            )
+            conn.execute(
+                """
+                INSERT INTO cover_case_events (
+                    case_id, detection_id, event_type, actor_type,
+                    actor_user_id, reason, created_at
+                ) VALUES (?, ?, ?, 'user', ?, ?, ?)
+                """,
+                (case_id, detection_id, event_types[action], int(scope.user_id), reason, now),
+            )
+            result = conn.execute(
+                "SELECT * FROM cover_risk_cases WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()
+            conn.commit()
+        if result is None:
+            raise RuntimeError("risk case review did not return a row")
+        return dict(result)
 
     def create_import_preview(
         self,
@@ -1624,16 +1792,31 @@ class CoverMonitorStore:
                 raise RuntimeError("detection save did not return a row")
             detection_id = str(saved_detection["detection_id"])
             overall_risk = str(saved_detection["overall_risk"])
-            if overall_risk in {"risk", "review", "unknown"}:
+            active_case = conn.execute(
+                """
+                SELECT risk_case.case_id, opened_detection.asset_id AS opened_asset_id
+                  FROM cover_risk_cases AS risk_case
+                  JOIN cover_detections AS opened_detection
+                    ON opened_detection.detection_id = risk_case.opened_detection_id
+                 WHERE risk_case.workspace_key = ? AND risk_case.video_pk = ?
+                   AND risk_case.current_status IN ('open', 'needs_review')
+                 ORDER BY risk_case.opened_at, risk_case.case_id LIMIT 1
+                """,
+                (scope.workspace_key.strip(), int(item["video_pk"])),
+            ).fetchone()
+            case_id = str(active_case["case_id"]) if active_case is not None else ""
+            opened_asset_id = str(active_case["opened_asset_id"]) if active_case is not None else ""
+            if overall_risk in {"risk", "review", "unknown"} and not case_id:
+                case_id = str(uuid4())
                 conn.execute(
                     """
-                    INSERT OR IGNORE INTO cover_risk_cases (
+                    INSERT INTO cover_risk_cases (
                         case_id, workspace_key, video_pk, opened_detection_id,
                         current_status, opened_at, updated_at
                     ) VALUES (?, ?, ?, ?, 'needs_review', ?, ?)
                     """,
                     (
-                        str(uuid4()),
+                        case_id,
                         scope.workspace_key.strip(),
                         int(item["video_pk"]),
                         detection_id,
@@ -1641,8 +1824,40 @@ class CoverMonitorStore:
                         now,
                     ),
                 )
+            event_type = {
+                "risk": "risk_detected",
+                "review": "review_detected",
+                "unknown": "unknown_detected",
+            }.get(overall_risk)
+            if overall_risk == "safe" and case_id:
+                event_type = (
+                    "safe_redetection"
+                    if opened_asset_id == _required_text(asset_id, "asset_id")
+                    else "rectification_candidate"
+                )
+            if case_id and event_type:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO cover_case_events (
+                        case_id, detection_id, event_type, actor_type,
+                        actor_user_id, reason, created_at
+                    ) VALUES (?, ?, ?, 'system', NULL, ?, ?)
+                    """,
+                    (
+                        case_id,
+                        detection_id,
+                        event_type,
+                        str(detection.get("summary") or "模型检测结果")[:1000],
+                        now,
+                    ),
+                )
             conn.commit()
-        return {"detection_id": detection_id, "overall_risk": overall_risk}
+        return {
+            "detection_id": detection_id,
+            "overall_risk": overall_risk,
+            "case_id": case_id or None,
+            "case_event_type": event_type,
+        }
 
     def finish_run_without_items(self, run_id: str, worker_lease_token: str) -> bool:
         now = _now()

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from service.cover_monitor.collector import (
     ChannelCollectionResult,
     CollectedCoverVideo,
@@ -60,8 +62,9 @@ class PartialCollector(FakeCollector):
 
 
 class FakeDownloader:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, content_sha256: str = "a" * 64) -> None:
         self.root = root
+        self.content_sha256 = content_sha256
 
     def download(self, video_id: str, original_url: str = "") -> DownloadedCover:
         storage_key = f"{video_id}/fake.jpg"
@@ -74,7 +77,7 @@ class FakeDownloader:
             fetched_url=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
             local_path=str(path),
             storage_key=storage_key,
-            content_sha256="a" * 64,
+            content_sha256=self.content_sha256,
             mime_type="image/jpeg",
             byte_size=10,
             width=1280,
@@ -83,8 +86,9 @@ class FakeDownloader:
 
 
 class FakeReviewer:
-    def __init__(self, *, fail_once: bool = False) -> None:
+    def __init__(self, *, fail_once: bool = False, overall_risk: str = "risk") -> None:
         self.fail_once = fail_once
+        self.overall_risk = overall_risk
         self.calls = 0
 
     def review(self, **_: object) -> CoverReviewOutcome:
@@ -101,10 +105,10 @@ class FakeReviewer:
             provider_status=200,
             duration_seconds=0.2,
             result=CoverDetectionResult(
-                overall_risk="risk",
-                risk_tags=("未成年人",),
-                summary="封面包含疑似未成年人风险元素",
-                evidence="画面主体呈现学生制服与校园文字",
+                overall_risk=self.overall_risk,
+                risk_tags=("未成年人",) if self.overall_risk != "safe" else (),
+                summary="封面包含疑似未成年人风险元素" if self.overall_risk != "safe" else "本次封面未见明确风险",
+                evidence="画面主体呈现学生制服与校园文字" if self.overall_risk != "safe" else "当前画面未见此前风险元素",
                 confidence=0.91,
                 provider="fake-provider",
                 model="fake-model",
@@ -241,6 +245,148 @@ def test_partial_channel_scan_without_items_does_not_report_completed(tmp_path: 
     assert result["status"] == "partial_failed"
     assert result["total_item_count"] == 0
     assert "频道扫描不完整" in result["status_message"]
+
+
+def test_safe_redetection_on_changed_cover_creates_candidate_without_closing_case(tmp_path: Path) -> None:
+    store, scope, _, _, executor = _create_executor_fixture(tmp_path)
+    first_result = executor.run_once()
+    assert first_result is not None and first_result["status"] == "completed"
+
+    channel = store.list_channels(scope)[0]
+    second_run = store.create_run(
+        scope,
+        trigger_type="manual",
+        intensity="standard",
+        channel_pks=[channel["channel_pk"]],
+        params={"force_refresh": True},
+        model_snapshot={"provider": "fake", "model": "fake"},
+        prompt_version="cover-visible-evidence-v1",
+    )
+    second_executor = CoverRunExecutor(
+        store=store,
+        collector=FakeCollector(),
+        downloader=FakeDownloader(tmp_path / "changed-assets", content_sha256="b" * 64),
+        reviewer=FakeReviewer(overall_risk="safe"),
+        worker_name="cover-worker-safe-redetection",
+    )
+
+    second_result = second_executor.run_once()
+
+    assert second_result is not None
+    assert second_result["run_id"] == second_run["run_id"]
+    assert second_result["status"] == "completed"
+    with store._connect() as conn:
+        assets = conn.execute(
+            "SELECT content_sha256 FROM cover_assets ORDER BY created_at, asset_id"
+        ).fetchall()
+        detections = conn.execute(
+            "SELECT overall_risk FROM cover_detections ORDER BY created_at, detection_id"
+        ).fetchall()
+        risk_cases = conn.execute(
+            "SELECT current_status, closed_at FROM cover_risk_cases"
+        ).fetchall()
+        events = conn.execute(
+            "SELECT event_type FROM cover_case_events ORDER BY case_event_id"
+        ).fetchall()
+    assert {row[0] for row in assets} == {"a" * 64, "b" * 64}
+    assert {row[0] for row in detections} == {"risk", "safe"}
+    assert [tuple(row) for row in risk_cases] == [("needs_review", None)]
+    assert [row[0] for row in events] == ["risk_detected", "rectification_candidate"]
+
+    case_id = store.list_risk_cases(scope, status="needs_review")["items"][0]["case_id"]
+    reviewed = store.review_risk_case(
+        scope,
+        case_id,
+        action="confirm_rectified",
+        reason="已核对新旧封面，确认风险元素已移除",
+    )
+
+    assert reviewed["current_status"] == "confirmed_rectified"
+    assert reviewed["closed_at"] is not None
+    with store._connect() as conn:
+        review = conn.execute(
+            "SELECT action, reviewed_by_user_id FROM cover_case_reviews WHERE case_id = ?",
+            (case_id,),
+        ).fetchone()
+        user_event = conn.execute(
+            "SELECT event_type, actor_type, actor_user_id FROM cover_case_events "
+            "WHERE case_id = ? ORDER BY case_event_id DESC LIMIT 1",
+            (case_id,),
+        ).fetchone()
+    assert tuple(review) == ("confirm_rectified", scope.user_id)
+    assert tuple(user_event) == ("confirmed_rectified", "user", scope.user_id)
+
+
+def test_safe_redetection_on_same_cover_is_model_variance_not_rectification(tmp_path: Path) -> None:
+    store, scope, _, _, executor = _create_executor_fixture(tmp_path)
+    executor.run_once()
+    channel = store.list_channels(scope)[0]
+    store.create_run(
+        scope,
+        trigger_type="manual",
+        intensity="standard",
+        channel_pks=[channel["channel_pk"]],
+        params={"force_refresh": True},
+        model_snapshot={"provider": "fake", "model": "fake"},
+        prompt_version="cover-visible-evidence-v1",
+    )
+    follow_up = CoverRunExecutor(
+        store=store,
+        collector=FakeCollector(),
+        downloader=FakeDownloader(tmp_path / "same-assets", content_sha256="a" * 64),
+        reviewer=FakeReviewer(overall_risk="safe"),
+        worker_name="cover-worker-model-variance",
+    )
+
+    follow_up.run_once()
+
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cover_assets").fetchone()[0] == 1
+        case = conn.execute("SELECT current_status, closed_at FROM cover_risk_cases").fetchone()
+        events = conn.execute(
+            "SELECT event_type FROM cover_case_events ORDER BY case_event_id"
+        ).fetchall()
+    assert tuple(case) == ("needs_review", None)
+    assert [row[0] for row in events] == ["risk_detected", "safe_redetection"]
+    case_id = store.list_risk_cases(scope, status="needs_review")["items"][0]["case_id"]
+    with pytest.raises(ValueError, match="整改候选"):
+        store.review_risk_case(
+            scope,
+            case_id,
+            action="confirm_rectified",
+            reason="不能仅依据同一图片的模型波动确认整改",
+        )
+
+
+def test_repeated_risk_detection_reuses_existing_open_case(tmp_path: Path) -> None:
+    store, scope, _, _, executor = _create_executor_fixture(tmp_path)
+    executor.run_once()
+    channel = store.list_channels(scope)[0]
+    store.create_run(
+        scope,
+        trigger_type="manual",
+        intensity="standard",
+        channel_pks=[channel["channel_pk"]],
+        params={"force_refresh": True},
+        model_snapshot={"provider": "fake", "model": "fake"},
+        prompt_version="cover-visible-evidence-v1",
+    )
+    follow_up = CoverRunExecutor(
+        store=store,
+        collector=FakeCollector(),
+        downloader=FakeDownloader(tmp_path / "repeat-risk-assets", content_sha256="b" * 64),
+        reviewer=FakeReviewer(overall_risk="risk"),
+        worker_name="cover-worker-repeat-risk",
+    )
+
+    follow_up.run_once()
+
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cover_risk_cases").fetchone()[0] == 1
+        events = conn.execute(
+            "SELECT event_type FROM cover_case_events ORDER BY case_event_id"
+        ).fetchall()
+    assert [row[0] for row in events] == ["risk_detected", "risk_detected"]
 
 
 def test_cover_executor_retries_transient_review_failure_without_duplicate_asset(tmp_path: Path) -> None:

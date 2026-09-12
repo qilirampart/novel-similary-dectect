@@ -31,10 +31,11 @@ def test_init_cover_db_is_idempotent_and_enables_required_tables(tmp_path: Path)
             ).fetchall()
         }
 
-    assert version == 5
+    assert version == 6
     assert "idx_cover_runs_claim" in indexes
     assert "idx_cover_task_items_run_claim" in indexes
     assert "uq_cover_detections_task_item" in indexes
+    assert "uq_cover_case_events_system_detection" in indexes
     assert {
         "cover_channels",
         "cover_videos",
@@ -43,6 +44,7 @@ def test_init_cover_db_is_idempotent_and_enables_required_tables(tmp_path: Path)
         "cover_assets",
         "cover_detections",
         "cover_risk_cases",
+        "cover_case_events",
         "cover_import_conflicts",
         "cover_historical_observations",
     }.issubset(tables)

@@ -326,6 +326,30 @@ CREATE TABLE IF NOT EXISTS cover_case_reviews (
     FOREIGN KEY (detection_id) REFERENCES cover_detections (detection_id)
 );
 
+CREATE TABLE IF NOT EXISTS cover_case_events (
+    case_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id TEXT NOT NULL,
+    detection_id TEXT,
+    event_type TEXT NOT NULL CHECK (event_type IN (
+        'risk_detected', 'review_detected', 'unknown_detected',
+        'rectification_candidate', 'safe_redetection', 'confirmed_rectified', 'false_positive',
+        'kept_open', 'marked_unavailable', 'reopened'
+    )),
+    actor_type TEXT NOT NULL CHECK (actor_type IN ('system', 'user')),
+    actor_user_id INTEGER,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (case_id) REFERENCES cover_risk_cases (case_id) ON DELETE CASCADE,
+    FOREIGN KEY (detection_id) REFERENCES cover_detections (detection_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cover_case_events_system_detection
+    ON cover_case_events (case_id, detection_id, event_type)
+    WHERE actor_type = 'system';
+
+CREATE INDEX IF NOT EXISTS idx_cover_case_events_case_created
+    ON cover_case_events (case_id, created_at DESC, case_event_id DESC);
+
 CREATE TABLE IF NOT EXISTS cover_report_exports (
     export_id TEXT PRIMARY KEY,
     workspace_key TEXT NOT NULL,
