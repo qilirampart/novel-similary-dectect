@@ -527,6 +527,8 @@ app.include_router(
         import_root=SETTINGS.cover_monitor_import_root,
         import_max_bytes=SETTINGS.cover_monitor_import_max_bytes,
         current_user_dependency=_require_current_user,
+        vision_provider=SETTINGS.cover_monitor_vision_api_base,
+        vision_model=SETTINGS.cover_monitor_vision_model,
     )
 )
 

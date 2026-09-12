@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 
 from api.cover_routes import build_cover_monitor_router
+from service.cover_monitor.store import CoverAccessScope, CoverMonitorStore
 
 
 def test_cover_overview_uses_independent_empty_database(tmp_path: Path) -> None:
@@ -121,3 +123,98 @@ def test_cover_import_rejects_corrupt_xlsx_as_client_error(tmp_path: Path) -> No
     )
 
     assert response.status_code == 400
+
+
+def _cover_run_client(tmp_path: Path) -> tuple[TestClient, Path]:
+    db_path = tmp_path / "cover.sqlite3"
+    app = FastAPI()
+    app.include_router(
+        build_cover_monitor_router(
+            db_path=str(db_path),
+            current_user_dependency=lambda: {"user_id": 7, "role": "operator"},
+            vision_provider="vision.example.test",
+            vision_model="test-vision-model",
+        )
+    )
+    client = TestClient(app)
+    store = CoverMonitorStore(db_path)
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    for index in range(1, 3):
+        store.upsert_channel(
+            scope,
+            platform="youtube",
+            channel_id=f"UC-route-run-{index}",
+            name=f"巡检频道 {index}",
+            source_url=f"https://www.youtube.com/channel/UC-route-run-{index}",
+        )
+    return client, db_path
+
+
+def test_cover_run_routes_create_list_and_get_without_persisting_secrets(tmp_path: Path) -> None:
+    client, db_path = _cover_run_client(tmp_path)
+
+    created_response = client.post(
+        "/api/v1/cover-monitor/runs",
+        json={
+            "intensity": "strict",
+            "include_shorts": False,
+            "force_refresh": True,
+            "max_items_per_scope": 25,
+        },
+    )
+
+    assert created_response.status_code == 200
+    created = created_response.json()
+    assert created["status"] == "queued"
+    assert created["intensity"] == "strict"
+    assert created["total_channel_count"] == 2
+    listed = client.get("/api/v1/cover-monitor/runs?limit=10&offset=0")
+    assert listed.status_code == 200
+    assert listed.json()["total"] == 1
+    assert listed.json()["items"][0]["run_id"] == created["run_id"]
+    detail = client.get(f"/api/v1/cover-monitor/runs/{created['run_id']}")
+    assert detail.status_code == 200
+    assert detail.json()["run_id"] == created["run_id"]
+
+    with sqlite3.connect(db_path) as conn:
+        snapshot = conn.execute(
+            "SELECT model_snapshot_json FROM cover_runs WHERE run_id = ?",
+            (created["run_id"],),
+        ).fetchone()[0]
+    assert "test-vision-model" in snapshot
+    assert "api_key" not in snapshot.casefold()
+
+
+def test_cover_run_routes_pause_resume_and_cancel_with_state_conflicts(tmp_path: Path) -> None:
+    client, _ = _cover_run_client(tmp_path)
+    created = client.post("/api/v1/cover-monitor/runs", json={}).json()
+    run_url = f"/api/v1/cover-monitor/runs/{created['run_id']}"
+
+    paused = client.post(f"{run_url}/pause")
+    assert paused.status_code == 200
+    assert paused.json()["status"] == "paused"
+    resumed = client.post(f"{run_url}/resume")
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "queued"
+    cancelled = client.post(f"{run_url}/cancel")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    invalid_resume = client.post(f"{run_url}/resume")
+    assert invalid_resume.status_code == 409
+    assert client.get("/api/v1/cover-monitor/runs/missing-run").status_code == 404
+
+
+def test_cover_run_create_validates_channel_scope_and_request_limits(tmp_path: Path) -> None:
+    client, _ = _cover_run_client(tmp_path)
+
+    missing_channel = client.post(
+        "/api/v1/cover-monitor/runs",
+        json={"channel_pks": [999999]},
+    )
+    invalid_limit = client.post(
+        "/api/v1/cover-monitor/runs",
+        json={"max_items_per_scope": 10001},
+    )
+
+    assert missing_channel.status_code == 409
+    assert invalid_limit.status_code == 422

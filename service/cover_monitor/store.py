@@ -920,10 +920,52 @@ class CoverMonitorStore:
     def get_run(self, scope: CoverAccessScope, run_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM cover_runs WHERE run_id = ? AND workspace_key = ?",
+                """
+                SELECT run.*,
+                       (SELECT COUNT(*) FROM cover_run_channels WHERE run_id = run.run_id)
+                           AS total_channel_count
+                  FROM cover_runs AS run
+                 WHERE run.run_id = ? AND run.workspace_key = ?
+                """,
                 (_required_text(run_id, "run_id"), scope.workspace_key.strip()),
             ).fetchone()
         return self._row(row)
+
+    def list_runs(
+        self,
+        scope: CoverAccessScope,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        safe_limit = min(max(int(limit), 1), 100)
+        safe_offset = max(int(offset), 0)
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        with self._connect() as conn:
+            total = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM cover_runs WHERE workspace_key = ?",
+                    (workspace_key,),
+                ).fetchone()[0]
+            )
+            rows = conn.execute(
+                """
+                SELECT run.*,
+                       (SELECT COUNT(*) FROM cover_run_channels WHERE run_id = run.run_id)
+                           AS total_channel_count
+                  FROM cover_runs AS run
+                 WHERE run.workspace_key = ?
+                 ORDER BY run.created_at DESC, run.run_id DESC
+                 LIMIT ? OFFSET ?
+                """,
+                (workspace_key, safe_limit, safe_offset),
+            ).fetchall()
+        return {
+            "items": [dict(row) for row in rows],
+            "total": total,
+            "limit": safe_limit,
+            "offset": safe_offset,
+        }
 
     def claim_next_run(self, *, worker_name: str) -> dict[str, Any] | None:
         worker_name = _required_text(worker_name, "worker_name")

@@ -3,15 +3,17 @@ from __future__ import annotations
 from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
+from urllib.parse import urlsplit
 from uuid import uuid4
 from zipfile import BadZipFile
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from openpyxl.utils.exceptions import InvalidFileException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, PositiveInt
 
+from service.cover_monitor.prompts import PROMPT_VERSION
 from service.cover_monitor.store import CoverAccessScope, CoverMonitorStore
 
 
@@ -26,6 +28,7 @@ class CoverRunSummary(BaseModel):
     total_item_count: int
     completed_item_count: int
     failed_item_count: int
+    total_channel_count: int = 0
     status_message: Optional[str] = None
     created_at: str
     started_at: Optional[str] = None
@@ -39,6 +42,21 @@ class CoverOverviewResponse(BaseModel):
     pending_review_count: int
     risk_distribution: dict[str, int]
     latest_run: Optional[CoverRunSummary] = None
+
+
+class CoverRunCreateRequest(BaseModel):
+    intensity: Literal["conservative", "standard", "strict"] = "standard"
+    channel_pks: list[PositiveInt] = Field(default_factory=list, max_length=5000)
+    include_shorts: bool = True
+    force_refresh: bool = False
+    max_items_per_scope: int = Field(default=0, ge=0, le=10_000)
+
+
+class CoverRunListResponse(BaseModel):
+    items: list[CoverRunSummary]
+    total: int
+    limit: int
+    offset: int
 
 
 class CoverImportResponse(BaseModel):
@@ -64,6 +82,8 @@ def build_cover_monitor_router(
     import_root: str = "runtime/cover_monitor/imports",
     import_max_bytes: int = 150 * 1024 * 1024,
     current_user_dependency: Callable[..., dict[str, Any]],
+    vision_provider: str = "",
+    vision_model: str = "",
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1/cover-monitor", tags=["cover-monitor"])
     store = CoverMonitorStore(db_path)
@@ -83,6 +103,93 @@ def build_cover_monitor_router(
             workspace_key=INTERNAL_WORKSPACE_KEY,
             user_id=int(user["user_id"]),
         )
+
+    def model_snapshot() -> dict[str, str]:
+        raw_provider = str(vision_provider or "").strip()
+        parsed = urlsplit(raw_provider)
+        provider = parsed.hostname or raw_provider
+        return {
+            "provider": provider[:200],
+            "model": str(vision_model or "unconfigured")[:200],
+        }
+
+    @router.post("/runs", response_model=CoverRunSummary)
+    def create_run(
+        body: CoverRunCreateRequest,
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverRunSummary:
+        try:
+            result = store.create_run(
+                access_scope(user),
+                trigger_type="manual",
+                intensity=body.intensity,
+                channel_pks=[int(value) for value in body.channel_pks],
+                params={
+                    "include_shorts": body.include_shorts,
+                    "force_refresh": body.force_refresh,
+                    "max_items_per_scope": body.max_items_per_scope,
+                },
+                model_snapshot=model_snapshot(),
+                prompt_version=PROMPT_VERSION,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return CoverRunSummary.model_validate(result)
+
+    @router.get("/runs", response_model=CoverRunListResponse)
+    def list_runs(
+        limit: int = Query(default=20, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverRunListResponse:
+        return CoverRunListResponse.model_validate(
+            store.list_runs(access_scope(user), limit=limit, offset=offset)
+        )
+
+    @router.get("/runs/{run_id}", response_model=CoverRunSummary)
+    def get_run(
+        run_id: str,
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverRunSummary:
+        result = store.get_run(access_scope(user), run_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="巡检批次不存在")
+        return CoverRunSummary.model_validate(result)
+
+    def control_run(action: str, run_id: str, user: dict[str, Any]) -> CoverRunSummary:
+        try:
+            if action == "pause":
+                result = store.request_pause(access_scope(user), run_id)
+            elif action == "resume":
+                result = store.resume_run(access_scope(user), run_id)
+            else:
+                result = store.request_cancel(access_scope(user), run_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="巡检批次不存在") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return CoverRunSummary.model_validate(result)
+
+    @router.post("/runs/{run_id}/pause", response_model=CoverRunSummary)
+    def pause_run(
+        run_id: str,
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverRunSummary:
+        return control_run("pause", run_id, user)
+
+    @router.post("/runs/{run_id}/resume", response_model=CoverRunSummary)
+    def resume_run(
+        run_id: str,
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverRunSummary:
+        return control_run("resume", run_id, user)
+
+    @router.post("/runs/{run_id}/cancel", response_model=CoverRunSummary)
+    def cancel_run(
+        run_id: str,
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverRunSummary:
+        return control_run("cancel", run_id, user)
 
     @router.post("/imports/preview", response_model=CoverImportResponse)
     async def preview_import(
