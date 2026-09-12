@@ -377,7 +377,6 @@ def build_cover_monitor_router(
         return FileResponse(
             path=target,
             media_type=str(asset["mime_type"]),
-            filename=target.name,
         )
 
     @router.post("/risk-cases/{case_id}/review", response_model=CoverRiskCaseDetailResponse)

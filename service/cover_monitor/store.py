@@ -259,20 +259,24 @@ class CoverMonitorStore:
                 conn.rollback()
                 raise ValueError("risk case is already closed")
 
-            candidate = conn.execute(
+            latest_system_event = conn.execute(
                 """
-                SELECT detection_id FROM cover_case_events
-                 WHERE case_id = ? AND event_type = 'rectification_candidate'
+                SELECT detection_id, event_type FROM cover_case_events
+                 WHERE case_id = ? AND actor_type = 'system' AND detection_id IS NOT NULL
                  ORDER BY created_at DESC, case_event_id DESC LIMIT 1
                 """,
                 (case_id,),
             ).fetchone()
-            if action == "confirm_rectified" and candidate is None:
+            candidate_is_current = (
+                latest_system_event is not None
+                and str(latest_system_event["event_type"]) == "rectification_candidate"
+            )
+            if action == "confirm_rectified" and not candidate_is_current:
                 conn.rollback()
                 raise ValueError("当前案件没有可确认的换图整改候选")
             detection_id = (
-                str(candidate["detection_id"])
-                if action == "confirm_rectified" and candidate is not None
+                str(latest_system_event["detection_id"])
+                if action == "confirm_rectified" and latest_system_event is not None
                 else str(risk_case["opened_detection_id"])
             )
             target_status = transitions[action]

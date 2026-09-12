@@ -15,6 +15,7 @@ import {
   type CoverRunSummary
 } from "../api";
 import { Icon } from "../icons";
+import { CoverRiskReviewPanel } from "./CoverRiskReviewPanel";
 
 
 const EMPTY_OVERVIEW: CoverMonitorOverviewResponse = {
@@ -27,7 +28,7 @@ const EMPTY_OVERVIEW: CoverMonitorOverviewResponse = {
 };
 
 const tabs = ["工作台", "频道清单", "巡检批次", "风险复核", "历史整改"];
-const enabledTabs = new Set(["工作台", "巡检批次"]);
+const enabledTabs = new Set(["工作台", "巡检批次", "风险复核"]);
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat("zh-CN").format(Math.max(Number(value) || 0, 0));
@@ -291,13 +292,13 @@ export function CoverMonitorPage() {
 
       <nav className="cover-monitor-tabs" aria-label="封面巡检模块">
         {tabs.map((tab) => (
-          <button key={tab} type="button" className={activeTab === tab ? "active" : ""} disabled={!enabledTabs.has(tab)} onClick={() => setActiveTab(tab)}>
+          <button key={tab} type="button" className={activeTab === tab ? "active" : ""} disabled={!enabledTabs.has(tab)} onClick={() => { setError(""); setActiveTab(tab); }}>
             {tab}{!enabledTabs.has(tab) && <small>待接入</small>}
           </button>
         ))}
       </nav>
 
-      {error && (
+      {error && activeTab !== "风险复核" && (
         <div className="cover-monitor-error" role="alert">
           <div><strong>页面数据加载失败</strong><span>{error}</span></div>
           <button className="ghost-button slim" type="button" onClick={() => void (activeTab === "巡检批次" ? loadRuns() : loadOverview())}>重新加载</button>
@@ -400,7 +401,7 @@ export function CoverMonitorPage() {
           </div>
         </div>
       </section>
-      </> : (
+      </> : activeTab === "巡检批次" ? (
         <section className="cover-run-browser">
           <aside className="card-panel cover-run-list">
             <div className="section-heading">
@@ -461,6 +462,8 @@ export function CoverMonitorPage() {
             </> : <div className="cover-run-detail-empty">{runListLoading ? "正在加载批次..." : "从左侧选择一个巡检批次"}</div>}
           </article>
         </section>
+      ) : (
+        <CoverRiskReviewPanel />
       )}
 
       {isRunOpen && (

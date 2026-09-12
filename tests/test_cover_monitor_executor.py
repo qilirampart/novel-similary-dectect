@@ -389,6 +389,41 @@ def test_repeated_risk_detection_reuses_existing_open_case(tmp_path: Path) -> No
     assert [row[0] for row in events] == ["risk_detected", "risk_detected"]
 
 
+def test_new_risk_after_rectification_candidate_invalidates_confirmation(tmp_path: Path) -> None:
+    store, scope, _, _, executor = _create_executor_fixture(tmp_path)
+    executor.run_once()
+    channel = store.list_channels(scope)[0]
+    for index, overall_risk in enumerate(("safe", "risk"), start=1):
+        store.create_run(
+            scope,
+            trigger_type="manual",
+            intensity="standard",
+            channel_pks=[channel["channel_pk"]],
+            params={"force_refresh": True},
+            model_snapshot={"provider": "fake", "model": "fake"},
+            prompt_version="cover-visible-evidence-v1",
+        )
+        CoverRunExecutor(
+            store=store,
+            collector=FakeCollector(),
+            downloader=FakeDownloader(
+                tmp_path / f"candidate-invalidated-{index}",
+                content_sha256=("b" if index == 1 else "c") * 64,
+            ),
+            reviewer=FakeReviewer(overall_risk=overall_risk),
+            worker_name=f"cover-worker-candidate-invalidated-{index}",
+        ).run_once()
+
+    case_id = store.list_risk_cases(scope, status="needs_review")["items"][0]["case_id"]
+    with pytest.raises(ValueError, match="整改候选"):
+        store.review_risk_case(
+            scope,
+            case_id,
+            action="confirm_rectified",
+            reason="候选之后再次检出风险，不能确认整改",
+        )
+
+
 def test_cover_executor_retries_transient_review_failure_without_duplicate_asset(tmp_path: Path) -> None:
     store, scope, run, reviewer, executor = _create_executor_fixture(
         tmp_path,

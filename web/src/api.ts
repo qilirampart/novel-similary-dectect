@@ -75,6 +75,75 @@ export type CoverRunDetailResponse = {
   item_offset: number;
 };
 
+export type CoverRiskCaseSummary = {
+  case_id: string;
+  video_pk: number;
+  video_id: string;
+  video_title: string;
+  video_url: string;
+  thumbnail_url: string;
+  current_status: string;
+  opened_detection_id: string;
+  opened_risk: string;
+  opened_summary: string;
+  opened_evidence: string;
+  opened_confidence: number;
+  opened_asset_id: string;
+  latest_event_type?: string | null;
+  opened_at: string;
+  updated_at: string;
+  closed_at?: string | null;
+};
+
+export type CoverRiskCaseEvent = {
+  case_event_id: number;
+  detection_id?: string | null;
+  event_type: string;
+  actor_type: string;
+  actor_user_id?: number | null;
+  reason: string;
+  created_at: string;
+  overall_risk?: string | null;
+  risk_tags: string[];
+  summary?: string | null;
+  evidence?: string | null;
+  confidence?: number | null;
+  provider?: string | null;
+  model?: string | null;
+  duration_seconds?: number | null;
+  asset_id?: string | null;
+  content_sha256?: string | null;
+  width?: number | null;
+  height?: number | null;
+};
+
+export type CoverRiskCaseDetailResponse = {
+  case: CoverRiskCaseSummary;
+  events: CoverRiskCaseEvent[];
+  reviews: Array<{
+    case_review_id: number;
+    detection_id?: string | null;
+    action: string;
+    reason: string;
+    reviewed_by_user_id: number;
+    reviewed_at: string;
+  }>;
+};
+
+export type CoverRiskCaseListResponse = {
+  items: CoverRiskCaseSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export type CoverRiskCaseReviewAction =
+  | "confirm_rectified"
+  | "false_positive"
+  | "keep_open"
+  | "mark_unavailable"
+  | "reopen";
+
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const LONG_REQUEST_TIMEOUT_MS = 60_000;
 const DOWNLOAD_REQUEST_TIMEOUT_MS = 120_000;
@@ -695,6 +764,45 @@ export function getCoverMonitorRunDetail(
       query: { item_limit: itemLimit, item_offset: itemOffset },
       timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
     }
+  );
+}
+
+export function listCoverRiskCases(
+  status = "needs_review",
+  limit = 50,
+  offset = 0
+): Promise<CoverRiskCaseListResponse> {
+  return requestJson<CoverRiskCaseListResponse>("/api/v1/cover-monitor/risk-cases", {
+    query: { status: status || undefined, limit, offset },
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+  });
+}
+
+export function getCoverRiskCaseDetail(caseId: string): Promise<CoverRiskCaseDetailResponse> {
+  return requestJson<CoverRiskCaseDetailResponse>(
+    `/api/v1/cover-monitor/risk-cases/${encodeURIComponent(caseId)}`,
+    { timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS }
+  );
+}
+
+export function reviewCoverRiskCase(
+  caseId: string,
+  action: CoverRiskCaseReviewAction,
+  reason: string
+): Promise<CoverRiskCaseDetailResponse> {
+  return requestJson<CoverRiskCaseDetailResponse>(
+    `/api/v1/cover-monitor/risk-cases/${encodeURIComponent(caseId)}/review`,
+    {
+      method: "POST",
+      timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+      body: JSON.stringify({ action, reason })
+    }
+  );
+}
+
+export function coverRiskCaseAssetUrl(caseId: string, assetId: string): string {
+  return resolveApiPath(
+    `/api/v1/cover-monitor/risk-cases/${encodeURIComponent(caseId)}/assets/${encodeURIComponent(assetId)}`
   );
 }
 
