@@ -967,6 +967,66 @@ class CoverMonitorStore:
             "offset": safe_offset,
         }
 
+    def get_run_detail(
+        self,
+        scope: CoverAccessScope,
+        run_id: str,
+        *,
+        item_limit: int = 50,
+        item_offset: int = 0,
+    ) -> dict[str, Any] | None:
+        run = self.get_run(scope, run_id)
+        if run is None:
+            return None
+        safe_limit = min(max(int(item_limit), 1), 100)
+        safe_offset = max(int(item_offset), 0)
+        with self._connect() as conn:
+            channels = conn.execute(
+                """
+                SELECT run_channel.run_channel_id, run_channel.channel_pk,
+                       channel.name AS channel_name, channel.source_url,
+                       run_channel.scan_status, run_channel.completeness,
+                       run_channel.discovered_count, run_channel.error_message
+                  FROM cover_run_channels AS run_channel
+                  JOIN cover_channels AS channel ON channel.channel_pk = run_channel.channel_pk
+                 WHERE run_channel.run_id = ? AND channel.workspace_key = ?
+                 ORDER BY run_channel.run_channel_id
+                """,
+                (run_id, scope.workspace_key.strip()),
+            ).fetchall()
+            item_total = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM cover_task_items WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+            )
+            items = conn.execute(
+                """
+                SELECT item.task_item_id, item.video_pk, item.reason, item.stage,
+                       item.status, item.attempts, item.error_type, item.error_message,
+                       item.created_at, item.started_at, item.finished_at,
+                       video.video_id, video.title AS video_title, video.video_url,
+                       video.thumbnail_url, detection.overall_risk,
+                       detection.confidence, detection.summary
+                  FROM cover_task_items AS item
+                  JOIN cover_videos AS video ON video.video_pk = item.video_pk
+                  LEFT JOIN cover_detections AS detection
+                    ON detection.task_item_id = item.task_item_id
+                 WHERE item.run_id = ? AND video.workspace_key = ?
+                 ORDER BY item.task_item_id
+                 LIMIT ? OFFSET ?
+                """,
+                (run_id, scope.workspace_key.strip(), safe_limit, safe_offset),
+            ).fetchall()
+        return {
+            "run": run,
+            "channels": [dict(row) for row in channels],
+            "items": [dict(row) for row in items],
+            "item_total": item_total,
+            "item_limit": safe_limit,
+            "item_offset": safe_offset,
+        }
+
     def claim_next_run(self, *, worker_name: str) -> dict[str, Any] | None:
         worker_name = _required_text(worker_name, "worker_name")
         lease_token = uuid4().hex

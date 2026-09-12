@@ -59,6 +59,47 @@ class CoverRunListResponse(BaseModel):
     offset: int
 
 
+class CoverRunChannelSummary(BaseModel):
+    run_channel_id: int
+    channel_pk: int
+    channel_name: str
+    source_url: str
+    scan_status: str
+    completeness: str
+    discovered_count: int
+    error_message: Optional[str] = None
+
+
+class CoverRunItemSummary(BaseModel):
+    task_item_id: int
+    video_pk: int
+    video_id: str
+    video_title: str
+    video_url: str
+    thumbnail_url: str
+    reason: str
+    stage: str
+    status: str
+    attempts: int
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None
+    overall_risk: Optional[str] = None
+    confidence: Optional[float] = None
+    summary: Optional[str] = None
+    created_at: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+
+
+class CoverRunDetailResponse(BaseModel):
+    run: CoverRunSummary
+    channels: list[CoverRunChannelSummary]
+    items: list[CoverRunItemSummary]
+    item_total: int
+    item_limit: int
+    item_offset: int
+
+
 class CoverImportResponse(BaseModel):
     import_id: str
     import_kind: str
@@ -155,6 +196,23 @@ def build_cover_monitor_router(
         if result is None:
             raise HTTPException(status_code=404, detail="巡检批次不存在")
         return CoverRunSummary.model_validate(result)
+
+    @router.get("/runs/{run_id}/detail", response_model=CoverRunDetailResponse)
+    def get_run_detail(
+        run_id: str,
+        item_limit: int = Query(default=50, ge=1, le=100),
+        item_offset: int = Query(default=0, ge=0),
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverRunDetailResponse:
+        result = store.get_run_detail(
+            access_scope(user),
+            run_id,
+            item_limit=item_limit,
+            item_offset=item_offset,
+        )
+        if result is None:
+            raise HTTPException(status_code=404, detail="巡检批次不存在")
+        return CoverRunDetailResponse.model_validate(result)
 
     def control_run(action: str, run_id: str, user: dict[str, Any]) -> CoverRunSummary:
         try:

@@ -218,3 +218,41 @@ def test_cover_run_create_validates_channel_scope_and_request_limits(tmp_path: P
 
     assert missing_channel.status_code == 409
     assert invalid_limit.status_code == 422
+
+
+def test_cover_run_detail_returns_channel_progress_and_paginated_items(tmp_path: Path) -> None:
+    client, db_path = _cover_run_client(tmp_path)
+    created = client.post("/api/v1/cover-monitor/runs", json={}).json()
+    store = CoverMonitorStore(db_path)
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    channel = store.list_channels(scope)[0]
+    video = store.upsert_video(
+        scope,
+        channel_pk=channel["channel_pk"],
+        platform="youtube",
+        video_id="video-route-detail",
+        title="Detail Video",
+        video_url="https://www.youtube.com/watch?v=video-route-detail",
+        thumbnail_url="https://i.ytimg.com/vi/video-route-detail/hqdefault.jpg",
+    )
+    claimed = store.claim_next_run(worker_name="route-detail-worker")
+    assert claimed is not None
+    store.enqueue_task_items(
+        created["run_id"],
+        claimed["worker_lease_token"],
+        [{"video_pk": video["video_pk"], "reason": "manual"}],
+    )
+
+    response = client.get(
+        f"/api/v1/cover-monitor/runs/{created['run_id']}/detail?item_limit=1&item_offset=0"
+    )
+
+    assert response.status_code == 200
+    detail = response.json()
+    assert detail["run"]["run_id"] == created["run_id"]
+    assert detail["item_total"] == 1
+    assert detail["item_limit"] == 1
+    assert detail["channels"][0]["channel_name"] == "巡检频道 1"
+    assert detail["items"][0]["video_id"] == "video-route-detail"
+    assert detail["items"][0]["reason"] == "manual"
+    assert client.get("/api/v1/cover-monitor/runs/missing/detail").status_code == 404
