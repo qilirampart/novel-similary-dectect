@@ -19,6 +19,21 @@ export type CoverImportResponse = {
   finished_at: string | null;
 };
 
+export type CoverRunSummary = {
+  run_id: string;
+  status: string;
+  trigger_type: string;
+  intensity: string;
+  total_item_count: number;
+  completed_item_count: number;
+  failed_item_count: number;
+  total_channel_count: number;
+  status_message?: string | null;
+  created_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+};
+
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const LONG_REQUEST_TIMEOUT_MS = 60_000;
 const DOWNLOAD_REQUEST_TIMEOUT_MS = 120_000;
@@ -249,19 +264,7 @@ export type CoverMonitorOverviewResponse = {
   risk_count: number;
   pending_review_count: number;
   risk_distribution: Record<"safe" | "review" | "risk" | "unknown", number>;
-  latest_run: null | {
-    run_id: string;
-    status: string;
-    trigger_type: string;
-    intensity: string;
-    total_item_count: number;
-    completed_item_count: number;
-    failed_item_count: number;
-    status_message?: string | null;
-    created_at: string;
-    started_at?: string | null;
-    finished_at?: string | null;
-  };
+  latest_run: CoverRunSummary | null;
 };
 
 export function compareSingle(params: {
@@ -601,6 +604,36 @@ export function getCoverMonitorOverview(): Promise<CoverMonitorOverviewResponse>
   return requestJson<CoverMonitorOverviewResponse>("/api/v1/cover-monitor/overview", {
     timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
   });
+}
+
+export function createCoverMonitorRun(params: {
+  intensity: "conservative" | "standard" | "strict";
+  includeShorts: boolean;
+  forceRefresh: boolean;
+  maxItemsPerScope: number;
+  channelPks?: number[];
+}): Promise<CoverRunSummary> {
+  return requestJson<CoverRunSummary>("/api/v1/cover-monitor/runs", {
+    method: "POST",
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+    body: JSON.stringify({
+      intensity: params.intensity,
+      include_shorts: params.includeShorts,
+      force_refresh: params.forceRefresh,
+      max_items_per_scope: params.maxItemsPerScope,
+      channel_pks: params.channelPks ?? []
+    })
+  });
+}
+
+export function controlCoverMonitorRun(
+  runId: string,
+  action: "pause" | "resume" | "cancel"
+): Promise<CoverRunSummary> {
+  return requestJson<CoverRunSummary>(
+    `/api/v1/cover-monitor/runs/${encodeURIComponent(runId)}/${action}`,
+    { method: "POST", timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS }
+  );
 }
 
 export function previewCoverMonitorImport(params: {

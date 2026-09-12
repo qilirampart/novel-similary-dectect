@@ -5671,6 +5671,17 @@ button {
   background: rgba(255, 107, 92, 0.13);
 }
 
+.cover-run-heading-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.cover-run-heading-actions .cover-run-status {
+  margin-left: 4px;
+}
+
 .cover-run-body {
   margin-top: 26px;
 }
@@ -6018,6 +6029,83 @@ button {
   gap: 20px;
 }
 
+.cover-run-dialog {
+  width: min(680px, 100%);
+}
+
+.cover-run-form {
+  padding: 22px 24px 2px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.cover-run-form > label:not(.cover-run-switch) {
+  display: grid;
+  gap: 8px;
+}
+
+.cover-run-form > label > span {
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.cover-run-form select,
+.cover-run-form input[type="number"] {
+  width: 100%;
+  min-height: 48px;
+  padding: 0 13px;
+  border: 1px solid var(--border-strong);
+  border-radius: 13px;
+  color: var(--text);
+  background: #f9fbfd;
+}
+
+.cover-run-form small {
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.cover-run-switch {
+  min-height: 76px;
+  padding: 14px;
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  border: 1px solid #dce7ef;
+  border-radius: 14px;
+  background: #f7fafc;
+  cursor: pointer;
+}
+
+.cover-run-switch.warning {
+  border-color: rgba(255, 138, 87, 0.28);
+  background: rgba(255, 138, 87, 0.06);
+}
+
+.cover-run-switch input {
+  width: 17px;
+  height: 17px;
+  margin: 2px 0 0;
+  accent-color: var(--blue-deep);
+}
+
+.cover-run-switch span,
+.cover-run-switch strong,
+.cover-run-switch small {
+  display: block;
+}
+
+.cover-run-switch strong {
+  font-size: 13px;
+}
+
+.cover-run-switch small {
+  margin-top: 5px;
+}
+
 .cover-import-dialog > header {
   border-bottom: 1px solid var(--border);
 }
@@ -6261,6 +6349,15 @@ button {
   .cover-run-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 18px 0;
+  }
+
+  .cover-run-heading-actions {
+    align-items: flex-end;
+    flex-direction: column-reverse;
+  }
+
+  .cover-run-form {
+    grid-template-columns: 1fr;
   }
 
   .cover-run-metrics > div:nth-child(3) {

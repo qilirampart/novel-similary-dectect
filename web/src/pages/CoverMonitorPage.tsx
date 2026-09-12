@@ -2,6 +2,8 @@ import { useEffect, useRef, useState, type DragEvent } from "react";
 
 import {
   confirmCoverMonitorImport,
+  controlCoverMonitorRun,
+  createCoverMonitorRun,
   getCoverMonitorOverview,
   previewCoverMonitorImport,
   type CoverImportKind,
@@ -29,7 +31,8 @@ function formatNumber(value: number): string {
 function runProgress(overview: CoverMonitorOverviewResponse): number {
   const run = overview.latest_run;
   if (!run || run.total_item_count <= 0) return 0;
-  return Math.min(Math.round((run.completed_item_count / run.total_item_count) * 100), 100);
+  const settled = run.completed_item_count + run.failed_item_count;
+  return Math.min(Math.round((settled / run.total_item_count) * 100), 100);
 }
 
 function statusLabel(status: string): string {
@@ -52,6 +55,13 @@ export function CoverMonitorPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [isImportOpen, setIsImportOpen] = useState(false);
+  const [isRunOpen, setIsRunOpen] = useState(false);
+  const [runIntensity, setRunIntensity] = useState<"conservative" | "standard" | "strict">("standard");
+  const [runIncludeShorts, setRunIncludeShorts] = useState(true);
+  const [runForceRefresh, setRunForceRefresh] = useState(false);
+  const [runMaxItems, setRunMaxItems] = useState(0);
+  const [runBusy, setRunBusy] = useState(false);
+  const [runError, setRunError] = useState("");
   const [importKind, setImportKind] = useState<CoverImportKind>("channels");
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importPreview, setImportPreview] = useState<CoverImportResponse | null>(null);
@@ -60,21 +70,63 @@ export function CoverMonitorPage() {
   const [isDragging, setIsDragging] = useState(false);
   const importInputRef = useRef<HTMLInputElement | null>(null);
 
-  async function loadOverview() {
-    setLoading(true);
-    setError("");
+  async function loadOverview(silent = false) {
+    if (!silent) setLoading(true);
+    if (!silent) setError("");
     try {
       setOverview(await getCoverMonitorOverview());
+      setError("");
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "封面巡检概览加载失败");
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }
 
   useEffect(() => {
     void loadOverview();
   }, []);
+
+  useEffect(() => {
+    const status = overview.latest_run?.status;
+    if (!status || !["queued", "running", "pause_requested", "cancel_requested"].includes(status)) return;
+    const timer = window.setInterval(() => void loadOverview(true), 2000);
+    return () => window.clearInterval(timer);
+  }, [overview.latest_run?.status]);
+
+  async function createRun() {
+    setRunBusy(true);
+    setRunError("");
+    try {
+      await createCoverMonitorRun({
+        intensity: runIntensity,
+        includeShorts: runIncludeShorts,
+        forceRefresh: runForceRefresh,
+        maxItemsPerScope: runMaxItems
+      });
+      setIsRunOpen(false);
+      await loadOverview(true);
+    } catch (createError) {
+      setRunError(createError instanceof Error ? createError.message : "创建巡检失败");
+    } finally {
+      setRunBusy(false);
+    }
+  }
+
+  async function controlRun(action: "pause" | "resume" | "cancel") {
+    const runId = overview.latest_run?.run_id;
+    if (!runId) return;
+    setRunBusy(true);
+    setError("");
+    try {
+      await controlCoverMonitorRun(runId, action);
+      await loadOverview(true);
+    } catch (controlError) {
+      setError(controlError instanceof Error ? controlError.message : "巡检状态更新失败");
+    } finally {
+      setRunBusy(false);
+    }
+  }
 
   function closeImport() {
     if (importBusy) return;
@@ -146,7 +198,13 @@ export function CoverMonitorPage() {
           <button className="outline-button" type="button" onClick={() => setIsImportOpen(true)}>
             <Icon name="upload" />导入频道表
           </button>
-          <button className="primary-button" type="button" disabled title="完成频道导入后可创建巡检">
+          <button
+            className="primary-button"
+            type="button"
+            disabled={loading || overview.channel_count <= 0 || runBusy}
+            title={overview.channel_count <= 0 ? "请先导入频道" : "创建新的封面巡检批次"}
+            onClick={() => { setRunError(""); setIsRunOpen(true); }}
+          >
             <span className="cover-button-plus">+</span>新建巡检
           </button>
         </div>
@@ -190,7 +248,12 @@ export function CoverMonitorPage() {
         <article className="card-panel cover-current-run">
           <div className="section-heading">
             <div><h2>当前巡检批次</h2><p>采集、封面下载和模型检测将分别记录进度。</p></div>
-            {run && <span className={`cover-run-status ${run.status}`}>{statusLabel(run.status)}</span>}
+            <div className="cover-run-heading-actions">
+              {run?.status === "paused" && <button className="outline-button slim" type="button" disabled={runBusy} onClick={() => void controlRun("resume")}>继续</button>}
+              {run && ["queued", "running"].includes(run.status) && <button className="outline-button slim" type="button" disabled={runBusy} onClick={() => void controlRun("pause")}>暂停</button>}
+              {run && ["queued", "running", "pause_requested", "paused"].includes(run.status) && <button className="ghost-button slim danger" type="button" disabled={runBusy} onClick={() => void controlRun("cancel")}>取消</button>}
+              {run && <span className={`cover-run-status ${run.status}`}>{statusLabel(run.status)}</span>}
+            </div>
           </div>
           {run ? (
             <div className="cover-run-body">
@@ -202,7 +265,7 @@ export function CoverMonitorPage() {
                 <div><span>任务总量</span><strong>{formatNumber(run.total_item_count)}</strong></div>
                 <div><span>已完成</span><strong>{formatNumber(run.completed_item_count)}</strong></div>
                 <div><span>失败项</span><strong>{formatNumber(run.failed_item_count)}</strong></div>
-                <div><span>检测档位</span><strong>{run.intensity}</strong></div>
+                <div><span>检测档位</span><strong>{{ conservative: "保守", standard: "标准", strict: "严格" }[run.intensity] || run.intensity}</strong></div>
               </div>
               {run.status_message && <p className="cover-run-message">{run.status_message}</p>}
             </div>
@@ -210,7 +273,7 @@ export function CoverMonitorPage() {
             <div className="cover-empty-run">
               <div className="cover-empty-symbol"><Icon name="pulse" /></div>
               <div><strong>尚未创建巡检批次</strong><p>先导入频道总表并完成预检，之后即可创建首次手动巡检。</p></div>
-              <span>等待 C2 频道导入</span>
+              <span>等待频道导入</span>
             </div>
           )}
         </article>
@@ -257,6 +320,25 @@ export function CoverMonitorPage() {
           </div>
         </div>
       </section>
+
+      {isRunOpen && (
+        <div className="cover-import-overlay" role="dialog" aria-modal="true" aria-label="新建封面巡检" onClick={() => !runBusy && setIsRunOpen(false)}>
+          <section className="cover-import-dialog cover-run-dialog" onClick={(event) => event.stopPropagation()}>
+            <header>
+              <div><span className="eyebrow">NEW INSPECTION</span><h2>新建封面巡检</h2><p>默认扫描全部在管频道，只处理新增视频；强制复检会重新检测已有视频。</p></div>
+              <button className="icon-button" type="button" aria-label="关闭新建巡检窗口" onClick={() => setIsRunOpen(false)} disabled={runBusy}>×</button>
+            </header>
+            <div className="cover-run-form">
+              <label><span>检测档位</span><select value={runIntensity} onChange={(event) => setRunIntensity(event.target.value as typeof runIntensity)} disabled={runBusy}><option value="conservative">保守</option><option value="standard">标准</option><option value="strict">严格</option></select><small>标准档兼顾风险识别与误报控制。</small></label>
+              <label><span>单范围采集上限</span><input type="number" min="0" max="10000" value={runMaxItems} onChange={(event) => setRunMaxItems(Math.min(Math.max(Number(event.target.value) || 0, 0), 10000))} disabled={runBusy} /><small>0 表示不限制；Videos 和 Shorts 分别计算。</small></label>
+              <label className="cover-run-switch"><input type="checkbox" checked={runIncludeShorts} onChange={(event) => setRunIncludeShorts(event.target.checked)} disabled={runBusy} /><span><strong>同时扫描 Shorts</strong><small>关闭后只检查频道 Videos 页面。</small></span></label>
+              <label className="cover-run-switch warning"><input type="checkbox" checked={runForceRefresh} onChange={(event) => setRunForceRefresh(event.target.checked)} disabled={runBusy} /><span><strong>强制复检已有视频</strong><small>会增加封面下载和视觉模型调用量，通常保持关闭。</small></span></label>
+            </div>
+            {runError && <div className="cover-import-message error" role="alert">{runError}</div>}
+            <footer><button className="ghost-button" type="button" onClick={() => setIsRunOpen(false)} disabled={runBusy}>取消</button><button className="primary-button" type="button" onClick={() => void createRun()} disabled={runBusy}>{runBusy ? "正在创建..." : `开始巡检 ${formatNumber(overview.channel_count)} 个频道`}</button></footer>
+          </section>
+        </div>
+      )}
 
       {isImportOpen && (
         <div className="cover-import-overlay" role="dialog" aria-modal="true" aria-label="导入封面巡检数据" onClick={closeImport}>
