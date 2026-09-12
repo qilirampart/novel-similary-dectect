@@ -312,6 +312,102 @@ class CoverMonitorStore:
             raise RuntimeError("risk case review did not return a row")
         return dict(result)
 
+    def get_risk_case_detail(
+        self,
+        scope: CoverAccessScope,
+        case_id: str,
+    ) -> dict[str, Any] | None:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        case_id = _required_text(case_id, "case_id")
+        with self._connect() as conn:
+            risk_case = conn.execute(
+                """
+                SELECT risk_case.*, video.video_id, video.title AS video_title,
+                       video.video_url, video.thumbnail_url,
+                       opened.overall_risk AS opened_risk,
+                       opened.summary AS opened_summary,
+                       opened.evidence AS opened_evidence,
+                       opened.confidence AS opened_confidence,
+                       opened.asset_id AS opened_asset_id
+                  FROM cover_risk_cases AS risk_case
+                  JOIN cover_videos AS video ON video.video_pk = risk_case.video_pk
+                  JOIN cover_detections AS opened ON opened.detection_id = risk_case.opened_detection_id
+                 WHERE risk_case.case_id = ? AND risk_case.workspace_key = ?
+                """,
+                (case_id, workspace_key),
+            ).fetchone()
+            if risk_case is None:
+                return None
+            events = conn.execute(
+                """
+                SELECT event.case_event_id, event.detection_id, event.event_type,
+                       event.actor_type, event.actor_user_id, event.reason, event.created_at,
+                       detection.overall_risk, detection.risk_tags_json,
+                       detection.summary, detection.evidence, detection.confidence,
+                       detection.provider, detection.model, detection.duration_seconds,
+                       asset.asset_id, asset.content_sha256, asset.storage_key,
+                       asset.original_url, asset.fetched_url, asset.width, asset.height,
+                       asset.fetched_at
+                  FROM cover_case_events AS event
+                  LEFT JOIN cover_detections AS detection
+                    ON detection.detection_id = event.detection_id
+                  LEFT JOIN cover_assets AS asset ON asset.asset_id = detection.asset_id
+                 WHERE event.case_id = ?
+                 ORDER BY event.created_at, event.case_event_id
+                """,
+                (case_id,),
+            ).fetchall()
+            reviews = conn.execute(
+                """
+                SELECT case_review_id, detection_id, action, reason,
+                       reviewed_by_user_id, reviewed_at
+                  FROM cover_case_reviews
+                 WHERE case_id = ?
+                 ORDER BY reviewed_at, case_review_id
+                """,
+                (case_id,),
+            ).fetchall()
+        event_items: list[dict[str, Any]] = []
+        for row in events:
+            item = dict(row)
+            raw_tags = str(item.pop("risk_tags_json", "") or "")
+            try:
+                item["risk_tags"] = list(json.loads(raw_tags)) if raw_tags else []
+            except (TypeError, ValueError):
+                item["risk_tags"] = []
+            event_items.append(item)
+        return {
+            "case": dict(risk_case),
+            "events": event_items,
+            "reviews": [dict(row) for row in reviews],
+        }
+
+    def get_risk_case_asset(
+        self,
+        scope: CoverAccessScope,
+        case_id: str,
+        asset_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT asset.*
+                  FROM cover_risk_cases AS risk_case
+                  JOIN cover_case_events AS event ON event.case_id = risk_case.case_id
+                  JOIN cover_detections AS detection ON detection.detection_id = event.detection_id
+                  JOIN cover_assets AS asset ON asset.asset_id = detection.asset_id
+                 WHERE risk_case.case_id = ? AND risk_case.workspace_key = ?
+                   AND asset.asset_id = ? AND asset.workspace_key = risk_case.workspace_key
+                 LIMIT 1
+                """,
+                (
+                    _required_text(case_id, "case_id"),
+                    _required_text(scope.workspace_key, "workspace_key"),
+                    _required_text(asset_id, "asset_id"),
+                ),
+            ).fetchone()
+        return self._row(row)
+
     def create_import_preview(
         self,
         scope: CoverAccessScope,

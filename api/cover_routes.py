@@ -10,6 +10,7 @@ from zipfile import BadZipFile
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse
 from openpyxl.utils.exceptions import InvalidFileException
 from pydantic import BaseModel, Field, PositiveInt
 
@@ -100,6 +101,79 @@ class CoverRunDetailResponse(BaseModel):
     item_offset: int
 
 
+class CoverRiskCaseSummary(BaseModel):
+    case_id: str
+    video_pk: int
+    video_id: str
+    video_title: str
+    video_url: str
+    thumbnail_url: str
+    current_status: str
+    opened_detection_id: str
+    opened_risk: str
+    opened_summary: str
+    opened_evidence: str
+    opened_confidence: float
+    opened_asset_id: str
+    latest_event_type: Optional[str] = None
+    opened_at: str
+    updated_at: str
+    closed_at: Optional[str] = None
+
+
+class CoverRiskCaseListResponse(BaseModel):
+    items: list[CoverRiskCaseSummary]
+    total: int
+    limit: int
+    offset: int
+
+
+class CoverRiskCaseEvent(BaseModel):
+    case_event_id: int
+    detection_id: Optional[str] = None
+    event_type: str
+    actor_type: str
+    actor_user_id: Optional[int] = None
+    reason: str
+    created_at: str
+    overall_risk: Optional[str] = None
+    risk_tags: list[str] = Field(default_factory=list)
+    summary: Optional[str] = None
+    evidence: Optional[str] = None
+    confidence: Optional[float] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    duration_seconds: Optional[float] = None
+    asset_id: Optional[str] = None
+    content_sha256: Optional[str] = None
+    storage_key: Optional[str] = None
+    original_url: Optional[str] = None
+    fetched_url: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    fetched_at: Optional[str] = None
+
+
+class CoverRiskCaseReview(BaseModel):
+    case_review_id: int
+    detection_id: Optional[str] = None
+    action: str
+    reason: str
+    reviewed_by_user_id: int
+    reviewed_at: str
+
+
+class CoverRiskCaseDetailResponse(BaseModel):
+    case: CoverRiskCaseSummary
+    events: list[CoverRiskCaseEvent]
+    reviews: list[CoverRiskCaseReview]
+
+
+class CoverRiskCaseReviewRequest(BaseModel):
+    action: Literal["confirm_rectified", "false_positive", "keep_open", "mark_unavailable", "reopen"]
+    reason: str = Field(min_length=2, max_length=1000)
+
+
 class CoverImportResponse(BaseModel):
     import_id: str
     import_kind: str
@@ -121,6 +195,7 @@ def build_cover_monitor_router(
     *,
     db_path: str,
     import_root: str = "runtime/cover_monitor/imports",
+    asset_root: str = "runtime/cover_monitor/assets",
     import_max_bytes: int = 150 * 1024 * 1024,
     current_user_dependency: Callable[..., dict[str, Any]],
     vision_provider: str = "",
@@ -248,6 +323,85 @@ def build_cover_monitor_router(
         user: dict[str, Any] = Depends(current_user_dependency),
     ) -> CoverRunSummary:
         return control_run("cancel", run_id, user)
+
+    @router.get("/risk-cases", response_model=CoverRiskCaseListResponse)
+    def list_risk_cases(
+        status: Optional[Literal[
+            "open",
+            "needs_review",
+            "confirmed_rectified",
+            "false_positive",
+            "unavailable",
+            "closed",
+        ]] = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverRiskCaseListResponse:
+        return CoverRiskCaseListResponse.model_validate(
+            store.list_risk_cases(
+                access_scope(user),
+                status=status or "",
+                limit=limit,
+                offset=offset,
+            )
+        )
+
+    @router.get("/risk-cases/{case_id}", response_model=CoverRiskCaseDetailResponse)
+    def get_risk_case(
+        case_id: str,
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverRiskCaseDetailResponse:
+        result = store.get_risk_case_detail(access_scope(user), case_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="封面风险案件不存在")
+        return CoverRiskCaseDetailResponse.model_validate(result)
+
+    @router.get("/risk-cases/{case_id}/assets/{asset_id}", response_class=FileResponse)
+    def get_risk_case_asset(
+        case_id: str,
+        asset_id: str,
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> FileResponse:
+        asset = store.get_risk_case_asset(access_scope(user), case_id, asset_id)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="封面证据不存在")
+        root = Path(asset_root).resolve()
+        target = (root / str(asset["storage_key"])).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="封面证据不存在") from exc
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="封面证据文件缺失")
+        return FileResponse(
+            path=target,
+            media_type=str(asset["mime_type"]),
+            filename=target.name,
+        )
+
+    @router.post("/risk-cases/{case_id}/review", response_model=CoverRiskCaseDetailResponse)
+    def review_risk_case(
+        case_id: str,
+        body: CoverRiskCaseReviewRequest,
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverRiskCaseDetailResponse:
+        scope = access_scope(user)
+        try:
+            store.review_risk_case(
+                scope,
+                case_id,
+                action=body.action,
+                reason=body.reason,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="封面风险案件不存在") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        result = store.get_risk_case_detail(scope, case_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="封面风险案件不存在")
+        return CoverRiskCaseDetailResponse.model_validate(result)
 
     @router.post("/imports/preview", response_model=CoverImportResponse)
     async def preview_import(

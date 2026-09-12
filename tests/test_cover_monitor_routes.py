@@ -17,6 +17,7 @@ def test_cover_overview_uses_independent_empty_database(tmp_path: Path) -> None:
     app.include_router(
         build_cover_monitor_router(
             db_path=str(db_path),
+            asset_root=str(tmp_path / "assets"),
             current_user_dependency=lambda: {"user_id": 7, "role": "operator"},
         )
     )
@@ -131,6 +132,7 @@ def _cover_run_client(tmp_path: Path) -> tuple[TestClient, Path]:
     app.include_router(
         build_cover_monitor_router(
             db_path=str(db_path),
+            asset_root=str(tmp_path / "assets"),
             current_user_dependency=lambda: {"user_id": 7, "role": "operator"},
             vision_provider="vision.example.test",
             vision_model="test-vision-model",
@@ -256,3 +258,130 @@ def test_cover_run_detail_returns_channel_progress_and_paginated_items(tmp_path:
     assert detail["items"][0]["video_id"] == "video-route-detail"
     assert detail["items"][0]["reason"] == "manual"
     assert client.get("/api/v1/cover-monitor/runs/missing/detail").status_code == 404
+
+
+def _seed_cover_risk_candidate(db_path: Path) -> str:
+    store = CoverMonitorStore(db_path)
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    channel = store.list_channels(scope)[0]
+    video = store.upsert_video(
+        scope,
+        channel_pk=channel["channel_pk"],
+        platform="youtube",
+        video_id="video-route-risk",
+        title="风险案件接口测试",
+        video_url="https://www.youtube.com/watch?v=video-route-risk",
+        thumbnail_url="https://i.ytimg.com/vi/video-route-risk/hqdefault.jpg",
+    )
+    for index, overall_risk in enumerate(("risk", "safe"), start=1):
+        run = store.create_run(
+            scope,
+            trigger_type="manual",
+            intensity="standard",
+            channel_pks=[channel["channel_pk"]],
+            params={"force_refresh": index > 1},
+            model_snapshot={"provider": "fake", "model": "fake"},
+            prompt_version="cover-visible-evidence-v1",
+        )
+        claimed = store.claim_next_run(worker_name=f"route-risk-worker-{index}")
+        assert claimed is not None
+        store.enqueue_task_items(
+            run["run_id"],
+            claimed["worker_lease_token"],
+            [{"video_pk": video["video_pk"], "reason": "manual"}],
+        )
+        item = store.claim_next_task_item(run["run_id"], claimed["worker_lease_token"])
+        assert item is not None
+        content_sha256 = ("a" if index == 1 else "b") * 64
+        asset = store.save_asset(
+            scope,
+            video_pk=video["video_pk"],
+            asset={
+                "content_sha256": content_sha256,
+                "storage_key": f"video-route-risk/{content_sha256}.jpg",
+                "original_url": video["thumbnail_url"],
+                "fetched_url": video["thumbnail_url"],
+                "mime_type": "image/jpeg",
+                "byte_size": 2048,
+                "width": 1280,
+                "height": 720,
+            },
+        )
+        asset_path = db_path.parent / "assets" / asset["storage_key"]
+        asset_path.parent.mkdir(parents=True, exist_ok=True)
+        asset_path.write_bytes(f"fake-cover-{index}".encode("ascii"))
+        assert store.advance_task_item(
+            item["task_item_id"],
+            item["worker_lease_token"],
+            expected_stage="download",
+            next_stage="review",
+        )
+        store.save_detection_and_case(
+            scope,
+            task_item_id=item["task_item_id"],
+            worker_lease_token=item["worker_lease_token"],
+            asset_id=asset["asset_id"],
+            detection={
+                "overall_risk": overall_risk,
+                "risk_tags": ["未成年人"] if overall_risk == "risk" else [],
+                "summary": "发现风险元素" if overall_risk == "risk" else "新封面未见风险元素",
+                "evidence": "旧封面风险证据" if overall_risk == "risk" else "新封面安全证据",
+                "confidence": 0.91,
+                "provider": "fake",
+                "model": "fake",
+                "prompt_version": "cover-visible-evidence-v1",
+                "prompt_hash": "c" * 64,
+                "intensity": "standard",
+                "raw_response": "{}",
+                "duration_seconds": 0.2,
+            },
+        )
+        assert store.advance_task_item(
+            item["task_item_id"],
+            item["worker_lease_token"],
+            expected_stage="review",
+            next_stage="persist",
+        )
+        assert store.finish_task_item(
+            item["task_item_id"], item["worker_lease_token"], succeeded=True
+        )
+    return store.list_risk_cases(scope, status="needs_review")["items"][0]["case_id"]
+
+
+def test_cover_risk_case_routes_list_detail_and_confirm_rectification(tmp_path: Path) -> None:
+    client, db_path = _cover_run_client(tmp_path)
+    case_id = _seed_cover_risk_candidate(db_path)
+
+    listed = client.get("/api/v1/cover-monitor/risk-cases?status=needs_review")
+    detail = client.get(f"/api/v1/cover-monitor/risk-cases/{case_id}")
+    reviewed = client.post(
+        f"/api/v1/cover-monitor/risk-cases/{case_id}/review",
+        json={
+            "action": "confirm_rectified",
+            "reason": "人工对照新旧封面，确认风险元素已移除",
+        },
+    )
+
+    assert listed.status_code == 200
+    assert listed.json()["total"] == 1
+    assert listed.json()["items"][0]["video_id"] == "video-route-risk"
+    assert detail.status_code == 200
+    assert [item["event_type"] for item in detail.json()["events"]] == [
+        "risk_detected",
+        "rectification_candidate",
+    ]
+    assert {item["content_sha256"] for item in detail.json()["events"]} == {"a" * 64, "b" * 64}
+    first_asset_id = detail.json()["events"][0]["asset_id"]
+    evidence = client.get(
+        f"/api/v1/cover-monitor/risk-cases/{case_id}/assets/{first_asset_id}"
+    )
+    assert evidence.status_code == 200
+    assert evidence.content == b"fake-cover-1"
+    assert reviewed.status_code == 200
+    assert reviewed.json()["case"]["current_status"] == "confirmed_rectified"
+    assert reviewed.json()["reviews"][0]["action"] == "confirm_rectified"
+    assert client.post(
+        f"/api/v1/cover-monitor/risk-cases/{case_id}/review",
+        json={"action": "confirm_rectified", "reason": "重复确认应被拒绝"},
+    ).status_code == 409
+    assert client.get("/api/v1/cover-monitor/risk-cases/missing-case").status_code == 404
