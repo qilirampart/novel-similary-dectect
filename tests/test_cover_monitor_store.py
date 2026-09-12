@@ -448,3 +448,42 @@ def test_cancel_request_wins_when_last_task_item_finishes(tmp_path: Path) -> Non
     assert after_finish["status"] == "cancel_requested"
     assert after_finish["worker_lease_token"] == claimed_run["worker_lease_token"]
     assert store.settle_requested_control(run["run_id"], claimed_run["worker_lease_token"]) == "cancelled"
+
+
+def test_worker_shutdown_requeues_run_and_releases_claimed_item_lease(tmp_path: Path) -> None:
+    store = CoverMonitorStore(tmp_path / "cover-monitor.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    run = _create_cover_run_fixture(store, scope)
+    channel = store.list_channels(scope)[0]
+    video = store.upsert_video(
+        scope,
+        channel_pk=channel["channel_pk"],
+        platform="youtube",
+        video_id="video-shutdown-001",
+        title="Shutdown Video",
+        video_url="https://www.youtube.com/watch?v=video-shutdown-001",
+        thumbnail_url="https://i.ytimg.com/vi/video-shutdown-001/hqdefault.jpg",
+    )
+    claimed_run = store.claim_next_run(worker_name="cover-worker-1")
+    assert claimed_run is not None
+    store.enqueue_task_items(
+        run["run_id"],
+        claimed_run["worker_lease_token"],
+        [{"video_pk": video["video_pk"], "reason": "manual"}],
+    )
+    claimed_item = store.claim_next_task_item(run["run_id"], claimed_run["worker_lease_token"])
+    assert claimed_item is not None
+
+    status = store.release_run_for_worker_shutdown(
+        run["run_id"],
+        claimed_run["worker_lease_token"],
+    )
+
+    assert status == "queued"
+    released_run = store.get_run(scope, run["run_id"])
+    released_item = store.get_task_item(claimed_item["task_item_id"])
+    assert released_run is not None and released_run["status"] == "queued"
+    assert released_run["worker_lease_token"] is None
+    assert released_item is not None and released_item["status"] == "queued"
+    assert released_item["worker_lease_token"] is None
+    assert not store.heartbeat_task_item(claimed_item["task_item_id"], claimed_item["worker_lease_token"])

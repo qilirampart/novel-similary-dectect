@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from service.cover_monitor.collector import ChannelCollectionResult, CollectedCoverVideo
+from service.cover_monitor.collector import (
+    ChannelCollectionResult,
+    CollectedCoverVideo,
+    CoverCollectionCancelled,
+)
 from service.cover_monitor.downloader import DownloadedCover
 from service.cover_monitor.executor import CoverRunExecutor
 from service.cover_monitor.reviewer import CoverDetectionResult, CoverReviewOutcome
@@ -10,7 +14,11 @@ from service.cover_monitor.store import CoverAccessScope, CoverMonitorStore
 
 
 class FakeCollector:
+    def __init__(self) -> None:
+        self.calls = 0
+
     def collect(self, source_url: str, **_: object) -> ChannelCollectionResult:
+        self.calls += 1
         return ChannelCollectionResult(
             source_url=source_url,
             channel_id="UC-executor",
@@ -88,6 +96,32 @@ class FakeReviewer:
                 duration_seconds=0.2,
             ),
         )
+
+
+class PauseDuringCollection:
+    def __init__(self, store: CoverMonitorStore, scope: CoverAccessScope, run_id: str) -> None:
+        self.store = store
+        self.scope = scope
+        self.run_id = run_id
+
+    def collect(self, _source_url: str, **kwargs: object) -> ChannelCollectionResult:
+        self.store.request_pause(self.scope, self.run_id)
+        should_cancel = kwargs["should_cancel"]
+        if callable(should_cancel) and should_cancel():
+            raise CoverCollectionCancelled("pause requested")
+        raise AssertionError("pause request was not visible to the collector")
+
+
+class CancelDuringReview(FakeReviewer):
+    def __init__(self, store: CoverMonitorStore, scope: CoverAccessScope, run_id: str) -> None:
+        super().__init__()
+        self.store = store
+        self.scope = scope
+        self.run_id = run_id
+
+    def review(self, **kwargs: object) -> CoverReviewOutcome:
+        self.store.request_cancel(self.scope, self.run_id)
+        return super().review(**kwargs)
 
 
 def _create_executor_fixture(
@@ -209,5 +243,86 @@ def test_cover_executor_recovery_finishes_persist_stage_without_recalling_model(
     assert recovered["status"] == "completed"
     assert reviewer.calls == 0
     with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cover_detections").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM cover_risk_cases").fetchone()[0] == 1
+
+
+def test_cover_executor_releases_run_before_scan_when_worker_is_stopping(tmp_path: Path) -> None:
+    store = CoverMonitorStore(tmp_path / "cover.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    channel = store.upsert_channel(
+        scope,
+        platform="youtube",
+        channel_id="UC-stop",
+        name="Stop Channel",
+        source_url="https://www.youtube.com/channel/UC-stop",
+    )
+    run = store.create_run(
+        scope,
+        trigger_type="manual",
+        intensity="standard",
+        channel_pks=[channel["channel_pk"]],
+        params={},
+        model_snapshot={"provider": "fake", "model": "fake"},
+        prompt_version="cover-visible-evidence-v1",
+    )
+    collector = FakeCollector()
+    executor = CoverRunExecutor(
+        store=store,
+        collector=collector,
+        downloader=FakeDownloader(tmp_path / "assets"),
+        reviewer=FakeReviewer(),
+        worker_name="cover-worker-stopping",
+        should_stop=lambda: True,
+    )
+
+    result = executor.run_once()
+
+    assert result is not None
+    assert result["run_id"] == run["run_id"]
+    assert result["status"] == "queued"
+    assert result["worker_lease_token"] is None
+    assert collector.calls == 0
+
+
+def test_cover_executor_pauses_during_channel_collection_at_safe_checkpoint(tmp_path: Path) -> None:
+    store, scope, run, _, _ = _create_executor_fixture(tmp_path)
+    executor = CoverRunExecutor(
+        store=store,
+        collector=PauseDuringCollection(store, scope, run["run_id"]),
+        downloader=FakeDownloader(tmp_path / "assets"),
+        reviewer=FakeReviewer(),
+        worker_name="cover-worker-pausing",
+    )
+
+    result = executor.run_once()
+
+    assert result is not None
+    assert result["status"] == "paused"
+    assert result["worker_lease_token"] is None
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cover_task_items").fetchone()[0] == 0
+        assert conn.execute("SELECT scan_status FROM cover_run_channels").fetchone()[0] == "pending"
+
+
+def test_cover_executor_cancel_during_review_keeps_completed_evidence_and_cancels_run(tmp_path: Path) -> None:
+    store, scope, run, _, _ = _create_executor_fixture(tmp_path)
+    reviewer = CancelDuringReview(store, scope, run["run_id"])
+    executor = CoverRunExecutor(
+        store=store,
+        collector=FakeCollector(),
+        downloader=FakeDownloader(tmp_path / "assets"),
+        reviewer=reviewer,
+        worker_name="cover-worker-cancelling",
+    )
+
+    result = executor.run_once()
+
+    assert result is not None
+    assert result["status"] == "cancelled"
+    assert result["worker_lease_token"] is None
+    assert reviewer.calls == 1
+    with store._connect() as conn:
+        assert conn.execute("SELECT status FROM cover_task_items").fetchone()[0] == "succeeded"
         assert conn.execute("SELECT COUNT(*) FROM cover_detections").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM cover_risk_cases").fetchone()[0] == 1

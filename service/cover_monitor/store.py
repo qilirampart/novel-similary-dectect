@@ -1868,6 +1868,77 @@ class CoverMonitorStore:
                 )
         return target
 
+    def release_run_for_worker_shutdown(self, run_id: str, worker_lease_token: str) -> str | None:
+        run_id = _required_text(run_id, "run_id")
+        worker_lease_token = _required_text(worker_lease_token, "worker_lease_token")
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status FROM cover_runs WHERE run_id = ? AND worker_lease_token = ?",
+                (run_id, worker_lease_token),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            current_status = str(row["status"])
+            target_status = {
+                "running": "queued",
+                "pause_requested": "paused",
+                "cancel_requested": "cancelled",
+            }.get(current_status)
+            if target_status is None:
+                conn.rollback()
+                return current_status
+            status_message = {
+                "queued": "worker 已停止，任务重新排队",
+                "paused": "已暂停",
+                "cancelled": "已取消",
+            }[target_status]
+            conn.execute(
+                """
+                UPDATE cover_runs
+                   SET status = ?, status_message = ?, worker_name = NULL,
+                       worker_lease_token = NULL, last_heartbeat_at = NULL,
+                       finished_at = CASE WHEN ? = 'cancelled' THEN ? ELSE finished_at END,
+                       updated_at = ?
+                 WHERE run_id = ? AND worker_lease_token = ? AND status = ?
+                """,
+                (
+                    target_status,
+                    status_message,
+                    target_status,
+                    now,
+                    now,
+                    run_id,
+                    worker_lease_token,
+                    current_status,
+                ),
+            )
+            if target_status == "cancelled":
+                conn.execute(
+                    """
+                    UPDATE cover_task_items
+                       SET status = 'cancelled', worker_lease_token = NULL,
+                           last_heartbeat_at = NULL, finished_at = COALESCE(finished_at, ?),
+                           updated_at = ?
+                     WHERE run_id = ? AND status IN ('queued', 'running', 'retry_wait')
+                    """,
+                    (now, now, run_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE cover_task_items
+                       SET status = 'queued', worker_lease_token = NULL,
+                           last_heartbeat_at = NULL, updated_at = ?
+                     WHERE run_id = ? AND status = 'running'
+                    """,
+                    (now, run_id),
+                )
+            conn.commit()
+        return target_status
+
     def recover_stale_runs(self, *, stale_before: str) -> dict[str, int]:
         stale_before = _required_text(stale_before, "stale_before")
         now = _now()

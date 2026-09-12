@@ -52,6 +52,7 @@ class CoverRunExecutor:
         retry_delay_seconds: float = 5,
         heartbeat_interval_seconds: float = 5,
         sleep: Callable[[float], None] = time.sleep,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
         self.store = store
         self.collector = collector
@@ -64,6 +65,7 @@ class CoverRunExecutor:
         self.retry_delay_seconds = max(float(retry_delay_seconds), 0)
         self.heartbeat_interval_seconds = max(float(heartbeat_interval_seconds), 0.05)
         self.sleep = sleep
+        self.should_stop = should_stop or (lambda: False)
 
     def run_once(self) -> dict[str, Any] | None:
         run = self.store.claim_next_run(worker_name=self.worker_name)
@@ -74,9 +76,11 @@ class CoverRunExecutor:
         scope = CoverAccessScope(workspace_key=str(run["workspace_key"]), user_id=int(run["created_by_user_id"]))
         params = json.loads(str(run.get("params_json") or "{}"))
 
+        if self._settle_interruption(scope, run_id, run_lease):
+            return self.store.get_run(scope, run_id)
         if not self._scan_channels(scope, run, run_lease, params):
             return self.store.get_run(scope, run_id)
-        if self._settle_control(scope, run_id, run_lease):
+        if self._settle_interruption(scope, run_id, run_lease):
             return self.store.get_run(scope, run_id)
         self._process_items(scope, run, run_lease)
         current = self.store.get_run(scope, run_id)
@@ -96,7 +100,7 @@ class CoverRunExecutor:
         for channel in self.store.list_run_channels(run_id, run_lease):
             if str(channel.get("scan_status")) == "completed":
                 continue
-            if self._settle_control(scope, run_id, run_lease):
+            if self._settle_interruption(scope, run_id, run_lease):
                 return False
             try:
                 with self._run_heartbeat(run_id, run_lease):
@@ -104,7 +108,7 @@ class CoverRunExecutor:
                         str(channel["source_url"]),
                         max_items_per_scope=max(int(params.get("max_items_per_scope") or 0), 0),
                         include_shorts=bool(params.get("include_shorts", True)),
-                        should_cancel=lambda: self._control_requested(scope, run_id),
+                        should_cancel=lambda: self.should_stop() or self._control_requested(scope, run_id),
                     )
                 task_items: list[dict[str, Any]] = []
                 for video in collection.videos:
@@ -143,7 +147,7 @@ class CoverRunExecutor:
                     error_message="; ".join(collection.scope_errors.values()),
                 )
             except CoverCollectionCancelled:
-                self._settle_control(scope, run_id, run_lease)
+                self._settle_interruption(scope, run_id, run_lease)
                 return False
             except Exception as exc:
                 self.store.finish_run_channel(
@@ -161,7 +165,7 @@ class CoverRunExecutor:
     def _process_items(self, scope: CoverAccessScope, run: dict[str, Any], run_lease: str) -> None:
         run_id = str(run["run_id"])
         while True:
-            if self._settle_control(scope, run_id, run_lease):
+            if self._settle_interruption(scope, run_id, run_lease):
                 return
             item = self.store.claim_next_task_item(run_id, run_lease)
             if item is None:
@@ -309,7 +313,7 @@ class CoverRunExecutor:
         except ValueError:
             return False
         while True:
-            if self._settle_control(scope, run_id, run_lease):
+            if self._settle_interruption(scope, run_id, run_lease):
                 return False
             remaining = (retry_at - datetime.now(timezone.utc)).total_seconds()
             if remaining <= 0:
@@ -355,3 +359,9 @@ class CoverRunExecutor:
             return False
         self.store.settle_requested_control(run_id, run_lease)
         return True
+
+    def _settle_interruption(self, scope: CoverAccessScope, run_id: str, run_lease: str) -> bool:
+        if self.should_stop():
+            self.store.release_run_for_worker_shutdown(run_id, run_lease)
+            return True
+        return self._settle_control(scope, run_id, run_lease)

@@ -80,6 +80,27 @@ class ApiSettings:
     cover_monitor_vision_timeout_seconds: float = float(
         os.environ.get("COVER_MONITOR_VISION_TIMEOUT_SECONDS", "90")
     )
+    cover_monitor_worker_name: str = os.environ.get(
+        "COVER_MONITOR_WORKER_NAME", "cover-worker"
+    )
+    cover_monitor_worker_poll_seconds: float = float(
+        os.environ.get("COVER_MONITOR_WORKER_POLL_SECONDS", "3")
+    )
+    cover_monitor_worker_max_attempts: int = int(
+        os.environ.get("COVER_MONITOR_WORKER_MAX_ATTEMPTS", "3")
+    )
+    cover_monitor_worker_retry_seconds: float = float(
+        os.environ.get("COVER_MONITOR_WORKER_RETRY_SECONDS", "5")
+    )
+    cover_monitor_worker_heartbeat_seconds: float = float(
+        os.environ.get("COVER_MONITOR_WORKER_HEARTBEAT_SECONDS", "5")
+    )
+    cover_monitor_worker_stale_seconds: float = float(
+        os.environ.get("COVER_MONITOR_WORKER_STALE_SECONDS", "120")
+    )
+    cover_monitor_worker_recovery_sweep_seconds: float = float(
+        os.environ.get("COVER_MONITOR_WORKER_RECOVERY_SWEEP_SECONDS", "15")
+    )
     task_upload_root: str = os.environ.get("NOVEL_SIMILARITY_TASK_UPLOAD_ROOT", "runtime/task_uploads")
     task_export_root: str = os.environ.get("NOVEL_SIMILARITY_TASK_EXPORT_ROOT", "runtime/task_exports")
     task_created_by_default: str = os.environ.get("NOVEL_SIMILARITY_TASK_CREATED_BY", "api")
