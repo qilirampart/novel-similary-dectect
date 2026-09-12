@@ -1011,6 +1011,90 @@ class CoverMonitorStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def search_channels(
+        self,
+        scope: CoverAccessScope,
+        *,
+        keyword: str = "",
+        active: bool | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        safe_limit = min(max(int(limit), 1), 100)
+        safe_offset = max(int(offset), 0)
+        clauses = ["channel.workspace_key = ?"]
+        params: list[Any] = [workspace_key]
+        normalized_keyword = str(keyword or "").strip()
+        if normalized_keyword:
+            escaped = normalized_keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            clauses.append(
+                "(channel.name LIKE ? ESCAPE '\\' OR channel.channel_id LIKE ? ESCAPE '\\' "
+                "OR operator.name LIKE ? ESCAPE '\\')"
+            )
+            params.extend((pattern, pattern, pattern))
+        if active is not None:
+            clauses.append("channel.active = ?")
+            params.append(1 if active else 0)
+        where = " AND ".join(clauses)
+        with self._connect() as conn:
+            total = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                      FROM cover_channels AS channel
+                      LEFT JOIN cover_operators AS operator
+                        ON operator.operator_pk = channel.operator_pk
+                     WHERE {where}
+                    """,
+                    params,
+                ).fetchone()[0]
+            )
+            rows = conn.execute(
+                f"""
+                SELECT channel.channel_pk, channel.platform, channel.channel_id,
+                       channel.name, channel.source_url, channel.active,
+                       channel.operator_pk, operator.name AS operator_name,
+                       channel.last_scan_at, channel.updated_at,
+                       (SELECT COUNT(*) FROM cover_videos AS video
+                         WHERE video.workspace_key = channel.workspace_key
+                           AND video.channel_pk = channel.channel_pk) AS video_count,
+                       (SELECT COUNT(*)
+                          FROM cover_risk_cases AS risk_case
+                          JOIN cover_videos AS risk_video
+                            ON risk_video.video_pk = risk_case.video_pk
+                         WHERE risk_case.workspace_key = channel.workspace_key
+                           AND risk_video.channel_pk = channel.channel_pk
+                           AND risk_case.current_status IN ('open', 'needs_review')) AS open_case_count,
+                       (SELECT run_channel.scan_status
+                          FROM cover_run_channels AS run_channel
+                          JOIN cover_runs AS run ON run.run_id = run_channel.run_id
+                         WHERE run_channel.channel_pk = channel.channel_pk
+                           AND run.workspace_key = channel.workspace_key
+                         ORDER BY run.created_at DESC, run_channel.run_channel_id DESC
+                         LIMIT 1) AS latest_scan_status,
+                       (SELECT run_channel.completeness
+                          FROM cover_run_channels AS run_channel
+                          JOIN cover_runs AS run ON run.run_id = run_channel.run_id
+                         WHERE run_channel.channel_pk = channel.channel_pk
+                           AND run.workspace_key = channel.workspace_key
+                         ORDER BY run.created_at DESC, run_channel.run_channel_id DESC
+                         LIMIT 1) AS latest_scan_completeness
+                  FROM cover_channels AS channel
+                  LEFT JOIN cover_operators AS operator
+                    ON operator.operator_pk = channel.operator_pk
+                 WHERE {where}
+                 ORDER BY channel.updated_at DESC, channel.channel_pk DESC
+                 LIMIT ? OFFSET ?
+                """,
+                (*params, safe_limit, safe_offset),
+            ).fetchall()
+        items = [dict(row) for row in rows]
+        for item in items:
+            item["active"] = bool(item["active"])
+        return {"items": items, "total": total, "limit": safe_limit, "offset": safe_offset}
+
     def upsert_video(
         self,
         scope: CoverAccessScope,

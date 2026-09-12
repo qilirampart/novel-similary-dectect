@@ -60,6 +60,30 @@ class CoverRunListResponse(BaseModel):
     offset: int
 
 
+class CoverChannelSummary(BaseModel):
+    channel_pk: int
+    platform: str
+    channel_id: str
+    name: str
+    source_url: str
+    active: bool
+    operator_pk: Optional[int] = None
+    operator_name: Optional[str] = None
+    video_count: int
+    open_case_count: int
+    last_scan_at: Optional[str] = None
+    latest_scan_status: Optional[str] = None
+    latest_scan_completeness: Optional[str] = None
+    updated_at: str
+
+
+class CoverChannelListResponse(BaseModel):
+    items: list[CoverChannelSummary]
+    total: int
+    limit: int
+    offset: int
+
+
 class CoverRunChannelSummary(BaseModel):
     run_channel_id: int
     channel_pk: int
@@ -228,6 +252,24 @@ def build_cover_monitor_router(
             "provider": provider[:200],
             "model": str(vision_model or "unconfigured")[:200],
         }
+
+    @router.get("/channels", response_model=CoverChannelListResponse)
+    def list_channels(
+        keyword: str = Query(default="", max_length=200),
+        active: Optional[bool] = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverChannelListResponse:
+        return CoverChannelListResponse.model_validate(
+            store.search_channels(
+                access_scope(user),
+                keyword=keyword,
+                active=active,
+                limit=limit,
+                offset=offset,
+            )
+        )
 
     @router.post("/runs", response_model=CoverRunSummary)
     def create_run(

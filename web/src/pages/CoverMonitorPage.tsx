@@ -15,6 +15,7 @@ import {
   type CoverRunSummary
 } from "../api";
 import { Icon } from "../icons";
+import { CoverChannelPanel } from "./CoverChannelPanel";
 import { CoverRiskReviewPanel } from "./CoverRiskReviewPanel";
 
 
@@ -28,7 +29,7 @@ const EMPTY_OVERVIEW: CoverMonitorOverviewResponse = {
 };
 
 const tabs = ["工作台", "频道清单", "巡检批次", "风险复核", "历史整改"];
-const enabledTabs = new Set(["工作台", "巡检批次", "风险复核"]);
+const enabledTabs = new Set(["工作台", "频道清单", "巡检批次", "风险复核"]);
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat("zh-CN").format(Math.max(Number(value) || 0, 0));
@@ -401,7 +402,9 @@ export function CoverMonitorPage() {
           </div>
         </div>
       </section>
-      </> : activeTab === "巡检批次" ? (
+      </> : activeTab === "频道清单" ? (
+        <CoverChannelPanel />
+      ) : activeTab === "巡检批次" ? (
         <section className="cover-run-browser">
           <aside className="card-panel cover-run-list">
             <div className="section-heading">

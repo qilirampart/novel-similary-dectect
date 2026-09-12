@@ -41,6 +41,30 @@ export type CoverRunListResponse = {
   offset: number;
 };
 
+export type CoverChannelSummary = {
+  channel_pk: number;
+  platform: string;
+  channel_id: string;
+  name: string;
+  source_url: string;
+  active: boolean;
+  operator_pk?: number | null;
+  operator_name?: string | null;
+  video_count: number;
+  open_case_count: number;
+  last_scan_at?: string | null;
+  latest_scan_status?: string | null;
+  latest_scan_completeness?: string | null;
+  updated_at: string;
+};
+
+export type CoverChannelListResponse = {
+  items: CoverChannelSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
 export type CoverRunDetailResponse = {
   run: CoverRunSummary;
   channels: Array<{
@@ -712,6 +736,23 @@ export function getSystemStatus(): Promise<SystemStatusResponse> {
 
 export function getCoverMonitorOverview(): Promise<CoverMonitorOverviewResponse> {
   return requestJson<CoverMonitorOverviewResponse>("/api/v1/cover-monitor/overview", {
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+  });
+}
+
+export function listCoverMonitorChannels(params: {
+  keyword?: string;
+  active?: boolean;
+  limit?: number;
+  offset?: number;
+} = {}): Promise<CoverChannelListResponse> {
+  return requestJson<CoverChannelListResponse>("/api/v1/cover-monitor/channels", {
+    query: {
+      keyword: params.keyword || undefined,
+      active: params.active == null ? undefined : String(params.active),
+      limit: params.limit ?? 50,
+      offset: params.offset ?? 0
+    },
     timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
   });
 }

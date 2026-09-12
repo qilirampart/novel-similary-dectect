@@ -83,6 +83,78 @@ def test_cover_import_preview_and_confirm_routes(tmp_path: Path) -> None:
     assert client.get("/api/v1/cover-monitor/overview").json()["channel_count"] == 1
 
 
+def test_cover_channel_route_filters_and_paginates_with_operational_counts(tmp_path: Path) -> None:
+    db_path = tmp_path / "cover-monitor.sqlite3"
+    app = FastAPI()
+    app.include_router(
+        build_cover_monitor_router(
+            db_path=str(db_path),
+            current_user_dependency=lambda: {"user_id": 7, "role": "operator"},
+        )
+    )
+    store = CoverMonitorStore(db_path)
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO cover_operators (
+                workspace_key, external_id, name, active, created_by_user_id, created_at, updated_at
+            ) VALUES ('internal', 'agency-a', '代理甲', 1, 7, '2026-09-12T00:00:00+00:00', '2026-09-12T00:00:00+00:00')
+            """
+        )
+        operator_pk = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    alpha = store.upsert_channel(
+        scope,
+        platform="youtube",
+        channel_id="UC-alpha",
+        name="Alpha 剧场",
+        source_url="https://www.youtube.com/channel/UC-alpha",
+        operator_pk=operator_pk,
+    )
+    store.upsert_channel(
+        scope,
+        platform="youtube",
+        channel_id="UC-beta",
+        name="Beta 剧场",
+        source_url="https://www.youtube.com/channel/UC-beta",
+    )
+    store.upsert_video(
+        scope,
+        channel_pk=alpha["channel_pk"],
+        platform="youtube",
+        video_id="video-alpha-1",
+        title="Alpha video",
+        video_url="https://www.youtube.com/watch?v=video-alpha-1",
+        thumbnail_url="https://i.ytimg.com/vi/video-alpha-1/hqdefault.jpg",
+    )
+
+    response = TestClient(app).get(
+        "/api/v1/cover-monitor/channels?keyword=alpha&active=true&limit=1&offset=0"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    assert payload["limit"] == 1
+    assert payload["offset"] == 0
+    assert payload["items"][0] == {
+        "channel_pk": alpha["channel_pk"],
+        "platform": "youtube",
+        "channel_id": "UC-alpha",
+        "name": "Alpha 剧场",
+        "source_url": "https://www.youtube.com/channel/UC-alpha",
+        "active": True,
+        "operator_pk": operator_pk,
+        "operator_name": "代理甲",
+        "video_count": 1,
+        "open_case_count": 0,
+        "last_scan_at": None,
+        "latest_scan_status": None,
+        "latest_scan_completeness": None,
+        "updated_at": alpha["updated_at"],
+    }
+
+
 def test_cover_import_rejects_non_xlsx_and_oversized_files(tmp_path: Path) -> None:
     app = FastAPI()
     app.include_router(
