@@ -17,7 +17,7 @@ except Exception:
 
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_BUSY_TIMEOUT_MS = 30_000
 
 
@@ -974,6 +974,307 @@ class CoverMonitorStore:
             ).rowcount
         return updated == 1
 
+    def enqueue_task_items(
+        self,
+        run_id: str,
+        worker_lease_token: str,
+        items: list[dict[str, Any]],
+    ) -> int:
+        run_id = _required_text(run_id, "run_id")
+        worker_lease_token = _required_text(worker_lease_token, "worker_lease_token")
+        normalized: dict[tuple[int, str], None] = {}
+        for item in items:
+            video_pk = int(item.get("video_pk") or 0)
+            reason = _required_text(str(item.get("reason") or ""), "reason")
+            if video_pk <= 0:
+                raise ValueError("video_pk must be positive")
+            if reason not in {"new_video", "historical_risk", "retry_unknown", "manual"}:
+                raise ValueError("unsupported task item reason")
+            normalized[(video_pk, reason)] = None
+        if not normalized:
+            return 0
+
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                """
+                SELECT workspace_key FROM cover_runs
+                 WHERE run_id = ? AND worker_lease_token = ? AND status = 'running'
+                """,
+                (run_id, worker_lease_token),
+            ).fetchone()
+            if run is None:
+                conn.rollback()
+                return 0
+            workspace_key = str(run["workspace_key"])
+            inserted = 0
+            for video_pk, reason in normalized:
+                video = conn.execute(
+                    "SELECT 1 FROM cover_videos WHERE video_pk = ? AND workspace_key = ?",
+                    (video_pk, workspace_key),
+                ).fetchone()
+                if video is None:
+                    conn.rollback()
+                    raise ValueError("video is not visible in this run workspace")
+                inserted += conn.execute(
+                    """
+                    INSERT OR IGNORE INTO cover_task_items (
+                        run_id, video_pk, reason, stage, status, attempts, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'download', 'queued', 0, ?, ?)
+                    """,
+                    (run_id, video_pk, reason, now, now),
+                ).rowcount
+            conn.execute(
+                """
+                UPDATE cover_runs
+                   SET total_item_count = (
+                           SELECT COUNT(*) FROM cover_task_items WHERE run_id = ?
+                       ), updated_at = ?
+                 WHERE run_id = ? AND worker_lease_token = ? AND status = 'running'
+                """,
+                (run_id, now, run_id, worker_lease_token),
+            )
+            conn.commit()
+        return inserted
+
+    def claim_next_task_item(
+        self,
+        run_id: str,
+        worker_lease_token: str,
+    ) -> dict[str, Any] | None:
+        run_id = _required_text(run_id, "run_id")
+        worker_lease_token = _required_text(worker_lease_token, "worker_lease_token")
+        item_lease_token = uuid4().hex
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                """
+                SELECT 1 FROM cover_runs
+                 WHERE run_id = ? AND worker_lease_token = ? AND status = 'running'
+                """,
+                (run_id, worker_lease_token),
+            ).fetchone()
+            if run is None:
+                conn.rollback()
+                return None
+            row = conn.execute(
+                """
+                SELECT task_item_id FROM cover_task_items
+                 WHERE run_id = ?
+                   AND (status = 'queued' OR (status = 'retry_wait' AND next_retry_at <= ?))
+                 ORDER BY task_item_id
+                 LIMIT 1
+                """,
+                (run_id, now),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            task_item_id = int(row["task_item_id"])
+            updated = conn.execute(
+                """
+                UPDATE cover_task_items
+                   SET status = 'running', worker_lease_token = ?, attempts = attempts + 1,
+                       last_heartbeat_at = ?, started_at = COALESCE(started_at, ?),
+                       next_retry_at = NULL, error_type = NULL, error_message = NULL,
+                       updated_at = ?
+                 WHERE task_item_id = ?
+                   AND (status = 'queued' OR (status = 'retry_wait' AND next_retry_at <= ?))
+                """,
+                (item_lease_token, now, now, now, task_item_id, now),
+            ).rowcount
+            if updated != 1:
+                conn.rollback()
+                return None
+            claimed = conn.execute(
+                "SELECT * FROM cover_task_items WHERE task_item_id = ?",
+                (task_item_id,),
+            ).fetchone()
+            conn.commit()
+        return self._row(claimed)
+
+    def heartbeat_task_item(self, task_item_id: int, worker_lease_token: str) -> bool:
+        now = _now()
+        with self._connect() as conn:
+            updated = conn.execute(
+                """
+                UPDATE cover_task_items
+                   SET last_heartbeat_at = ?, updated_at = ?
+                 WHERE task_item_id = ? AND worker_lease_token = ? AND status = 'running'
+                """,
+                (now, now, int(task_item_id), _required_text(worker_lease_token, "worker_lease_token")),
+            ).rowcount
+        return updated == 1
+
+    def get_task_item(self, task_item_id: int) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM cover_task_items WHERE task_item_id = ?",
+                (int(task_item_id),),
+            ).fetchone()
+        return self._row(row)
+
+    def retry_task_item(
+        self,
+        task_item_id: int,
+        worker_lease_token: str,
+        *,
+        next_retry_at: str,
+        error_type: str,
+        error_message: str,
+    ) -> bool:
+        now = _now()
+        with self._connect() as conn:
+            updated = conn.execute(
+                """
+                UPDATE cover_task_items
+                   SET status = 'retry_wait', next_retry_at = ?,
+                       worker_lease_token = NULL, last_heartbeat_at = NULL,
+                       error_type = ?, error_message = ?, updated_at = ?
+                 WHERE task_item_id = ? AND worker_lease_token = ? AND status = 'running'
+                """,
+                (
+                    _required_text(next_retry_at, "next_retry_at"),
+                    _required_text(error_type, "error_type")[:100],
+                    str(error_message or "")[:1000],
+                    now,
+                    int(task_item_id),
+                    _required_text(worker_lease_token, "worker_lease_token"),
+                ),
+            ).rowcount
+        return updated == 1
+
+    def advance_task_item(
+        self,
+        task_item_id: int,
+        worker_lease_token: str,
+        *,
+        expected_stage: str,
+        next_stage: str,
+    ) -> bool:
+        expected_stage = _required_text(expected_stage, "expected_stage")
+        next_stage = _required_text(next_stage, "next_stage")
+        if (expected_stage, next_stage) not in {("download", "review"), ("review", "persist")}:
+            raise ValueError("unsupported task item stage transition")
+        now = _now()
+        with self._connect() as conn:
+            updated = conn.execute(
+                """
+                UPDATE cover_task_items
+                   SET stage = ?, last_heartbeat_at = ?, updated_at = ?
+                 WHERE task_item_id = ? AND worker_lease_token = ?
+                   AND status = 'running' AND stage = ?
+                """,
+                (
+                    next_stage,
+                    now,
+                    now,
+                    int(task_item_id),
+                    _required_text(worker_lease_token, "worker_lease_token"),
+                    expected_stage,
+                ),
+            ).rowcount
+        return updated == 1
+
+    def finish_task_item(
+        self,
+        task_item_id: int,
+        worker_lease_token: str,
+        *,
+        succeeded: bool,
+        error_type: str = "",
+        error_message: str = "",
+    ) -> bool:
+        now = _now()
+        target_status = "succeeded" if succeeded else "failed"
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT run_id FROM cover_task_items
+                 WHERE task_item_id = ? AND worker_lease_token = ? AND status = 'running'
+                """,
+                (int(task_item_id), _required_text(worker_lease_token, "worker_lease_token")),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return False
+            run_id = str(row["run_id"])
+            conn.execute(
+                """
+                UPDATE cover_task_items
+                   SET status = ?, worker_lease_token = NULL, last_heartbeat_at = NULL,
+                       error_type = ?, error_message = ?, finished_at = ?, updated_at = ?
+                 WHERE task_item_id = ? AND worker_lease_token = ? AND status = 'running'
+                """,
+                (
+                    target_status,
+                    None if succeeded else str(error_type or "unexpected")[:100],
+                    None if succeeded else str(error_message or "task item failed")[:1000],
+                    now,
+                    now,
+                    int(task_item_id),
+                    worker_lease_token,
+                ),
+            )
+            counts = conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS completed,
+                       SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+                  FROM cover_task_items WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            total = int(counts["total"] or 0)
+            completed = int(counts["completed"] or 0)
+            failed = int(counts["failed"] or 0)
+            final_status: str | None = None
+            if total > 0 and completed + failed == total:
+                final_status = "completed" if failed == 0 else ("failed" if completed == 0 else "partial_failed")
+            conn.execute(
+                """
+                UPDATE cover_runs
+                   SET total_item_count = ?, completed_item_count = ?, failed_item_count = ?,
+                       status = CASE WHEN status = 'running' THEN COALESCE(?, status) ELSE status END,
+                       status_message = CASE
+                           WHEN status = 'running' AND ? = 'completed' THEN '检测完成'
+                           WHEN status = 'running' AND ? = 'partial_failed' THEN '部分条目检测失败'
+                           WHEN status = 'running' AND ? = 'failed' THEN '检测失败'
+                           ELSE status_message END,
+                       worker_name = CASE
+                           WHEN status = 'running' AND ? IS NOT NULL THEN NULL ELSE worker_name END,
+                       worker_lease_token = CASE
+                           WHEN status = 'running' AND ? IS NOT NULL THEN NULL ELSE worker_lease_token END,
+                       last_heartbeat_at = CASE
+                           WHEN status = 'running' AND ? IS NOT NULL THEN NULL ELSE last_heartbeat_at END,
+                       finished_at = CASE
+                           WHEN status = 'running' AND ? IS NOT NULL THEN ? ELSE finished_at END,
+                       updated_at = ?
+                 WHERE run_id = ?
+                """,
+                (
+                    total,
+                    completed,
+                    failed,
+                    final_status,
+                    final_status,
+                    final_status,
+                    final_status,
+                    final_status,
+                    final_status,
+                    final_status,
+                    final_status,
+                    now,
+                    now,
+                    run_id,
+                ),
+            )
+            conn.commit()
+        return True
+
     def request_pause(self, scope: CoverAccessScope, run_id: str) -> dict[str, Any]:
         return self._request_control(scope, run_id, action="pause")
 
@@ -1098,6 +1399,26 @@ class CoverMonitorStore:
                     status,
                 ),
             )
+            if target == "paused":
+                conn.execute(
+                    """
+                    UPDATE cover_task_items
+                       SET status = 'queued', worker_lease_token = NULL,
+                           last_heartbeat_at = NULL, updated_at = ?
+                     WHERE run_id = ? AND status = 'running'
+                    """,
+                    (now, run_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE cover_task_items
+                       SET status = 'cancelled', worker_lease_token = NULL,
+                           last_heartbeat_at = NULL, finished_at = ?, updated_at = ?
+                     WHERE run_id = ? AND status IN ('queued', 'running', 'retry_wait')
+                    """,
+                    (now, now, run_id),
+                )
         return target
 
     def recover_stale_runs(self, *, stale_before: str) -> dict[str, int]:
@@ -1132,4 +1453,29 @@ class CoverMonitorStore:
                 """,
                 (now, now, stale_before),
             ).rowcount
+            conn.execute(
+                """
+                UPDATE cover_task_items
+                   SET status = 'queued', worker_lease_token = NULL,
+                       last_heartbeat_at = NULL, updated_at = ?
+                 WHERE status = 'running'
+                   AND run_id IN (
+                       SELECT run_id FROM cover_runs WHERE status IN ('queued', 'paused')
+                   )
+                """,
+                (now,),
+            )
+            conn.execute(
+                """
+                UPDATE cover_task_items
+                   SET status = 'cancelled', worker_lease_token = NULL,
+                       last_heartbeat_at = NULL, finished_at = COALESCE(finished_at, ?),
+                       updated_at = ?
+                 WHERE status IN ('queued', 'running', 'retry_wait')
+                   AND run_id IN (
+                       SELECT run_id FROM cover_runs WHERE status = 'cancelled'
+                   )
+                """,
+                (now, now),
+            )
         return counts

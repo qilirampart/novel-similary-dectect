@@ -31,8 +31,9 @@ def test_init_cover_db_is_idempotent_and_enables_required_tables(tmp_path: Path)
             ).fetchall()
         }
 
-    assert version == 3
+    assert version == 4
     assert "idx_cover_runs_claim" in indexes
+    assert "idx_cover_task_items_run_claim" in indexes
     assert {
         "cover_channels",
         "cover_videos",
@@ -233,3 +234,216 @@ def test_cover_run_recovery_resolves_stale_control_requests(tmp_path: Path) -> N
 
     assert recovered == {"requeued": 0, "paused": 1, "cancelled": 0}
     assert store.get_run(scope, paused_run["run_id"])["status"] == "paused"
+
+
+def test_cover_task_items_are_idempotent_and_use_independent_leases(tmp_path: Path) -> None:
+    store = CoverMonitorStore(tmp_path / "cover-monitor.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    run = _create_cover_run_fixture(store, scope)
+    channel = store.list_channels(scope)[0]
+    videos = [
+        store.upsert_video(
+            scope,
+            channel_pk=channel["channel_pk"],
+            platform="youtube",
+            video_id=f"video-{index:03d}",
+            title=f"Video {index}",
+            video_url=f"https://www.youtube.com/watch?v=video-{index:03d}",
+            thumbnail_url=f"https://i.ytimg.com/vi/video-{index:03d}/hqdefault.jpg",
+        )
+        for index in range(1, 3)
+    ]
+    claimed_run = store.claim_next_run(worker_name="cover-worker-1")
+    assert claimed_run is not None
+
+    inserted = store.enqueue_task_items(
+        run["run_id"],
+        claimed_run["worker_lease_token"],
+        [{"video_pk": video["video_pk"], "reason": "new_video"} for video in videos],
+    )
+    duplicate_inserted = store.enqueue_task_items(
+        run["run_id"],
+        claimed_run["worker_lease_token"],
+        [{"video_pk": video["video_pk"], "reason": "new_video"} for video in videos],
+    )
+
+    assert inserted == 2
+    assert duplicate_inserted == 0
+    assert store.get_run(scope, run["run_id"])["total_item_count"] == 2
+
+    first = store.claim_next_task_item(run["run_id"], claimed_run["worker_lease_token"])
+    second = store.claim_next_task_item(run["run_id"], claimed_run["worker_lease_token"])
+    assert first is not None and second is not None
+    assert first["task_item_id"] != second["task_item_id"]
+    assert first["status"] == "running"
+    assert first["stage"] == "download"
+    assert first["attempts"] == 1
+    assert len(first["worker_lease_token"]) == 32
+    assert store.heartbeat_task_item(first["task_item_id"], first["worker_lease_token"])
+    assert not store.heartbeat_task_item(first["task_item_id"], "stale-token")
+
+
+def test_cover_task_item_progress_and_terminal_counts_are_lease_safe(tmp_path: Path) -> None:
+    store = CoverMonitorStore(tmp_path / "cover-monitor.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    run = _create_cover_run_fixture(store, scope)
+    channel = store.list_channels(scope)[0]
+    video = store.upsert_video(
+        scope,
+        channel_pk=channel["channel_pk"],
+        platform="youtube",
+        video_id="video-stage-001",
+        title="Stage Video",
+        video_url="https://www.youtube.com/watch?v=video-stage-001",
+        thumbnail_url="https://i.ytimg.com/vi/video-stage-001/hqdefault.jpg",
+    )
+    claimed_run = store.claim_next_run(worker_name="cover-worker-1")
+    assert claimed_run is not None
+    store.enqueue_task_items(
+        run["run_id"],
+        claimed_run["worker_lease_token"],
+        [{"video_pk": video["video_pk"], "reason": "manual"}],
+    )
+    item = store.claim_next_task_item(run["run_id"], claimed_run["worker_lease_token"])
+    assert item is not None
+
+    assert store.advance_task_item(
+        item["task_item_id"], item["worker_lease_token"], expected_stage="download", next_stage="review"
+    )
+    assert not store.advance_task_item(
+        item["task_item_id"], "stale-token", expected_stage="review", next_stage="persist"
+    )
+    assert store.advance_task_item(
+        item["task_item_id"], item["worker_lease_token"], expected_stage="review", next_stage="persist"
+    )
+    assert store.finish_task_item(item["task_item_id"], item["worker_lease_token"], succeeded=True)
+    assert not store.finish_task_item(item["task_item_id"], item["worker_lease_token"], succeeded=True)
+
+    finished = store.get_run(scope, run["run_id"])
+    assert finished is not None
+    assert finished["status"] == "completed"
+    assert finished["completed_item_count"] == 1
+    assert finished["failed_item_count"] == 0
+
+
+def test_stale_run_recovery_requeues_claimed_task_item(tmp_path: Path) -> None:
+    store = CoverMonitorStore(tmp_path / "cover-monitor.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    run = _create_cover_run_fixture(store, scope)
+    channel = store.list_channels(scope)[0]
+    video = store.upsert_video(
+        scope,
+        channel_pk=channel["channel_pk"],
+        platform="youtube",
+        video_id="video-recovery-001",
+        title="Recovery Video",
+        video_url="https://www.youtube.com/watch?v=video-recovery-001",
+        thumbnail_url="https://i.ytimg.com/vi/video-recovery-001/hqdefault.jpg",
+    )
+    claimed_run = store.claim_next_run(worker_name="cover-worker-1")
+    assert claimed_run is not None
+    store.enqueue_task_items(
+        run["run_id"],
+        claimed_run["worker_lease_token"],
+        [{"video_pk": video["video_pk"], "reason": "new_video"}],
+    )
+    claimed_item = store.claim_next_task_item(run["run_id"], claimed_run["worker_lease_token"])
+    assert claimed_item is not None
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE cover_runs SET last_heartbeat_at = ? WHERE run_id = ?",
+            ("2020-01-01T00:00:00+00:00", run["run_id"]),
+        )
+        conn.execute(
+            "UPDATE cover_task_items SET last_heartbeat_at = ? WHERE task_item_id = ?",
+            ("2020-01-01T00:00:00+00:00", claimed_item["task_item_id"]),
+        )
+
+    recovered = store.recover_stale_runs(stale_before="2021-01-01T00:00:00+00:00")
+    recovered_item = store.get_task_item(claimed_item["task_item_id"])
+
+    assert recovered["requeued"] == 1
+    assert recovered_item is not None
+    assert recovered_item["status"] == "queued"
+    assert recovered_item["worker_lease_token"] is None
+    reclaimed_run = store.claim_next_run(worker_name="cover-worker-2")
+    assert reclaimed_run is not None
+    reclaimed_item = store.claim_next_task_item(run["run_id"], reclaimed_run["worker_lease_token"])
+    assert reclaimed_item is not None
+    assert reclaimed_item["attempts"] == 2
+
+
+def test_retry_wait_item_is_not_claimed_before_due_time(tmp_path: Path) -> None:
+    store = CoverMonitorStore(tmp_path / "cover-monitor.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    run = _create_cover_run_fixture(store, scope)
+    channel = store.list_channels(scope)[0]
+    video = store.upsert_video(
+        scope,
+        channel_pk=channel["channel_pk"],
+        platform="youtube",
+        video_id="video-retry-001",
+        title="Retry Video",
+        video_url="https://www.youtube.com/watch?v=video-retry-001",
+        thumbnail_url="https://i.ytimg.com/vi/video-retry-001/hqdefault.jpg",
+    )
+    claimed_run = store.claim_next_run(worker_name="cover-worker-1")
+    assert claimed_run is not None
+    store.enqueue_task_items(
+        run["run_id"],
+        claimed_run["worker_lease_token"],
+        [{"video_pk": video["video_pk"], "reason": "retry_unknown"}],
+    )
+    item = store.claim_next_task_item(run["run_id"], claimed_run["worker_lease_token"])
+    assert item is not None
+
+    assert store.retry_task_item(
+        item["task_item_id"],
+        item["worker_lease_token"],
+        next_retry_at="2999-01-01T00:00:00+00:00",
+        error_type="timeout",
+        error_message="provider timed out",
+    )
+    assert store.claim_next_task_item(run["run_id"], claimed_run["worker_lease_token"]) is None
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE cover_task_items SET next_retry_at = ? WHERE task_item_id = ?",
+            ("2020-01-01T00:00:00+00:00", item["task_item_id"]),
+        )
+    retried = store.claim_next_task_item(run["run_id"], claimed_run["worker_lease_token"])
+    assert retried is not None
+    assert retried["attempts"] == 2
+    assert retried["stage"] == "download"
+
+
+def test_cancel_request_wins_when_last_task_item_finishes(tmp_path: Path) -> None:
+    store = CoverMonitorStore(tmp_path / "cover-monitor.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    run = _create_cover_run_fixture(store, scope)
+    channel = store.list_channels(scope)[0]
+    video = store.upsert_video(
+        scope,
+        channel_pk=channel["channel_pk"],
+        platform="youtube",
+        video_id="video-cancel-race-001",
+        title="Cancel Race Video",
+        video_url="https://www.youtube.com/watch?v=video-cancel-race-001",
+        thumbnail_url="https://i.ytimg.com/vi/video-cancel-race-001/hqdefault.jpg",
+    )
+    claimed_run = store.claim_next_run(worker_name="cover-worker-1")
+    assert claimed_run is not None
+    store.enqueue_task_items(
+        run["run_id"],
+        claimed_run["worker_lease_token"],
+        [{"video_pk": video["video_pk"], "reason": "manual"}],
+    )
+    item = store.claim_next_task_item(run["run_id"], claimed_run["worker_lease_token"])
+    assert item is not None
+
+    assert store.request_cancel(scope, run["run_id"])["status"] == "cancel_requested"
+    assert store.finish_task_item(item["task_item_id"], item["worker_lease_token"], succeeded=True)
+    after_finish = store.get_run(scope, run["run_id"])
+    assert after_finish is not None
+    assert after_finish["status"] == "cancel_requested"
+    assert after_finish["worker_lease_token"] == claimed_run["worker_lease_token"]
+    assert store.settle_requested_control(run["run_id"], claimed_run["worker_lease_token"]) == "cancelled"

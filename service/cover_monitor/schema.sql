@@ -226,6 +226,9 @@ CREATE TABLE IF NOT EXISTS cover_task_items (
 CREATE INDEX IF NOT EXISTS idx_cover_task_items_claim
     ON cover_task_items (status, next_retry_at, task_item_id);
 
+CREATE INDEX IF NOT EXISTS idx_cover_task_items_run_claim
+    ON cover_task_items (run_id, status, next_retry_at, task_item_id);
+
 CREATE TABLE IF NOT EXISTS cover_assets (
     asset_id TEXT PRIMARY KEY,
     workspace_key TEXT NOT NULL,
