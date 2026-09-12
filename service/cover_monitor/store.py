@@ -1177,6 +1177,64 @@ class CoverMonitorStore:
             ).fetchone()
         return self._row(row)
 
+    def get_video_scan_reason(self, scope: CoverAccessScope, video_pk: int) -> str | None:
+        reasons = self.get_video_scan_reasons(scope, [video_pk])
+        if int(video_pk) not in reasons:
+            raise ValueError("video is not visible in this workspace")
+        return reasons[int(video_pk)]
+
+    def get_video_scan_reasons(
+        self,
+        scope: CoverAccessScope,
+        video_pks: list[int],
+    ) -> dict[int, str | None]:
+        normalized = sorted({int(value) for value in video_pks if int(value) > 0})
+        if not normalized:
+            return {}
+        result: dict[int, str | None] = {}
+        with self._connect() as conn:
+            for start in range(0, len(normalized), 500):
+                batch = normalized[start : start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"""
+                    SELECT video.video_pk,
+                           (
+                               SELECT detection.overall_risk
+                                 FROM cover_detections AS detection
+                                WHERE detection.workspace_key = video.workspace_key
+                                  AND detection.video_pk = video.video_pk
+                                ORDER BY detection.created_at DESC, detection.detection_id DESC
+                                LIMIT 1
+                           ) AS current_risk,
+                           (
+                               SELECT observation.overall_risk
+                                 FROM cover_historical_observations AS observation
+                                WHERE observation.workspace_key = video.workspace_key
+                                  AND observation.video_pk = video.video_pk
+                                ORDER BY observation.imported_at DESC, observation.observation_id DESC
+                                LIMIT 1
+                           ) AS historical_risk
+                      FROM cover_videos AS video
+                     WHERE video.workspace_key = ? AND video.video_pk IN ({placeholders})
+                    """,
+                    (scope.workspace_key.strip(), *batch),
+                ).fetchall()
+                for row in rows:
+                    current_risk = str(row["current_risk"] or "")
+                    historical_risk = str(row["historical_risk"] or "")
+                    if current_risk:
+                        reason = "retry_unknown" if current_risk == "unknown" else None
+                    elif historical_risk in {"risk", "review"}:
+                        reason = "historical_risk"
+                    elif historical_risk == "unknown":
+                        reason = "retry_unknown"
+                    else:
+                        # Imported videos without a current-model result are new to this detector.
+                        reason = "new_video"
+                    result[int(row["video_pk"])] = reason
+        return result
+
     def claim_next_task_item(
         self,
         run_id: str,

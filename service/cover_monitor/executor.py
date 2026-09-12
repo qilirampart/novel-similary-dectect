@@ -111,6 +111,7 @@ class CoverRunExecutor:
                         should_cancel=lambda: self.should_stop() or self._control_requested(scope, run_id),
                     )
                 task_items: list[dict[str, Any]] = []
+                scanned_videos: list[tuple[int, bool]] = []
                 for video in collection.videos:
                     existing = self.store.get_video_by_identity(
                         scope,
@@ -127,10 +128,17 @@ class CoverRunExecutor:
                         thumbnail_url=video.thumbnail_url,
                         upload_date=video.upload_date,
                     )
-                    if existing is None or force_refresh:
+                    scanned_videos.append((int(saved["video_pk"]), existing is None))
+                existing_video_pks = [video_pk for video_pk, is_new in scanned_videos if not is_new]
+                scan_reasons = self.store.get_video_scan_reasons(scope, existing_video_pks)
+                for video_pk, is_new in scanned_videos:
+                    reason = "manual" if force_refresh else (
+                        "new_video" if is_new else scan_reasons.get(video_pk)
+                    )
+                    if reason is not None:
                         task_items.append({
-                            "video_pk": int(saved["video_pk"]),
-                            "reason": "manual" if force_refresh else "new_video",
+                            "video_pk": video_pk,
+                            "reason": reason,
                         })
                 self.store.enqueue_task_items(run_id, run_lease, task_items)
                 self.store.finish_run_channel(

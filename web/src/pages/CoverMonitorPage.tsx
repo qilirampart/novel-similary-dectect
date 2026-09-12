@@ -325,7 +325,7 @@ export function CoverMonitorPage() {
         <div className="cover-import-overlay" role="dialog" aria-modal="true" aria-label="新建封面巡检" onClick={() => !runBusy && setIsRunOpen(false)}>
           <section className="cover-import-dialog cover-run-dialog" onClick={(event) => event.stopPropagation()}>
             <header>
-              <div><span className="eyebrow">NEW INSPECTION</span><h2>新建封面巡检</h2><p>默认扫描全部在管频道，只处理新增视频；强制复检会重新检测已有视频。</p></div>
+              <div><span className="eyebrow">NEW INSPECTION</span><h2>新建封面巡检</h2><p>默认处理新增、尚未完成当前模型检测及上次结果未知的视频；强制复检会重新检测全部已有视频。</p></div>
               <button className="icon-button" type="button" aria-label="关闭新建巡检窗口" onClick={() => setIsRunOpen(false)} disabled={runBusy}>×</button>
             </header>
             <div className="cover-run-form">

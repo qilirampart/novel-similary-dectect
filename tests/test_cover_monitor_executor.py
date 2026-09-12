@@ -326,3 +326,120 @@ def test_cover_executor_cancel_during_review_keeps_completed_evidence_and_cancel
         assert conn.execute("SELECT status FROM cover_task_items").fetchone()[0] == "succeeded"
         assert conn.execute("SELECT COUNT(*) FROM cover_detections").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM cover_risk_cases").fetchone()[0] == 1
+
+
+def test_default_scan_processes_preimported_video_without_current_detection(tmp_path: Path) -> None:
+    store = CoverMonitorStore(tmp_path / "cover.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    channel = store.upsert_channel(
+        scope,
+        platform="youtube",
+        channel_id="UC-executor",
+        name="Executor Channel",
+        source_url="https://www.youtube.com/channel/UC-executor",
+    )
+    store.upsert_video(
+        scope,
+        channel_pk=channel["channel_pk"],
+        platform="youtube",
+        video_id="video-executor-001",
+        title="Imported before first inspection",
+        video_url="https://www.youtube.com/watch?v=video-executor-001",
+        thumbnail_url="https://i.ytimg.com/vi/video-executor-001/hqdefault.jpg",
+    )
+    run = store.create_run(
+        scope,
+        trigger_type="manual",
+        intensity="standard",
+        channel_pks=[channel["channel_pk"]],
+        params={"force_refresh": False},
+        model_snapshot={"provider": "fake", "model": "fake"},
+        prompt_version="cover-visible-evidence-v1",
+    )
+    reviewer = FakeReviewer()
+    executor = CoverRunExecutor(
+        store=store,
+        collector=FakeCollector(),
+        downloader=FakeDownloader(tmp_path / "assets"),
+        reviewer=reviewer,
+        worker_name="cover-worker-initial-scan",
+    )
+
+    result = executor.run_once()
+
+    assert result is not None and result["status"] == "completed"
+    assert result["total_item_count"] == 1
+    assert reviewer.calls == 1
+    with store._connect() as conn:
+        reason = conn.execute(
+            "SELECT reason FROM cover_task_items WHERE run_id = ?",
+            (run["run_id"],),
+        ).fetchone()[0]
+    assert reason == "new_video"
+
+
+def test_incremental_scan_skips_valid_detection_but_retries_latest_unknown(tmp_path: Path) -> None:
+    store, scope, first_run, reviewer, executor = _create_executor_fixture(tmp_path)
+    first_result = executor.run_once()
+    assert first_result is not None and first_result["status"] == "completed"
+    channel = store.list_channels(scope)[0]
+
+    second_run = store.create_run(
+        scope,
+        trigger_type="manual",
+        intensity="standard",
+        channel_pks=[channel["channel_pk"]],
+        params={"force_refresh": False},
+        model_snapshot={"provider": "fake", "model": "fake"},
+        prompt_version="cover-visible-evidence-v1",
+    )
+    second_result = executor.run_once()
+    assert second_result is not None and second_result["status"] == "completed"
+    assert second_result["total_item_count"] == 0
+    assert reviewer.calls == 1
+
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE cover_detections SET overall_risk = 'unknown' WHERE run_id = ?",
+            (first_run["run_id"],),
+        )
+    third_run = store.create_run(
+        scope,
+        trigger_type="manual",
+        intensity="standard",
+        channel_pks=[channel["channel_pk"]],
+        params={"force_refresh": False},
+        model_snapshot={"provider": "fake", "model": "fake"},
+        prompt_version="cover-visible-evidence-v1",
+    )
+    third_result = executor.run_once()
+
+    assert third_result is not None and third_result["status"] == "completed"
+    assert third_result["total_item_count"] == 1
+    assert reviewer.calls == 2
+    with store._connect() as conn:
+        reason = conn.execute(
+            "SELECT reason FROM cover_task_items WHERE run_id = ?",
+            (third_run["run_id"],),
+        ).fetchone()[0]
+    assert reason == "retry_unknown"
+
+    fourth_run = store.create_run(
+        scope,
+        trigger_type="manual",
+        intensity="standard",
+        channel_pks=[channel["channel_pk"]],
+        params={"force_refresh": True},
+        model_snapshot={"provider": "fake", "model": "fake"},
+        prompt_version="cover-visible-evidence-v1",
+    )
+    fourth_result = executor.run_once()
+
+    assert fourth_result is not None and fourth_result["total_item_count"] == 1
+    assert reviewer.calls == 3
+    with store._connect() as conn:
+        reason = conn.execute(
+            "SELECT reason FROM cover_task_items WHERE run_id = ?",
+            (fourth_run["run_id"],),
+        ).fetchone()[0]
+    assert reason == "manual"
