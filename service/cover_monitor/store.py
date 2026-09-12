@@ -1647,19 +1647,28 @@ class CoverMonitorStore:
     def finish_run_without_items(self, run_id: str, worker_lease_token: str) -> bool:
         now = _now()
         with self._connect() as conn:
-            failed_channels = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM cover_run_channels WHERE run_id = ? AND completeness = 'failed'",
-                    (_required_text(run_id, "run_id"),),
-                ).fetchone()[0]
-            )
-            total_channels = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM cover_run_channels WHERE run_id = ?",
-                    (run_id,),
-                ).fetchone()[0]
-            )
-            status = "failed" if total_channels > 0 and failed_channels == total_channels else "completed"
+            run_id = _required_text(run_id, "run_id")
+            channel_counts = conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN completeness = 'failed' THEN 1 ELSE 0 END) AS failed,
+                       SUM(CASE WHEN completeness = 'partial' THEN 1 ELSE 0 END) AS partial
+                  FROM cover_run_channels WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            total_channels = int(channel_counts["total"] or 0)
+            failed_channels = int(channel_counts["failed"] or 0)
+            partial_channels = int(channel_counts["partial"] or 0)
+            if total_channels > 0 and failed_channels == total_channels:
+                status = "failed"
+                status_message = "频道扫描全部失败"
+            elif failed_channels > 0 or partial_channels > 0:
+                status = "partial_failed"
+                status_message = "频道扫描不完整，未发现需要检测的新视频"
+            else:
+                status = "completed"
+                status_message = "未发现需要检测的新视频"
             updated = conn.execute(
                 """
                 UPDATE cover_runs
@@ -1671,7 +1680,7 @@ class CoverMonitorStore:
                 """,
                 (
                     status,
-                    "未发现需要检测的新视频" if status == "completed" else "频道扫描失败",
+                    status_message,
                     now,
                     now,
                     run_id,
@@ -1797,18 +1806,38 @@ class CoverMonitorStore:
             completed = int(counts["completed"] or 0)
             failed = int(counts["failed"] or 0)
             final_status: str | None = None
+            final_message: str | None = None
             if total > 0 and completed + failed == total:
-                final_status = "completed" if failed == 0 else ("failed" if completed == 0 else "partial_failed")
+                incomplete_channels = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM cover_run_channels
+                         WHERE run_id = ? AND completeness IN ('partial', 'failed')
+                        """,
+                        (run_id,),
+                    ).fetchone()[0]
+                )
+                if completed == 0:
+                    final_status = "failed"
+                    final_message = "检测失败"
+                elif failed > 0 or incomplete_channels > 0:
+                    final_status = "partial_failed"
+                    if failed > 0 and incomplete_channels > 0:
+                        final_message = "部分频道扫描不完整，且部分条目检测失败"
+                    elif incomplete_channels > 0:
+                        final_message = "部分频道扫描不完整"
+                    else:
+                        final_message = "部分条目检测失败"
+                else:
+                    final_status = "completed"
+                    final_message = "检测完成"
             conn.execute(
                 """
                 UPDATE cover_runs
                    SET total_item_count = ?, completed_item_count = ?, failed_item_count = ?,
                        status = CASE WHEN status = 'running' THEN COALESCE(?, status) ELSE status END,
-                       status_message = CASE
-                           WHEN status = 'running' AND ? = 'completed' THEN '检测完成'
-                           WHEN status = 'running' AND ? = 'partial_failed' THEN '部分条目检测失败'
-                           WHEN status = 'running' AND ? = 'failed' THEN '检测失败'
-                           ELSE status_message END,
+                       status_message = CASE WHEN status = 'running' AND ? IS NOT NULL
+                                             THEN ? ELSE status_message END,
                        worker_name = CASE
                            WHEN status = 'running' AND ? IS NOT NULL THEN NULL ELSE worker_name END,
                        worker_lease_token = CASE
@@ -1826,8 +1855,7 @@ class CoverMonitorStore:
                     failed,
                     final_status,
                     final_status,
-                    final_status,
-                    final_status,
+                    final_message,
                     final_status,
                     final_status,
                     final_status,

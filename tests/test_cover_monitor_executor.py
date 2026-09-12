@@ -14,8 +14,9 @@ from service.cover_monitor.store import CoverAccessScope, CoverMonitorStore
 
 
 class FakeCollector:
-    def __init__(self) -> None:
+    def __init__(self, video_id: str = "video-executor-001") -> None:
         self.calls = 0
+        self.video_id = video_id
 
     def collect(self, source_url: str, **_: object) -> ChannelCollectionResult:
         self.calls += 1
@@ -25,10 +26,10 @@ class FakeCollector:
             channel_name="Executor Channel",
             videos=(
                 CollectedCoverVideo(
-                    video_id="video-executor-001",
+                    video_id=self.video_id,
                     title="Potentially risky cover",
-                    video_url="https://www.youtube.com/watch?v=video-executor-001",
-                    thumbnail_url="https://i.ytimg.com/vi/video-executor-001/hqdefault.jpg",
+                    video_url=f"https://www.youtube.com/watch?v={self.video_id}",
+                    thumbnail_url=f"https://i.ytimg.com/vi/{self.video_id}/hqdefault.jpg",
                     channel_id="UC-executor",
                     channel_name="Executor Channel",
                     upload_date="20260912",
@@ -37,6 +38,24 @@ class FakeCollector:
             scopes_completed=("videos", "shorts"),
             scope_item_counts={"videos": 1, "shorts": 0},
             scope_errors={},
+        )
+
+
+class PartialCollector(FakeCollector):
+    def __init__(self, *, include_video: bool = True) -> None:
+        super().__init__()
+        self.include_video = include_video
+
+    def collect(self, source_url: str, **kwargs: object) -> ChannelCollectionResult:
+        complete = super().collect(source_url, **kwargs)
+        return ChannelCollectionResult(
+            source_url=complete.source_url,
+            channel_id=complete.channel_id,
+            channel_name=complete.channel_name,
+            videos=complete.videos if self.include_video else (),
+            scopes_completed=("videos",),
+            scope_item_counts={"videos": len(complete.videos) if self.include_video else 0},
+            scope_errors={"shorts": "Shorts 采集超时"},
         )
 
 
@@ -185,6 +204,43 @@ def test_cover_executor_persists_asset_detection_and_risk_case(tmp_path: Path) -
             "SELECT scan_status, completeness, discovered_count FROM cover_run_channels"
         ).fetchone()
         assert tuple(run_channel) == ("completed", "complete", 1)
+
+
+def test_partial_channel_scan_with_successful_item_marks_run_partial_failed(tmp_path: Path) -> None:
+    store, scope, run, reviewer, _ = _create_executor_fixture(tmp_path)
+    executor = CoverRunExecutor(
+        store=store,
+        collector=PartialCollector(),
+        downloader=FakeDownloader(tmp_path / "partial-assets"),
+        reviewer=reviewer,
+        worker_name="cover-worker-partial",
+    )
+
+    result = executor.run_once()
+
+    assert result is not None
+    assert result["status"] == "partial_failed"
+    assert result["completed_item_count"] == 1
+    assert result["failed_item_count"] == 0
+    assert "频道扫描不完整" in result["status_message"]
+
+
+def test_partial_channel_scan_without_items_does_not_report_completed(tmp_path: Path) -> None:
+    store, scope, run, _, _ = _create_executor_fixture(tmp_path)
+    executor = CoverRunExecutor(
+        store=store,
+        collector=PartialCollector(include_video=False),
+        downloader=FakeDownloader(tmp_path / "partial-empty-assets"),
+        reviewer=FakeReviewer(),
+        worker_name="cover-worker-partial-empty",
+    )
+
+    result = executor.run_once()
+
+    assert result is not None
+    assert result["status"] == "partial_failed"
+    assert result["total_item_count"] == 0
+    assert "频道扫描不完整" in result["status_message"]
 
 
 def test_cover_executor_retries_transient_review_failure_without_duplicate_asset(tmp_path: Path) -> None:
@@ -443,3 +499,43 @@ def test_incremental_scan_skips_valid_detection_but_retries_latest_unknown(tmp_p
             (fourth_run["run_id"],),
         ).fetchone()[0]
     assert reason == "manual"
+
+
+def test_incremental_scan_on_existing_channel_only_processes_new_video(tmp_path: Path) -> None:
+    store, scope, _, reviewer, executor = _create_executor_fixture(tmp_path)
+    first_result = executor.run_once()
+    assert first_result is not None and first_result["completed_item_count"] == 1
+
+    channel = store.list_channels(scope)[0]
+    second_run = store.create_run(
+        scope,
+        trigger_type="schedule",
+        intensity="standard",
+        channel_pks=[channel["channel_pk"]],
+        params={"force_refresh": False},
+        model_snapshot={"provider": "fake", "model": "fake"},
+        prompt_version="cover-visible-evidence-v1",
+    )
+    second_executor = CoverRunExecutor(
+        store=store,
+        collector=FakeCollector("video-executor-002"),
+        downloader=FakeDownloader(tmp_path / "second-assets"),
+        reviewer=reviewer,
+        worker_name="cover-worker-incremental",
+    )
+
+    second_result = second_executor.run_once()
+
+    assert second_result is not None
+    assert second_result["status"] == "completed"
+    assert second_result["total_item_count"] == 1
+    assert reviewer.calls == 2
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cover_videos").fetchone()[0] == 2
+        task = conn.execute(
+            "SELECT video.video_id, item.reason FROM cover_task_items AS item "
+            "JOIN cover_videos AS video ON video.video_pk = item.video_pk "
+            "WHERE item.run_id = ?",
+            (second_run["run_id"],),
+        ).fetchone()
+    assert tuple(task) == ("video-executor-002", "new_video")
