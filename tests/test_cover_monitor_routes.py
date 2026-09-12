@@ -10,6 +10,7 @@ from openpyxl import Workbook, load_workbook
 
 from api.cover_routes import build_cover_monitor_router
 from service.cover_monitor.store import CoverAccessScope, CoverMonitorStore
+from service.cover_monitor.storage import LocalCoverAssetStorage
 
 
 def test_cover_overview_uses_independent_empty_database(tmp_path: Path) -> None:
@@ -18,7 +19,7 @@ def test_cover_overview_uses_independent_empty_database(tmp_path: Path) -> None:
     app.include_router(
         build_cover_monitor_router(
             db_path=str(db_path),
-            asset_root=str(tmp_path / "assets"),
+            asset_storage=LocalCoverAssetStorage(tmp_path / "assets"),
             current_user_dependency=lambda: {"user_id": 7, "role": "operator"},
         )
     )

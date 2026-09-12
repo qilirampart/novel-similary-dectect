@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from service.cover_monitor.downloader import DownloadedCover
 from service.cover_monitor.executor import CoverRunExecutor
 from service.cover_monitor.reviewer import CoverDetectionResult, CoverReviewOutcome
 from service.cover_monitor.store import CoverAccessScope, CoverMonitorStore
+from service.cover_monitor.storage import LocalCoverAssetStorage
 
 
 class FakeCollector:
@@ -78,6 +80,39 @@ class FakeDownloader:
             local_path=str(path),
             storage_key=storage_key,
             content_sha256=self.content_sha256,
+            mime_type="image/jpeg",
+            byte_size=10,
+            width=1280,
+            height=720,
+        )
+
+
+class RecordingStorage(LocalCoverAssetStorage):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.materialize_calls: list[str] = []
+
+    @contextmanager
+    def materialize(self, storage_key: str):
+        self.materialize_calls.append(storage_key)
+        with super().materialize(storage_key) as path:
+            yield path
+
+
+class StorageBackedDownloader:
+    def __init__(self, storage: RecordingStorage) -> None:
+        self.storage = storage
+
+    def download(self, video_id: str, original_url: str = "") -> DownloadedCover:
+        storage_key = f"{video_id}/fake.jpg"
+        path = self.storage.put_bytes(storage_key, b"fake-image")
+        return DownloadedCover(
+            video_id=video_id,
+            original_url=original_url,
+            fetched_url=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+            local_path=str(path),
+            storage_key=storage_key,
+            content_sha256="a" * 64,
             mime_type="image/jpeg",
             byte_size=10,
             width=1280,
@@ -208,6 +243,24 @@ def test_cover_executor_persists_asset_detection_and_risk_case(tmp_path: Path) -
             "SELECT scan_status, completeness, discovered_count FROM cover_run_channels"
         ).fetchone()
         assert tuple(run_channel) == ("completed", "complete", 1)
+
+
+def test_cover_executor_materializes_asset_through_storage_backend(tmp_path: Path) -> None:
+    store, scope, run, reviewer, _ = _create_executor_fixture(tmp_path)
+    storage = RecordingStorage(tmp_path / "storage-assets")
+    executor = CoverRunExecutor(
+        store=store,
+        collector=FakeCollector(),
+        downloader=StorageBackedDownloader(storage),
+        reviewer=reviewer,
+        worker_name="cover-worker-storage",
+    )
+
+    result = executor.run_once()
+
+    assert result is not None and result["status"] == "completed"
+    assert storage.materialize_calls == ["video-executor-001/fake.jpg"]
+    assert store.get_run(scope, run["run_id"])["completed_item_count"] == 1
 
 
 def test_partial_channel_scan_with_successful_item_marks_run_partial_failed(tmp_path: Path) -> None:

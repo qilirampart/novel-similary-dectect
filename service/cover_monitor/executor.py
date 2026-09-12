@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from service.cover_monitor.collector import CoverCollectionCancelled
 from service.cover_monitor.downloader import CoverDownloadError
@@ -220,7 +220,6 @@ class CoverRunExecutor:
                 context["stage"] = "review"
             if asset is None:
                 raise RuntimeError("cover asset is missing before review")
-            image_path = self._asset_path(asset)
             attempt = self.store.start_task_attempt(
                 task_item_id,
                 item_lease,
@@ -230,11 +229,12 @@ class CoverRunExecutor:
             if attempt is None:
                 return False
             with self._item_heartbeat(str(run["run_id"]), run_lease, task_item_id, item_lease):
-                outcome = self.reviewer.review(
-                    image_path=image_path,
-                    video_title=str(context["title"]),
-                    intensity=str(run["intensity"]),
-                )
+                with self._materialized_asset(asset) as image_path:
+                    outcome = self.reviewer.review(
+                        image_path=image_path,
+                        video_title=str(context["title"]),
+                        intensity=str(run["intensity"]),
+                    )
             self.store.finish_task_attempt(
                 int(attempt["attempt_id"]),
                 succeeded=outcome.status == "succeeded" and outcome.result is not None,
@@ -306,6 +306,15 @@ class CoverRunExecutor:
         if root is None:
             raise RuntimeError("downloader does not expose its asset root")
         return Path(root) / str(asset["storage_key"])
+
+    @contextmanager
+    def _materialized_asset(self, asset: dict[str, Any]) -> Iterator[Path]:
+        storage = getattr(self.downloader, "storage", None)
+        if storage is not None:
+            with storage.materialize(str(asset["storage_key"])) as path:
+                yield Path(path)
+            return
+        yield self._asset_path(asset)
 
     def _wait_for_retry(
         self,

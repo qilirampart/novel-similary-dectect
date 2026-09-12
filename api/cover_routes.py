@@ -10,13 +10,19 @@ from zipfile import BadZipFile
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from openpyxl.utils.exceptions import InvalidFileException
 from pydantic import BaseModel, Field, PositiveInt
 
 from service.cover_monitor.prompts import PROMPT_VERSION
 from service.cover_monitor.exporter import build_cover_report_xlsx
 from service.cover_monitor.store import CoverAccessScope, CoverMonitorStore
+from service.cover_monitor.storage import (
+    CoverAssetNotFoundError,
+    CoverAssetStorage,
+    CoverAssetStorageError,
+    LocalCoverAssetStorage,
+)
 
 
 INTERNAL_WORKSPACE_KEY = "internal"
@@ -221,6 +227,7 @@ def build_cover_monitor_router(
     db_path: str,
     import_root: str = "runtime/cover_monitor/imports",
     asset_root: str = "runtime/cover_monitor/assets",
+    asset_storage: CoverAssetStorage | None = None,
     export_root: str = "runtime/cover_monitor/exports",
     import_max_bytes: int = 150 * 1024 * 1024,
     current_user_dependency: Callable[..., dict[str, Any]],
@@ -229,6 +236,7 @@ def build_cover_monitor_router(
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1/cover-monitor", tags=["cover-monitor"])
     store = CoverMonitorStore(db_path)
+    storage = asset_storage or LocalCoverAssetStorage(asset_root)
 
     @router.get("/overview", response_model=CoverOverviewResponse)
     def get_overview(
@@ -422,25 +430,26 @@ def build_cover_monitor_router(
             raise HTTPException(status_code=404, detail="封面风险案件不存在")
         return CoverRiskCaseDetailResponse.model_validate(result)
 
-    @router.get("/risk-cases/{case_id}/assets/{asset_id}", response_class=FileResponse)
+    @router.get("/risk-cases/{case_id}/assets/{asset_id}")
     def get_risk_case_asset(
         case_id: str,
         asset_id: str,
         user: dict[str, Any] = Depends(current_user_dependency),
-    ) -> FileResponse:
+    ) -> Response:
         asset = store.get_risk_case_asset(access_scope(user), case_id, asset_id)
         if asset is None:
             raise HTTPException(status_code=404, detail="封面证据不存在")
-        root = Path(asset_root).resolve()
-        target = (root / str(asset["storage_key"])).resolve()
         try:
-            target.relative_to(root)
-        except ValueError as exc:
+            delivery = storage.delivery(str(asset["storage_key"]), expires_seconds=300)
+        except (CoverAssetNotFoundError, CoverAssetStorageError, ValueError) as exc:
             raise HTTPException(status_code=404, detail="封面证据不存在") from exc
-        if not target.is_file():
-            raise HTTPException(status_code=404, detail="封面证据文件缺失")
+        if delivery.kind == "redirect":
+            parts = urlsplit(delivery.location)
+            if parts.scheme != "https" or not parts.hostname:
+                raise HTTPException(status_code=404, detail="封面证据不存在")
+            return RedirectResponse(delivery.location, status_code=307)
         return FileResponse(
-            path=target,
+            path=delivery.location,
             media_type=str(asset["mime_type"]),
         )
 

@@ -8,9 +8,10 @@ import re
 from typing import Any, Optional
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
-from uuid import uuid4
 
 from PIL import Image, UnidentifiedImageError
+
+from service.cover_monitor.storage import CoverAssetStorage, LocalCoverAssetStorage
 
 
 class CoverDownloadError(RuntimeError):
@@ -40,8 +41,9 @@ class YouTubeCoverDownloader:
 
     def __init__(
         self,
-        asset_root: str | Path,
+        asset_root: str | Path | None = None,
         *,
+        storage: CoverAssetStorage | None = None,
         proxy_url: str = "",
         timeout_seconds: float = 30,
         max_bytes: int = 12 * 1024 * 1024,
@@ -50,7 +52,12 @@ class YouTubeCoverDownloader:
         min_height: int = 100,
         opener: Any = None,
     ) -> None:
-        self.asset_root = Path(asset_root)
+        if storage is None:
+            if asset_root is None:
+                raise ValueError("asset_root or storage is required")
+            storage = LocalCoverAssetStorage(asset_root)
+        self.storage = storage
+        self.asset_root = getattr(storage, "root", None)
         self.proxy_url = str(proxy_url or "").strip()
         self.timeout_seconds = max(float(timeout_seconds), 1)
         self.max_bytes = max(int(max_bytes), 1024)
@@ -112,12 +119,7 @@ class YouTubeCoverDownloader:
         suffix = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}[image_format]
         digest = sha256(content).hexdigest()
         storage_key = f"{video_id}/{digest}{suffix}"
-        target = self.asset_root / storage_key
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if not target.is_file():
-            temporary = target.with_suffix(f"{target.suffix}.part-{uuid4().hex}")
-            temporary.write_bytes(content)
-            temporary.replace(target)
+        target = self.storage.put_bytes(storage_key, content)
         return DownloadedCover(
             video_id=video_id,
             original_url=str(original_url),

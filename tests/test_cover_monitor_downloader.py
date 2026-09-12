@@ -7,6 +7,7 @@ from PIL import Image
 import pytest
 
 from service.cover_monitor.downloader import CoverDownloadError, YouTubeCoverDownloader
+from service.cover_monitor.storage import LocalCoverAssetStorage
 
 
 def _jpeg(width: int = 480, height: int = 360) -> bytes:
@@ -97,3 +98,17 @@ def test_downloader_rejects_untrusted_final_redirect(tmp_path: Path) -> None:
     ])
     with pytest.raises(CoverDownloadError):
         YouTubeCoverDownloader(tmp_path, opener=opener).download("video001")
+
+
+def test_downloader_can_persist_through_an_injected_storage_backend(tmp_path: Path) -> None:
+    video_id = "video001"
+    url = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    storage = LocalCoverAssetStorage(tmp_path / "backend-assets")
+    opener = FakeOpener([FakeResponse(_jpeg(), url=url)])
+    downloader = YouTubeCoverDownloader(storage=storage, opener=opener)
+
+    result = downloader.download(video_id, url)
+
+    assert downloader.storage is storage
+    assert Path(result.local_path) == storage.resolve_local_path(result.storage_key)
+    assert Path(result.local_path).is_file()
