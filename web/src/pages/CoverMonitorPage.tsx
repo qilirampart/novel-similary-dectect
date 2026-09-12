@@ -5,10 +5,14 @@ import {
   controlCoverMonitorRun,
   createCoverMonitorRun,
   getCoverMonitorOverview,
+  getCoverMonitorRunDetail,
+  listCoverMonitorRuns,
   previewCoverMonitorImport,
   type CoverImportKind,
   type CoverImportResponse,
-  type CoverMonitorOverviewResponse
+  type CoverMonitorOverviewResponse,
+  type CoverRunDetailResponse,
+  type CoverRunSummary
 } from "../api";
 import { Icon } from "../icons";
 
@@ -23,6 +27,7 @@ const EMPTY_OVERVIEW: CoverMonitorOverviewResponse = {
 };
 
 const tabs = ["工作台", "频道清单", "巡检批次", "风险复核", "历史整改"];
+const enabledTabs = new Set(["工作台", "巡检批次"]);
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat("zh-CN").format(Math.max(Number(value) || 0, 0));
@@ -50,7 +55,21 @@ function statusLabel(status: string): string {
   return labels[status] || status || "未知";
 }
 
+function reasonLabel(reason: string): string {
+  return ({
+    new_video: "新增/首次检测",
+    historical_risk: "历史风险复测",
+    retry_unknown: "异常结果重试",
+    manual: "手动强制复检"
+  } as Record<string, string>)[reason] || reason;
+}
+
+function stageLabel(stage: string): string {
+  return ({ download: "下载封面", review: "模型检测", persist: "保存结果" } as Record<string, string>)[stage] || stage;
+}
+
 export function CoverMonitorPage() {
+  const [activeTab, setActiveTab] = useState("工作台");
   const [overview, setOverview] = useState<CoverMonitorOverviewResponse>(EMPTY_OVERVIEW);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -62,6 +81,12 @@ export function CoverMonitorPage() {
   const [runMaxItems, setRunMaxItems] = useState(0);
   const [runBusy, setRunBusy] = useState(false);
   const [runError, setRunError] = useState("");
+  const [runs, setRuns] = useState<CoverRunSummary[]>([]);
+  const [runTotal, setRunTotal] = useState(0);
+  const [selectedRunId, setSelectedRunId] = useState("");
+  const [runDetail, setRunDetail] = useState<CoverRunDetailResponse | null>(null);
+  const [runListLoading, setRunListLoading] = useState(false);
+  const [itemOffset, setItemOffset] = useState(0);
   const [importKind, setImportKind] = useState<CoverImportKind>("channels");
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importPreview, setImportPreview] = useState<CoverImportResponse | null>(null);
@@ -69,6 +94,7 @@ export function CoverMonitorPage() {
   const [importBusy, setImportBusy] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const runDetailRequestRef = useRef(0);
 
   async function loadOverview(silent = false) {
     if (!silent) setLoading(true);
@@ -93,6 +119,59 @@ export function CoverMonitorPage() {
     const timer = window.setInterval(() => void loadOverview(true), 2000);
     return () => window.clearInterval(timer);
   }, [overview.latest_run?.status]);
+
+  async function loadRunDetail(runId: string, offset = 0, silent = false) {
+    const requestId = ++runDetailRequestRef.current;
+    if (!silent) {
+      setSelectedRunId(runId);
+      setRunListLoading(true);
+      setError("");
+    }
+    try {
+      const detail = await getCoverMonitorRunDetail(runId, 50, offset);
+      if (requestId !== runDetailRequestRef.current) return;
+      setRunDetail(detail);
+      setItemOffset(offset);
+      setError("");
+    } catch (detailError) {
+      if (requestId !== runDetailRequestRef.current || silent) return;
+      setError(detailError instanceof Error ? detailError.message : "巡检批次详情加载失败");
+    } finally {
+      if (!silent && requestId === runDetailRequestRef.current) setRunListLoading(false);
+    }
+  }
+
+  async function loadRuns() {
+    setRunListLoading(true);
+    setError("");
+    try {
+      const response = await listCoverMonitorRuns(50, 0);
+      setRuns(response.items);
+      setRunTotal(response.total);
+      const selectedStillVisible = response.items.some((item) => item.run_id === selectedRunId);
+      const targetRunId = selectedStillVisible ? selectedRunId : response.items[0]?.run_id || "";
+      if (targetRunId) await loadRunDetail(targetRunId, targetRunId === selectedRunId ? itemOffset : 0);
+      else {
+        setSelectedRunId("");
+        setRunDetail(null);
+      }
+    } catch (listError) {
+      setError(listError instanceof Error ? listError.message : "巡检批次加载失败");
+    } finally {
+      setRunListLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (activeTab === "巡检批次") void loadRuns();
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== "巡检批次" || !selectedRunId || !runDetail) return;
+    if (!["queued", "running", "pause_requested", "cancel_requested"].includes(runDetail.run.status)) return;
+    const timer = window.setInterval(() => void loadRunDetail(selectedRunId, itemOffset, true), 2000);
+    return () => window.clearInterval(timer);
+  }, [activeTab, selectedRunId, itemOffset, runDetail?.run.status]);
 
   async function createRun() {
     setRunBusy(true);
@@ -211,20 +290,21 @@ export function CoverMonitorPage() {
       </header>
 
       <nav className="cover-monitor-tabs" aria-label="封面巡检模块">
-        {tabs.map((tab, index) => (
-          <button key={tab} type="button" className={index === 0 ? "active" : ""} disabled={index !== 0}>
-            {tab}{index !== 0 && <small>待接入</small>}
+        {tabs.map((tab) => (
+          <button key={tab} type="button" className={activeTab === tab ? "active" : ""} disabled={!enabledTabs.has(tab)} onClick={() => setActiveTab(tab)}>
+            {tab}{!enabledTabs.has(tab) && <small>待接入</small>}
           </button>
         ))}
       </nav>
 
       {error && (
         <div className="cover-monitor-error" role="alert">
-          <div><strong>概览加载失败</strong><span>{error}</span></div>
-          <button className="ghost-button slim" type="button" onClick={() => void loadOverview()}>重新加载</button>
+          <div><strong>页面数据加载失败</strong><span>{error}</span></div>
+          <button className="ghost-button slim" type="button" onClick={() => void (activeTab === "巡检批次" ? loadRuns() : loadOverview())}>重新加载</button>
         </div>
       )}
 
+      {activeTab === "工作台" ? <>
       <section className="cover-monitor-kpis" aria-label="封面巡检概览">
         <article>
           <div className="cover-kpi-icon green"><Icon name="queue" /></div>
@@ -320,6 +400,68 @@ export function CoverMonitorPage() {
           </div>
         </div>
       </section>
+      </> : (
+        <section className="cover-run-browser">
+          <aside className="card-panel cover-run-list">
+            <div className="section-heading">
+              <div><h2>巡检批次</h2><p>共 {formatNumber(runTotal)} 个批次</p></div>
+              <button className="ghost-button slim" type="button" disabled={runListLoading} onClick={() => void loadRuns()}>刷新</button>
+            </div>
+            <div className="cover-run-list-items">
+              {runs.map((item) => (
+                <button key={item.run_id} type="button" className={selectedRunId === item.run_id ? "active" : ""} onClick={() => void loadRunDetail(item.run_id, 0)}>
+                  <span><strong>{item.run_id.slice(0, 8)}</strong><i className={item.status}>{statusLabel(item.status)}</i></span>
+                  <small>{item.total_channel_count} 个频道 · {item.completed_item_count + item.failed_item_count}/{item.total_item_count} 条</small>
+                  <time>{new Date(item.created_at).toLocaleString("zh-CN")}</time>
+                </button>
+              ))}
+              {!runListLoading && runs.length === 0 && <div className="cover-run-list-empty">尚无巡检批次</div>}
+            </div>
+          </aside>
+
+          <article className="card-panel cover-run-detail">
+            {runDetail ? <>
+              <div className="section-heading">
+                <div><h2>批次 {runDetail.run.run_id.slice(0, 8)}</h2><p>{runDetail.run.status_message || "等待状态更新"}</p></div>
+                <span className={`cover-run-status ${runDetail.run.status}`}>{statusLabel(runDetail.run.status)}</span>
+              </div>
+              <div className="cover-run-detail-summary">
+                <div><span>频道</span><strong>{runDetail.channels.length}</strong></div>
+                <div><span>任务项</span><strong>{formatNumber(runDetail.item_total)}</strong></div>
+                <div><span>已完成</span><strong>{formatNumber(runDetail.run.completed_item_count)}</strong></div>
+                <div><span>失败</span><strong>{formatNumber(runDetail.run.failed_item_count)}</strong></div>
+              </div>
+              <div className="cover-run-channel-strip">
+                {runDetail.channels.map((channel) => (
+                  <div key={channel.run_channel_id} className={channel.completeness}>
+                    <span><strong>{channel.channel_name}</strong><i>{channel.completeness === "complete" ? "完整" : channel.completeness === "partial" ? "部分完成" : channel.completeness === "failed" ? "失败" : "待扫描"}</i></span>
+                    <small>发现 {formatNumber(channel.discovered_count)} 条{channel.error_message ? ` · ${channel.error_message}` : ""}</small>
+                  </div>
+                ))}
+              </div>
+              <div className="cover-run-item-table">
+                <div className="cover-run-item-head"><span>视频</span><span>入队原因</span><span>阶段/状态</span><span>检测结果</span></div>
+                {runDetail.items.map((item) => (
+                  <div className="cover-run-item-row" key={item.task_item_id}>
+                    <div><strong title={item.video_title}>{item.video_title}</strong><small>{item.video_id}</small></div>
+                    <span>{reasonLabel(item.reason)}</span>
+                    <div><strong>{stageLabel(item.stage)}</strong><small>{statusLabel(item.status)} · 尝试 {item.attempts}</small></div>
+                    <div>
+                      <strong>{item.overall_risk ? ({ safe: "安全", review: "待复核", risk: "风险", unknown: "异常" } as Record<string, string>)[item.overall_risk] : "待检测"}</strong>
+                      <small title={item.error_message || item.summary || ""}>{item.confidence == null ? item.error_message || "暂无结果" : `置信度 ${(item.confidence * 100).toFixed(0)}%${item.summary ? ` · ${item.summary}` : ""}`}</small>
+                    </div>
+                  </div>
+                ))}
+                {runDetail.items.length === 0 && <div className="cover-run-detail-empty">{runListLoading ? "正在加载..." : "该批次尚未生成视频任务项"}</div>}
+              </div>
+              <div className="cover-run-pagination">
+                <span>第 {runDetail.item_total === 0 ? 0 : itemOffset + 1}-{Math.min(itemOffset + runDetail.item_limit, runDetail.item_total)} 条，共 {formatNumber(runDetail.item_total)} 条</span>
+                <div><button className="outline-button slim" type="button" disabled={itemOffset <= 0 || runListLoading} onClick={() => void loadRunDetail(runDetail.run.run_id, Math.max(itemOffset - 50, 0))}>上一页</button><button className="outline-button slim" type="button" disabled={itemOffset + runDetail.item_limit >= runDetail.item_total || runListLoading} onClick={() => void loadRunDetail(runDetail.run.run_id, itemOffset + 50)}>下一页</button></div>
+              </div>
+            </> : <div className="cover-run-detail-empty">{runListLoading ? "正在加载批次..." : "从左侧选择一个巡检批次"}</div>}
+          </article>
+        </section>
+      )}
 
       {isRunOpen && (
         <div className="cover-import-overlay" role="dialog" aria-modal="true" aria-label="新建封面巡检" onClick={() => !runBusy && setIsRunOpen(false)}>

@@ -34,6 +34,47 @@ export type CoverRunSummary = {
   finished_at?: string | null;
 };
 
+export type CoverRunListResponse = {
+  items: CoverRunSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export type CoverRunDetailResponse = {
+  run: CoverRunSummary;
+  channels: Array<{
+    run_channel_id: number;
+    channel_pk: number;
+    channel_name: string;
+    source_url: string;
+    scan_status: string;
+    completeness: string;
+    discovered_count: number;
+    error_message?: string | null;
+  }>;
+  items: Array<{
+    task_item_id: number;
+    video_pk: number;
+    video_id: string;
+    video_title: string;
+    video_url: string;
+    thumbnail_url: string;
+    reason: string;
+    stage: string;
+    status: string;
+    attempts: number;
+    error_type?: string | null;
+    error_message?: string | null;
+    overall_risk?: string | null;
+    confidence?: number | null;
+    summary?: string | null;
+  }>;
+  item_total: number;
+  item_limit: number;
+  item_offset: number;
+};
+
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const LONG_REQUEST_TIMEOUT_MS = 60_000;
 const DOWNLOAD_REQUEST_TIMEOUT_MS = 120_000;
@@ -633,6 +674,27 @@ export function controlCoverMonitorRun(
   return requestJson<CoverRunSummary>(
     `/api/v1/cover-monitor/runs/${encodeURIComponent(runId)}/${action}`,
     { method: "POST", timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS }
+  );
+}
+
+export function listCoverMonitorRuns(limit = 50, offset = 0): Promise<CoverRunListResponse> {
+  return requestJson<CoverRunListResponse>("/api/v1/cover-monitor/runs", {
+    query: { limit, offset },
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+  });
+}
+
+export function getCoverMonitorRunDetail(
+  runId: string,
+  itemLimit = 50,
+  itemOffset = 0
+): Promise<CoverRunDetailResponse> {
+  return requestJson<CoverRunDetailResponse>(
+    `/api/v1/cover-monitor/runs/${encodeURIComponent(runId)}/detail`,
+    {
+      query: { item_limit: itemLimit, item_offset: itemOffset },
+      timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+    }
   );
 }
 
