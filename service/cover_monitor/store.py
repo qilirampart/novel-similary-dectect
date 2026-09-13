@@ -1996,6 +1996,50 @@ class CoverMonitorStore:
             "offset": safe_offset,
         }
 
+    def get_asset_lifecycle_record(
+        self,
+        scope: CoverAccessScope,
+        asset_id: str,
+    ) -> dict[str, Any] | None:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        normalized_asset_id = _required_text(asset_id, "asset_id")
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT asset.asset_id, asset.video_pk, asset.content_sha256,
+                       asset.storage_backend, asset.storage_key, asset.byte_size,
+                       asset.fetched_at,
+                       EXISTS (
+                           SELECT 1
+                             FROM cover_case_events AS event
+                             JOIN cover_detections AS detection
+                               ON detection.detection_id = event.detection_id
+                            WHERE detection.asset_id = asset.asset_id
+                       ) AS is_case_evidence,
+                       EXISTS (
+                           SELECT 1 FROM cover_detections AS detection
+                            WHERE detection.asset_id = asset.asset_id
+                              AND detection.overall_risk IN ('review', 'risk', 'unknown')
+                       ) AS has_sensitive_detection,
+                       EXISTS (
+                           SELECT 1 FROM cover_detections AS detection
+                            WHERE detection.asset_id = asset.asset_id
+                              AND detection.overall_risk = 'safe'
+                       ) AS has_safe_detection,
+                       asset.asset_id = (
+                           SELECT candidate.asset_id FROM cover_assets AS candidate
+                            WHERE candidate.workspace_key = asset.workspace_key
+                              AND candidate.video_pk = asset.video_pk
+                            ORDER BY candidate.fetched_at DESC, candidate.asset_id DESC
+                            LIMIT 1
+                       ) AS is_latest_for_video
+                  FROM cover_assets AS asset
+                 WHERE asset.asset_id = ? AND asset.workspace_key = ?
+                """,
+                (normalized_asset_id, workspace_key),
+            ).fetchone()
+        return self._row(row)
+
     def register_cleanup_plan(
         self,
         scope: CoverAccessScope,
