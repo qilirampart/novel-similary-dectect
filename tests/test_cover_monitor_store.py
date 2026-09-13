@@ -36,7 +36,7 @@ def test_init_cover_db_is_idempotent_and_enables_required_tables(tmp_path: Path)
             ).fetchall()
         }
 
-    assert version == 8
+    assert version == 9
     assert "idx_cover_runs_claim" in indexes
     assert "idx_cover_task_items_run_claim" in indexes
     assert "uq_cover_detections_task_item" in indexes
@@ -55,6 +55,8 @@ def test_init_cover_db_is_idempotent_and_enables_required_tables(tmp_path: Path)
         "cover_case_events",
         "cover_import_conflicts",
         "cover_historical_observations",
+        "cover_cleanup_runs",
+        "cover_cleanup_items",
     }.issubset(tables)
 
 
@@ -96,7 +98,77 @@ def test_init_cover_db_migrates_existing_assets_to_local_storage_backend(tmp_pat
         ).fetchone()[0]
         version = conn.execute("SELECT MAX(version) FROM cover_schema_versions").fetchone()[0]
     assert backend == "local"
-    assert version == 8
+    assert version == 9
+
+
+def test_cleanup_plan_registration_is_workspace_scoped_and_auditable(tmp_path: Path) -> None:
+    store = CoverMonitorStore(tmp_path / "cover-monitor.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+
+    cleanup = store.register_cleanup_plan(
+        scope,
+        cleanup_kind="staging",
+        manifest_path="manifests/staging-20260913.csv",
+        manifest_sha256="a" * 64,
+        policy={"stale_hours": 24},
+        total_count=9,
+        candidate_items=[
+            {
+                "item_key": f"video001/{'b' * 64}.jpg",
+                "reason": "staging_retention_expired",
+                "byte_size": 2048,
+            }
+        ],
+    )
+
+    assert cleanup["workspace_key"] == "internal"
+    assert cleanup["cleanup_kind"] == "staging"
+    assert cleanup["status"] == "planned"
+    assert cleanup["total_count"] == 9
+    assert cleanup["candidate_count"] == 1
+    assert cleanup["candidate_bytes"] == 2048
+    assert cleanup["created_by_user_id"] == 7
+    assert cleanup["policy"] == {"stale_hours": 24}
+    assert cleanup["items"] == [
+        {
+            "item_key": f"video001/{'b' * 64}.jpg",
+            "reason": "staging_retention_expired",
+            "byte_size": 2048,
+            "execution_status": "pending",
+            "result_message": None,
+            "executed_at": None,
+        }
+    ]
+
+
+def test_cleanup_plan_registration_rejects_invalid_digest_and_duplicate_items(
+    tmp_path: Path,
+) -> None:
+    store = CoverMonitorStore(tmp_path / "cover-monitor.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+
+    with pytest.raises(ValueError, match="manifest_sha256"):
+        store.register_cleanup_plan(
+            scope,
+            cleanup_kind="asset",
+            manifest_path="manifest.csv",
+            manifest_sha256="not-a-digest",
+            policy={},
+            total_count=0,
+            candidate_items=[],
+        )
+
+    duplicate = {"item_key": "asset-1", "reason": "expired", "byte_size": 1}
+    with pytest.raises(ValueError, match="duplicate"):
+        store.register_cleanup_plan(
+            scope,
+            cleanup_kind="asset",
+            manifest_path="manifest.csv",
+            manifest_sha256="c" * 64,
+            policy={},
+            total_count=2,
+            candidate_items=[duplicate, duplicate],
+        )
 
 
 def test_channel_and_video_identity_are_unique_inside_workspace(tmp_path: Path) -> None:

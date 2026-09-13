@@ -374,3 +374,46 @@ CREATE TABLE IF NOT EXISTS cover_report_exports (
     finished_at TEXT,
     FOREIGN KEY (run_id) REFERENCES cover_runs (run_id)
 );
+
+CREATE TABLE IF NOT EXISTS cover_cleanup_runs (
+    cleanup_run_id TEXT PRIMARY KEY,
+    workspace_key TEXT NOT NULL,
+    cleanup_kind TEXT NOT NULL CHECK (cleanup_kind IN ('asset', 'staging')),
+    manifest_path TEXT NOT NULL,
+    manifest_sha256 TEXT NOT NULL,
+    policy_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN (
+        'planned', 'approved', 'running', 'completed', 'partial_failed', 'cancelled'
+    )),
+    total_count INTEGER NOT NULL CHECK (total_count >= 0),
+    candidate_count INTEGER NOT NULL CHECK (candidate_count >= 0),
+    candidate_bytes INTEGER NOT NULL CHECK (candidate_bytes >= 0),
+    created_by_user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    approved_by_user_id INTEGER,
+    approved_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    UNIQUE (workspace_key, cleanup_kind, manifest_sha256)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cover_cleanup_runs_workspace_created
+    ON cover_cleanup_runs (workspace_key, created_at DESC, cleanup_run_id DESC);
+
+CREATE TABLE IF NOT EXISTS cover_cleanup_items (
+    cleanup_item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cleanup_run_id TEXT NOT NULL,
+    item_key TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+    execution_status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        execution_status IN ('pending', 'skipped', 'deleted', 'failed')
+    ),
+    result_message TEXT,
+    executed_at TEXT,
+    UNIQUE (cleanup_run_id, item_key),
+    FOREIGN KEY (cleanup_run_id) REFERENCES cover_cleanup_runs (cleanup_run_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cover_cleanup_items_run_status
+    ON cover_cleanup_items (cleanup_run_id, execution_status, cleanup_item_id);

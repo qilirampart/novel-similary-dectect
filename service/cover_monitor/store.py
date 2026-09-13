@@ -17,7 +17,7 @@ except Exception:
 
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 DEFAULT_BUSY_TIMEOUT_MS = 30_000
 
 
@@ -1995,6 +1995,121 @@ class CoverMonitorStore:
             "limit": safe_limit,
             "offset": safe_offset,
         }
+
+    def register_cleanup_plan(
+        self,
+        scope: CoverAccessScope,
+        *,
+        cleanup_kind: str,
+        manifest_path: str,
+        manifest_sha256: str,
+        policy: dict[str, Any],
+        total_count: int,
+        candidate_items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        normalized_kind = _required_text(cleanup_kind, "cleanup_kind")
+        if normalized_kind not in {"asset", "staging"}:
+            raise ValueError("unsupported cleanup_kind")
+        normalized_manifest_path = _required_text(manifest_path, "manifest_path")
+        if len(normalized_manifest_path) > 4096:
+            raise ValueError("manifest_path is too long")
+        normalized_digest = str(manifest_sha256 or "").strip().lower()
+        if re.fullmatch(r"[a-f0-9]{64}", normalized_digest) is None:
+            raise ValueError("manifest_sha256 must be a lowercase SHA-256 digest")
+        if not isinstance(policy, dict):
+            raise ValueError("policy must be an object")
+        try:
+            policy_json = json.dumps(
+                policy,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("policy must be JSON serializable") from exc
+
+        normalized_total = int(total_count)
+        if normalized_total < 0:
+            raise ValueError("total_count must not be negative")
+        normalized_items: list[tuple[str, str, int]] = []
+        seen_keys: set[str] = set()
+        for item in candidate_items:
+            if not isinstance(item, dict):
+                raise ValueError("candidate item must be an object")
+            item_key = _required_text(str(item.get("item_key") or ""), "item_key")
+            if len(item_key) > 2048:
+                raise ValueError("item_key is too long")
+            if item_key in seen_keys:
+                raise ValueError("duplicate cleanup item_key")
+            seen_keys.add(item_key)
+            reason = _required_text(str(item.get("reason") or ""), "reason")[:200]
+            byte_size = int(item.get("byte_size", 0))
+            if byte_size < 0:
+                raise ValueError("byte_size must not be negative")
+            normalized_items.append((item_key, reason, byte_size))
+        if len(normalized_items) > normalized_total:
+            raise ValueError("candidate_count must not exceed total_count")
+
+        cleanup_run_id = str(uuid4())
+        created_at = _now()
+        candidate_bytes = sum(item[2] for item in normalized_items)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO cover_cleanup_runs (
+                    cleanup_run_id, workspace_key, cleanup_kind, manifest_path,
+                    manifest_sha256, policy_json, status, total_count,
+                    candidate_count, candidate_bytes, created_by_user_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?)
+                """,
+                (
+                    cleanup_run_id,
+                    workspace_key,
+                    normalized_kind,
+                    normalized_manifest_path,
+                    normalized_digest,
+                    policy_json,
+                    normalized_total,
+                    len(normalized_items),
+                    candidate_bytes,
+                    int(scope.user_id),
+                    created_at,
+                ),
+            )
+            conn.executemany(
+                """
+                INSERT INTO cover_cleanup_items (
+                    cleanup_run_id, item_key, reason, byte_size
+                ) VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (cleanup_run_id, item_key, reason, byte_size)
+                    for item_key, reason, byte_size in normalized_items
+                ],
+            )
+            row = conn.execute(
+                "SELECT * FROM cover_cleanup_runs WHERE cleanup_run_id = ?",
+                (cleanup_run_id,),
+            ).fetchone()
+            item_rows = conn.execute(
+                """
+                SELECT item_key, reason, byte_size, execution_status,
+                       result_message, executed_at
+                  FROM cover_cleanup_items
+                 WHERE cleanup_run_id = ?
+                 ORDER BY cleanup_item_id
+                """,
+                (cleanup_run_id,),
+            ).fetchall()
+        result = self._row(row)
+        if result is None:
+            raise RuntimeError("cleanup plan registration did not return a row")
+        result["policy"] = json.loads(str(result.pop("policy_json")))
+        result["items"] = [dict(item) for item in item_rows]
+        return result
 
     def start_task_attempt(
         self,
