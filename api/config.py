@@ -8,6 +8,7 @@ from typing import Optional
 
 from service.drama_subtitle_semantic_retrieval import DramaSubtitleSemanticConfig
 from service.semantic_retrieval import SemanticRetrievalConfig
+from service.cover_monitor.storage import CoverAssetStorage, OssObjectClient, build_cover_asset_storage
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -56,6 +57,24 @@ class ApiSettings:
     )
     cover_monitor_asset_root: str = os.environ.get(
         "COVER_MONITOR_ASSET_ROOT", "runtime/cover_monitor/assets"
+    )
+    cover_monitor_storage_backend: str = os.environ.get(
+        "COVER_MONITOR_STORAGE_BACKEND", "local"
+    )
+    cover_monitor_staging_root: str = os.environ.get(
+        "COVER_MONITOR_STAGING_ROOT", "runtime/cover_monitor/staging"
+    )
+    cover_monitor_oss_region: str = os.environ.get("COVER_MONITOR_OSS_REGION", "")
+    cover_monitor_oss_endpoint: str = os.environ.get("COVER_MONITOR_OSS_ENDPOINT", "")
+    cover_monitor_oss_bucket: str = os.environ.get("COVER_MONITOR_OSS_BUCKET", "")
+    cover_monitor_oss_prefix: str = os.environ.get(
+        "COVER_MONITOR_OSS_PREFIX", "cover-monitor/v1"
+    )
+    cover_monitor_oss_credential_mode: str = os.environ.get(
+        "COVER_MONITOR_OSS_CREDENTIAL_MODE", "ecs_ram_role"
+    )
+    cover_monitor_oss_ecs_role_name: str = os.environ.get(
+        "COVER_MONITOR_OSS_ECS_ROLE_NAME", ""
     )
     cover_monitor_import_root: str = os.environ.get(
         "COVER_MONITOR_IMPORT_ROOT", "runtime/cover_monitor/imports"
@@ -249,8 +268,29 @@ class ApiSettings:
     def ensure_runtime_dirs(self) -> None:
         Path(self.task_upload_root).mkdir(parents=True, exist_ok=True)
         Path(self.task_export_root).mkdir(parents=True, exist_ok=True)
-        Path(self.cover_monitor_asset_root).mkdir(parents=True, exist_ok=True)
+        if self.cover_monitor_storage_backend.strip().lower() == "local":
+            Path(self.cover_monitor_asset_root).mkdir(parents=True, exist_ok=True)
+        Path(self.cover_monitor_staging_root).mkdir(parents=True, exist_ok=True)
         Path(self.cover_monitor_import_root).mkdir(parents=True, exist_ok=True)
+
+    def build_cover_asset_storage(
+        self,
+        *,
+        local_root: str | Path | None = None,
+        oss_client: OssObjectClient | None = None,
+    ) -> CoverAssetStorage:
+        return build_cover_asset_storage(
+            backend=self.cover_monitor_storage_backend,
+            local_root=local_root or self.cover_monitor_asset_root,
+            staging_root=self.cover_monitor_staging_root,
+            oss_region=self.cover_monitor_oss_region,
+            oss_endpoint=self.cover_monitor_oss_endpoint,
+            oss_bucket=self.cover_monitor_oss_bucket,
+            oss_prefix=self.cover_monitor_oss_prefix,
+            oss_credential_mode=self.cover_monitor_oss_credential_mode,
+            oss_ecs_role_name=self.cover_monitor_oss_ecs_role_name,
+            oss_client=oss_client,
+        )
 
     @property
     def cors_allowed_origins_list(self) -> list[str]:

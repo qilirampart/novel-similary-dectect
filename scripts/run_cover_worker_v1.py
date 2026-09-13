@@ -53,8 +53,9 @@ def main() -> None:
         cookie_path=SETTINGS.cover_monitor_cookie_path,
         timeout_seconds=SETTINGS.cover_monitor_network_timeout_seconds,
     )
+    storage = SETTINGS.build_cover_asset_storage(local_root=args.asset_root)
     downloader = YouTubeCoverDownloader(
-        args.asset_root,
+        storage=storage,
         proxy_url=SETTINGS.cover_monitor_proxy_url,
         timeout_seconds=SETTINGS.cover_monitor_network_timeout_seconds,
         max_bytes=SETTINGS.cover_monitor_download_max_bytes,
