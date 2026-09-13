@@ -88,7 +88,7 @@ def build_staging_cleanup_plan(
         except OSError:
             decisions.append(_staging_decision(relative, reason="invalid_metadata"))
             continue
-        recognized = _is_recognized_staging_path(relative)
+        recognized = is_recognized_staging_path(relative)
         expired = modified_at < effective_now - timedelta(hours=int(stale_hours))
         if not recognized:
             action: CleanupAction = "keep"
@@ -114,7 +114,7 @@ _STAGING_FILE = re.compile(
 )
 
 
-def _is_recognized_staging_path(relative_path: str) -> bool:
+def is_recognized_staging_path(relative_path: str) -> bool:
     parts = PurePosixPath(relative_path).parts
     return len(parts) == 2 and bool(_VIDEO_ID.fullmatch(parts[0])) and bool(
         _STAGING_FILE.fullmatch(parts[1])

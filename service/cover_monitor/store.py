@@ -2146,6 +2146,38 @@ class CoverMonitorStore:
         result["items"] = [dict(item) for item in item_rows]
         return result
 
+    def get_cleanup_plan(
+        self,
+        scope: CoverAccessScope,
+        cleanup_run_id: str,
+    ) -> dict[str, Any] | None:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        normalized_run_id = _required_text(cleanup_run_id, "cleanup_run_id")
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM cover_cleanup_runs
+                 WHERE cleanup_run_id = ? AND workspace_key = ?
+                """,
+                (normalized_run_id, workspace_key),
+            ).fetchone()
+            if row is None:
+                return None
+            item_rows = conn.execute(
+                """
+                SELECT item_key, reason, byte_size, execution_status,
+                       result_message, executed_at
+                  FROM cover_cleanup_items
+                 WHERE cleanup_run_id = ?
+                 ORDER BY cleanup_item_id
+                """,
+                (normalized_run_id,),
+            ).fetchall()
+        result = dict(row)
+        result["policy"] = json.loads(str(result.pop("policy_json")))
+        result["items"] = [dict(item) for item in item_rows]
+        return result
+
     def start_task_attempt(
         self,
         task_item_id: int,
