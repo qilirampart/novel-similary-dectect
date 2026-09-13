@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path, PurePosixPath
+import re
 from typing import Any, Literal
 
 
@@ -29,6 +31,15 @@ class CoverAssetCleanupDecision:
     byte_size: int
 
 
+@dataclass(frozen=True)
+class CoverStagingCleanupDecision:
+    relative_path: str
+    action: CleanupAction
+    reason: str
+    modified_at: str
+    byte_size: int
+
+
 def build_asset_cleanup_plan(
     records: list[dict[str, Any]],
     *,
@@ -44,6 +55,80 @@ def build_asset_cleanup_plan(
         _classify_asset(record, now=effective_now, policy=retention)
         for record in records
     ]
+
+
+def build_staging_cleanup_plan(
+    staging_root: str | Path,
+    *,
+    now: datetime | None = None,
+    stale_hours: int = 24,
+) -> list[CoverStagingCleanupDecision]:
+    if int(stale_hours) <= 0:
+        raise ValueError("stale_hours 必须大于 0")
+    effective_now = now or datetime.now(timezone.utc)
+    if effective_now.tzinfo is None:
+        raise ValueError("now 必须包含时区")
+    effective_now = effective_now.astimezone(timezone.utc)
+    root = Path(staging_root).resolve()
+    if not root.exists():
+        return []
+    if not root.is_dir():
+        raise ValueError("staging_root 必须是目录")
+    decisions: list[CoverStagingCleanupDecision] = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+        if path.is_dir() and not path.is_symlink():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink() or not path.is_file():
+            decisions.append(_staging_decision(relative, reason="unrecognized_staging_file"))
+            continue
+        try:
+            stat = path.stat()
+            modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        except OSError:
+            decisions.append(_staging_decision(relative, reason="invalid_metadata"))
+            continue
+        recognized = _is_recognized_staging_path(relative)
+        expired = modified_at < effective_now - timedelta(hours=int(stale_hours))
+        if not recognized:
+            action: CleanupAction = "keep"
+            reason = "unrecognized_staging_file"
+        else:
+            action = "delete_candidate" if expired else "keep"
+            reason = "staging_retention_expired" if expired else "staging_within_retention"
+        decisions.append(
+            CoverStagingCleanupDecision(
+                relative_path=relative,
+                action=action,
+                reason=reason,
+                modified_at=modified_at.isoformat(timespec="seconds"),
+                byte_size=max(int(stat.st_size), 0),
+            )
+        )
+    return decisions
+
+
+_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{6,32}$")
+_STAGING_FILE = re.compile(
+    r"^[a-f0-9]{64}\.(?:jpg|png|webp)(?:\.part-[a-f0-9]{32})?$"
+)
+
+
+def _is_recognized_staging_path(relative_path: str) -> bool:
+    parts = PurePosixPath(relative_path).parts
+    return len(parts) == 2 and bool(_VIDEO_ID.fullmatch(parts[0])) and bool(
+        _STAGING_FILE.fullmatch(parts[1])
+    )
+
+
+def _staging_decision(relative_path: str, *, reason: str) -> CoverStagingCleanupDecision:
+    return CoverStagingCleanupDecision(
+        relative_path=relative_path,
+        action="keep",
+        reason=reason,
+        modified_at="",
+        byte_size=0,
+    )
 
 
 def _classify_asset(
