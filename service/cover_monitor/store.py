@@ -17,7 +17,7 @@ except Exception:
 
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DEFAULT_BUSY_TIMEOUT_MS = 30_000
 
 
@@ -1935,6 +1935,66 @@ class CoverMonitorStore:
                 (scope.workspace_key.strip(), int(video_pk)),
             ).fetchone()
         return self._row(row)
+
+    def list_asset_lifecycle_records(
+        self,
+        scope: CoverAccessScope,
+        *,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        safe_limit = min(max(int(limit), 1), 5000)
+        safe_offset = max(int(offset), 0)
+        with self._connect() as conn:
+            total = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM cover_assets WHERE workspace_key = ?",
+                    (workspace_key,),
+                ).fetchone()[0]
+            )
+            rows = conn.execute(
+                """
+                SELECT asset.asset_id, asset.video_pk, asset.content_sha256,
+                       asset.storage_backend, asset.storage_key, asset.byte_size,
+                       asset.fetched_at,
+                       EXISTS (
+                           SELECT 1
+                             FROM cover_case_events AS event
+                             JOIN cover_detections AS detection
+                               ON detection.detection_id = event.detection_id
+                            WHERE detection.asset_id = asset.asset_id
+                       ) AS is_case_evidence,
+                       EXISTS (
+                           SELECT 1 FROM cover_detections AS detection
+                            WHERE detection.asset_id = asset.asset_id
+                              AND detection.overall_risk IN ('review', 'risk', 'unknown')
+                       ) AS has_sensitive_detection,
+                       EXISTS (
+                           SELECT 1 FROM cover_detections AS detection
+                            WHERE detection.asset_id = asset.asset_id
+                              AND detection.overall_risk = 'safe'
+                       ) AS has_safe_detection,
+                       asset.asset_id = (
+                           SELECT candidate.asset_id FROM cover_assets AS candidate
+                            WHERE candidate.workspace_key = asset.workspace_key
+                              AND candidate.video_pk = asset.video_pk
+                            ORDER BY candidate.fetched_at DESC, candidate.asset_id DESC
+                            LIMIT 1
+                       ) AS is_latest_for_video
+                  FROM cover_assets AS asset
+                 WHERE asset.workspace_key = ?
+                 ORDER BY asset.fetched_at, asset.asset_id
+                 LIMIT ? OFFSET ?
+                """,
+                (workspace_key, safe_limit, safe_offset),
+            ).fetchall()
+        return {
+            "items": [dict(row) for row in rows],
+            "total": total,
+            "limit": safe_limit,
+            "offset": safe_offset,
+        }
 
     def start_task_attempt(
         self,

@@ -248,6 +248,9 @@ CREATE TABLE IF NOT EXISTS cover_assets (
     FOREIGN KEY (video_pk) REFERENCES cover_videos (video_pk)
 );
 
+CREATE INDEX IF NOT EXISTS idx_cover_assets_lifecycle
+    ON cover_assets (workspace_key, video_pk, fetched_at DESC, asset_id DESC);
+
 CREATE TABLE IF NOT EXISTS cover_detections (
     detection_id TEXT PRIMARY KEY,
     workspace_key TEXT NOT NULL,
@@ -279,6 +282,9 @@ CREATE TABLE IF NOT EXISTS cover_detections (
 
 CREATE INDEX IF NOT EXISTS idx_cover_detections_workspace_risk
     ON cover_detections (workspace_key, overall_risk, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_cover_detections_asset_risk
+    ON cover_detections (asset_id, overall_risk);
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_cover_detections_task_item
     ON cover_detections (task_item_id);
@@ -350,6 +356,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_cover_case_events_system_detection
 
 CREATE INDEX IF NOT EXISTS idx_cover_case_events_case_created
     ON cover_case_events (case_id, created_at DESC, case_event_id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_cover_case_events_detection
+    ON cover_case_events (detection_id);
 
 CREATE TABLE IF NOT EXISTS cover_report_exports (
     export_id TEXT PRIMARY KEY,

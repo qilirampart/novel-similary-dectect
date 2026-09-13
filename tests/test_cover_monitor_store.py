@@ -36,11 +36,14 @@ def test_init_cover_db_is_idempotent_and_enables_required_tables(tmp_path: Path)
             ).fetchall()
         }
 
-    assert version == 7
+    assert version == 8
     assert "idx_cover_runs_claim" in indexes
     assert "idx_cover_task_items_run_claim" in indexes
     assert "uq_cover_detections_task_item" in indexes
     assert "uq_cover_case_events_system_detection" in indexes
+    assert "idx_cover_assets_lifecycle" in indexes
+    assert "idx_cover_detections_asset_risk" in indexes
+    assert "idx_cover_case_events_detection" in indexes
     assert {
         "cover_channels",
         "cover_videos",
@@ -93,7 +96,7 @@ def test_init_cover_db_migrates_existing_assets_to_local_storage_backend(tmp_pat
         ).fetchone()[0]
         version = conn.execute("SELECT MAX(version) FROM cover_schema_versions").fetchone()[0]
     assert backend == "local"
-    assert version == 7
+    assert version == 8
 
 
 def test_channel_and_video_identity_are_unique_inside_workspace(tmp_path: Path) -> None:
@@ -231,6 +234,59 @@ def test_save_asset_promotes_duplicate_local_content_to_oss_without_downgrade(tm
     assert promoted["asset_id"] == local["asset_id"]
     assert promoted["storage_backend"] == "oss"
     assert not_downgraded["storage_backend"] == "oss"
+
+
+def test_asset_lifecycle_records_mark_only_the_latest_version(tmp_path: Path) -> None:
+    store = CoverMonitorStore(tmp_path / "cover-monitor.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    channel = store.upsert_channel(
+        scope,
+        platform="youtube",
+        channel_id="UC-lifecycle",
+        name="Lifecycle Channel",
+        source_url="https://www.youtube.com/channel/UC-lifecycle",
+    )
+    video = store.upsert_video(
+        scope,
+        channel_pk=channel["channel_pk"],
+        platform="youtube",
+        video_id="video-lifecycle",
+        title="Lifecycle Video",
+        video_url="https://www.youtube.com/watch?v=video-lifecycle",
+        thumbnail_url="https://i.ytimg.com/vi/video-lifecycle/hqdefault.jpg",
+    )
+    for marker in ("e", "f"):
+        store.save_asset(
+            scope,
+            video_pk=video["video_pk"],
+            asset={
+                "content_sha256": marker * 64,
+                "storage_key": f"video-lifecycle/{marker * 64}.jpg",
+                "original_url": video["thumbnail_url"],
+                "fetched_url": video["thumbnail_url"],
+                "mime_type": "image/jpeg",
+                "byte_size": 1024,
+                "width": 1280,
+                "height": 720,
+            },
+        )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE cover_assets SET fetched_at = '2026-06-01T00:00:00+00:00' WHERE content_sha256 = ?",
+            ("e" * 64,),
+        )
+        conn.execute(
+            "UPDATE cover_assets SET fetched_at = '2026-09-01T00:00:00+00:00' WHERE content_sha256 = ?",
+            ("f" * 64,),
+        )
+
+    records = store.list_asset_lifecycle_records(scope, limit=100, offset=0)
+
+    assert records["total"] == 2
+    assert [item["is_latest_for_video"] for item in records["items"]] == [0, 1]
+    assert all(item["has_safe_detection"] == 0 for item in records["items"])
+    assert all(item["has_sensitive_detection"] == 0 for item in records["items"])
+    assert all(item["is_case_evidence"] == 0 for item in records["items"])
 
 
 def test_workspace_scope_blocks_cross_workspace_reads(tmp_path: Path) -> None:

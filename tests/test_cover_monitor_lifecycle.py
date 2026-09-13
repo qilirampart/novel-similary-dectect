@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from service.cover_monitor.lifecycle import CoverRetentionPolicy, build_asset_cleanup_plan
+
+
+NOW = datetime(2026, 9, 13, 12, 0, tzinfo=timezone.utc)
+
+
+def _asset(**overrides: object) -> dict[str, object]:
+    record: dict[str, object] = {
+        "asset_id": "asset-1",
+        "storage_backend": "oss",
+        "storage_key": "video-1/hash.jpg",
+        "fetched_at": "2026-06-01T00:00:00+00:00",
+        "is_case_evidence": 0,
+        "has_sensitive_detection": 0,
+        "has_safe_detection": 1,
+        "is_latest_for_video": 0,
+    }
+    record.update(overrides)
+    return record
+
+
+def test_cleanup_plan_never_deletes_case_or_sensitive_evidence() -> None:
+    decisions = build_asset_cleanup_plan(
+        [
+            _asset(asset_id="case", is_case_evidence=1),
+            _asset(asset_id="risk", has_sensitive_detection=1),
+        ],
+        now=NOW,
+    )
+
+    assert [(item.asset_id, item.action, item.reason) for item in decisions] == [
+        ("case", "keep", "case_evidence"),
+        ("risk", "keep", "sensitive_detection"),
+    ]
+
+
+def test_cleanup_plan_keeps_latest_video_asset_even_when_old() -> None:
+    decision = build_asset_cleanup_plan(
+        [_asset(is_latest_for_video=1)],
+        now=NOW,
+    )[0]
+
+    assert decision.action == "keep"
+    assert decision.reason == "latest_video_asset"
+
+
+def test_cleanup_plan_marks_only_expired_safe_and_unprocessed_assets() -> None:
+    decisions = build_asset_cleanup_plan(
+        [
+            _asset(asset_id="old-safe"),
+            _asset(asset_id="recent-safe", fetched_at="2026-08-20T00:00:00+00:00"),
+            _asset(
+                asset_id="old-unprocessed",
+                fetched_at="2026-08-01T00:00:00+00:00",
+                has_safe_detection=0,
+            ),
+            _asset(
+                asset_id="recent-unprocessed",
+                fetched_at="2026-09-05T00:00:00+00:00",
+                has_safe_detection=0,
+            ),
+        ],
+        now=NOW,
+        policy=CoverRetentionPolicy(safe_days=60, unprocessed_days=14),
+    )
+
+    assert [(item.asset_id, item.action, item.reason) for item in decisions] == [
+        ("old-safe", "delete_candidate", "safe_retention_expired"),
+        ("recent-safe", "keep", "safe_within_retention"),
+        ("old-unprocessed", "delete_candidate", "unprocessed_retention_expired"),
+        ("recent-unprocessed", "keep", "unprocessed_within_retention"),
+    ]
+
+
+def test_cleanup_plan_fails_closed_for_invalid_timestamp_or_unknown_backend() -> None:
+    decisions = build_asset_cleanup_plan(
+        [
+            _asset(asset_id="bad-time", fetched_at="not-a-time"),
+            _asset(asset_id="bad-backend", storage_backend="unknown"),
+            _asset(asset_id="bad-size", byte_size="not-a-number"),
+            _asset(asset_id="bad-flag", is_case_evidence=[]),
+        ],
+        now=NOW,
+    )
+
+    assert [(item.asset_id, item.action, item.reason) for item in decisions] == [
+        ("bad-time", "keep", "invalid_metadata"),
+        ("bad-backend", "keep", "invalid_metadata"),
+        ("bad-size", "keep", "invalid_metadata"),
+        ("bad-flag", "keep", "invalid_metadata"),
+    ]
