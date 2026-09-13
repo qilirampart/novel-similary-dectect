@@ -32,6 +32,7 @@ class DownloadedCover:
     byte_size: int
     width: int
     height: int
+    storage_backend: str = "local"
 
 
 class YouTubeCoverDownloader:
@@ -131,6 +132,7 @@ class YouTubeCoverDownloader:
             byte_size=len(content),
             width=width,
             height=height,
+            storage_backend=str(self.storage.backend_name),
         )
 
     def _validate_image(self, content: bytes) -> tuple[int, int, str]:

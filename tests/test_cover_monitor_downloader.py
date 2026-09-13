@@ -65,6 +65,7 @@ def test_downloader_falls_back_from_small_placeholder_and_versions_by_hash(tmp_p
     assert result.fetched_url.endswith("/hqdefault.jpg")
     assert Path(result.local_path).is_file()
     assert result.content_sha256 in result.storage_key
+    assert result.storage_backend == "local"
     assert len(opener.requests) == 2
 
 
@@ -112,3 +113,4 @@ def test_downloader_can_persist_through_an_injected_storage_backend(tmp_path: Pa
     assert downloader.storage is storage
     assert Path(result.local_path) == storage.resolve_local_path(result.storage_key)
     assert Path(result.local_path).is_file()
+    assert result.storage_backend == "local"

@@ -14,7 +14,7 @@ from service.cover_monitor.downloader import DownloadedCover
 from service.cover_monitor.executor import CoverRunExecutor
 from service.cover_monitor.reviewer import CoverDetectionResult, CoverReviewOutcome
 from service.cover_monitor.store import CoverAccessScope, CoverMonitorStore
-from service.cover_monitor.storage import LocalCoverAssetStorage
+from service.cover_monitor.storage import LocalCoverAssetStorage, RoutedCoverAssetStorage
 
 
 class FakeCollector:
@@ -99,6 +99,10 @@ class RecordingStorage(LocalCoverAssetStorage):
             yield path
 
 
+class OssNamedRecordingStorage(RecordingStorage):
+    backend_name = "oss"
+
+
 class StorageBackedDownloader:
     def __init__(self, storage: RecordingStorage) -> None:
         self.storage = storage
@@ -154,6 +158,33 @@ class FakeReviewer:
                 duration_seconds=0.2,
             ),
         )
+
+
+def test_executor_materializes_asset_from_recorded_backend(tmp_path: Path) -> None:
+    local = RecordingStorage(tmp_path / "local-assets")
+    oss = OssNamedRecordingStorage(tmp_path / "oss-assets")
+    routed = RoutedCoverAssetStorage(
+        active=oss,
+        backends={"local": local, "oss": oss},
+    )
+    key = "video-history/local.jpg"
+    local.put_bytes(key, b"historical-local-cover")
+    downloader = StorageBackedDownloader(routed)
+    executor = CoverRunExecutor(
+        store=CoverMonitorStore(tmp_path / "cover.sqlite3"),
+        collector=FakeCollector(),
+        downloader=downloader,
+        reviewer=FakeReviewer(),
+        worker_name="mixed-storage-test",
+    )
+
+    with executor._materialized_asset(
+        {"storage_key": key, "storage_backend": "local"}
+    ) as path:
+        assert path.read_bytes() == b"historical-local-cover"
+
+    assert local.materialize_calls == [key]
+    assert oss.materialize_calls == []
 
 
 class PauseDuringCollection:

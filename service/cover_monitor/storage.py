@@ -34,6 +34,8 @@ class CoverAssetDelivery:
 
 
 class CoverAssetStorage(Protocol):
+    backend_name: str
+
     def put_bytes(self, storage_key: str, content: bytes) -> Path:
         """Persist immutable content and return a local path usable by the current worker."""
 
@@ -56,6 +58,8 @@ class OssObjectClient(Protocol):
 
 
 class LocalCoverAssetStorage:
+    backend_name = "local"
+
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
@@ -121,6 +125,8 @@ class LocalCoverAssetStorage:
 
 
 class OssCoverAssetStorage:
+    backend_name = "oss"
+
     _BUCKET_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
     _CONTENT_HASH = re.compile(r"^[a-f0-9]{64}$")
 
@@ -204,6 +210,57 @@ class OssCoverAssetStorage:
             raise CoverAssetConflictError("封面内容与 SHA-256 存储键不一致")
 
 
+class RoutedCoverAssetStorage:
+    def __init__(
+        self,
+        *,
+        active: CoverAssetStorage,
+        backends: dict[str, CoverAssetStorage],
+    ) -> None:
+        normalized = {str(name).strip().lower(): storage for name, storage in backends.items()}
+        active_name = str(active.backend_name).strip().lower()
+        if active_name not in normalized or normalized[active_name] is not active:
+            raise ValueError("活动封面存储后端未注册")
+        self._active = active
+        self._backends = normalized
+        self.backend_name = active_name
+
+    def put_bytes(self, storage_key: str, content: bytes) -> Path:
+        return self._active.put_bytes(storage_key, content)
+
+    def materialize(self, storage_key: str) -> ContextManager[Path]:
+        return self._active.materialize(storage_key)
+
+    def delivery(self, storage_key: str, *, expires_seconds: int) -> CoverAssetDelivery:
+        return self._active.delivery(storage_key, expires_seconds=expires_seconds)
+
+    def select(self, backend_name: str) -> CoverAssetStorage:
+        backend = _normalize_storage_backend(backend_name)
+        storage = self._backends.get(backend)
+        if storage is None:
+            raise CoverAssetStorageError(f"封面存储后端未配置: {backend}")
+        return storage
+
+
+def _normalize_storage_backend(backend_name: str) -> str:
+    backend = str(backend_name or "local").strip().lower()
+    if backend not in {"local", "oss"}:
+        raise ValueError("unsupported storage_backend")
+    return backend
+
+
+def select_cover_asset_storage(
+    storage: CoverAssetStorage,
+    backend_name: str,
+) -> CoverAssetStorage:
+    backend = _normalize_storage_backend(backend_name)
+    if isinstance(storage, RoutedCoverAssetStorage):
+        return storage.select(backend)
+    if str(storage.backend_name).strip().lower() != backend:
+        raise CoverAssetStorageError(f"封面存储后端未配置: {backend}")
+    return storage
+
+
 def build_cover_asset_storage(
     *,
     backend: str,
@@ -239,9 +296,14 @@ def build_cover_asset_storage(
             credential_mode=oss_credential_mode,
             ecs_role_name=oss_ecs_role_name,
         )
-    return OssCoverAssetStorage(
+    oss_storage = OssCoverAssetStorage(
         client=oss_client,
         bucket=oss_bucket,
         prefix=oss_prefix,
         staging_root=staging_root,
+    )
+    local_storage = LocalCoverAssetStorage(local_root)
+    return RoutedCoverAssetStorage(
+        active=oss_storage,
+        backends={"local": local_storage, "oss": oss_storage},
     )

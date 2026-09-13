@@ -17,7 +17,7 @@ except Exception:
 
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 DEFAULT_BUSY_TIMEOUT_MS = 30_000
 
 
@@ -68,6 +68,16 @@ def init_cover_db(path: str | Path) -> None:
     schema = SCHEMA_PATH.read_text(encoding="utf-8")
     with connect_cover_db(path, configure_wal=True) as conn:
         conn.executescript(schema)
+        asset_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(cover_assets)").fetchall()
+        }
+        if "storage_backend" not in asset_columns:
+            conn.execute(
+                """
+                ALTER TABLE cover_assets ADD COLUMN storage_backend TEXT NOT NULL
+                    DEFAULT 'local' CHECK (storage_backend IN ('local', 'oss'))
+                """
+            )
         conn.execute(
             "INSERT OR IGNORE INTO cover_schema_versions (version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, _now()),
@@ -1857,6 +1867,9 @@ class CoverMonitorStore:
         now = _now()
         asset_id = str(uuid4())
         content_sha256 = _required_text(str(asset.get("content_sha256") or ""), "content_sha256")
+        storage_backend = str(asset.get("storage_backend") or "local").strip().lower()
+        if storage_backend not in {"local", "oss"}:
+            raise ValueError("unsupported storage_backend")
         with self._connect() as conn:
             video = conn.execute(
                 "SELECT 1 FROM cover_videos WHERE video_pk = ? AND workspace_key = ?",
@@ -1868,9 +1881,9 @@ class CoverMonitorStore:
                 """
                 INSERT OR IGNORE INTO cover_assets (
                     asset_id, workspace_key, video_pk, content_sha256, storage_key,
-                    original_url, fetched_url, mime_type, byte_size, width, height,
-                    fetched_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    storage_backend, original_url, fetched_url, mime_type, byte_size,
+                    width, height, fetched_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     asset_id,
@@ -1878,6 +1891,7 @@ class CoverMonitorStore:
                     int(video_pk),
                     content_sha256,
                     _required_text(str(asset.get("storage_key") or ""), "storage_key"),
+                    storage_backend,
                     _required_text(str(asset.get("original_url") or ""), "original_url"),
                     _required_text(str(asset.get("fetched_url") or ""), "fetched_url"),
                     _required_text(str(asset.get("mime_type") or ""), "mime_type"),
@@ -1888,6 +1902,16 @@ class CoverMonitorStore:
                     now,
                 ),
             )
+            if storage_backend == "oss":
+                conn.execute(
+                    """
+                    UPDATE cover_assets
+                       SET storage_backend = 'oss'
+                     WHERE workspace_key = ? AND video_pk = ? AND content_sha256 = ?
+                       AND storage_backend = 'local'
+                    """,
+                    (scope.workspace_key.strip(), int(video_pk), content_sha256),
+                )
             row = conn.execute(
                 """
                 SELECT * FROM cover_assets

@@ -235,6 +235,7 @@ CREATE TABLE IF NOT EXISTS cover_assets (
     video_pk INTEGER NOT NULL,
     content_sha256 TEXT NOT NULL,
     storage_key TEXT NOT NULL,
+    storage_backend TEXT NOT NULL DEFAULT 'local' CHECK (storage_backend IN ('local', 'oss')),
     original_url TEXT NOT NULL,
     fetched_url TEXT NOT NULL,
     mime_type TEXT NOT NULL,

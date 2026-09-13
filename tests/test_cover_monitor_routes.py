@@ -10,7 +10,11 @@ from openpyxl import Workbook, load_workbook
 
 from api.cover_routes import build_cover_monitor_router
 from service.cover_monitor.store import CoverAccessScope, CoverMonitorStore
-from service.cover_monitor.storage import LocalCoverAssetStorage
+from service.cover_monitor.storage import LocalCoverAssetStorage, RoutedCoverAssetStorage
+
+
+class OssNamedLocalStorage(LocalCoverAssetStorage):
+    backend_name = "oss"
 
 
 def test_cover_overview_uses_independent_empty_database(tmp_path: Path) -> None:
@@ -200,13 +204,18 @@ def test_cover_import_rejects_corrupt_xlsx_as_client_error(tmp_path: Path) -> No
     assert response.status_code == 400
 
 
-def _cover_run_client(tmp_path: Path) -> tuple[TestClient, Path]:
+def _cover_run_client(
+    tmp_path: Path,
+    *,
+    asset_storage=None,
+) -> tuple[TestClient, Path]:
     db_path = tmp_path / "cover.sqlite3"
     app = FastAPI()
     app.include_router(
         build_cover_monitor_router(
             db_path=str(db_path),
             asset_root=str(tmp_path / "assets"),
+            asset_storage=asset_storage,
             current_user_dependency=lambda: {"user_id": 7, "role": "operator"},
             vision_provider="vision.example.test",
             vision_model="test-vision-model",
@@ -423,7 +432,13 @@ def _seed_cover_risk_candidate(db_path: Path) -> str:
 
 
 def test_cover_risk_case_routes_list_detail_and_confirm_rectification(tmp_path: Path) -> None:
-    client, db_path = _cover_run_client(tmp_path)
+    local = LocalCoverAssetStorage(tmp_path / "assets")
+    oss = OssNamedLocalStorage(tmp_path / "oss-assets")
+    routed = RoutedCoverAssetStorage(
+        active=oss,
+        backends={"local": local, "oss": oss},
+    )
+    client, db_path = _cover_run_client(tmp_path, asset_storage=routed)
     case_id = _seed_cover_risk_candidate(db_path)
 
     listed = client.get("/api/v1/cover-monitor/risk-cases?status=needs_review")

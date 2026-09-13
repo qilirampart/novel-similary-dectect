@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from api.config import ApiSettings
-from service.cover_monitor.storage import LocalCoverAssetStorage, OssCoverAssetStorage
+from service.cover_monitor.storage import LocalCoverAssetStorage, RoutedCoverAssetStorage
 
 
 def test_cover_storage_settings_default_to_local_without_loading_oss(tmp_path: Path) -> None:
@@ -30,7 +30,8 @@ def test_cover_storage_settings_build_oss_with_injected_client(tmp_path: Path) -
 
     storage = settings.build_cover_asset_storage(oss_client=object())
 
-    assert isinstance(storage, OssCoverAssetStorage)
+    assert isinstance(storage, RoutedCoverAssetStorage)
+    assert storage.backend_name == "oss"
 
 
 def test_oss_runtime_dirs_create_staging_without_creating_local_asset_root(tmp_path: Path) -> None:

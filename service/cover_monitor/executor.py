@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterator
 from service.cover_monitor.collector import CoverCollectionCancelled
 from service.cover_monitor.downloader import CoverDownloadError
 from service.cover_monitor.store import CoverAccessScope, CoverMonitorStore
+from service.cover_monitor.storage import select_cover_asset_storage
 
 
 class _Heartbeat(AbstractContextManager["_Heartbeat"]):
@@ -311,7 +312,11 @@ class CoverRunExecutor:
     def _materialized_asset(self, asset: dict[str, Any]) -> Iterator[Path]:
         storage = getattr(self.downloader, "storage", None)
         if storage is not None:
-            with storage.materialize(str(asset["storage_key"])) as path:
+            asset_storage = select_cover_asset_storage(
+                storage,
+                str(asset.get("storage_backend") or "local"),
+            )
+            with asset_storage.materialize(str(asset["storage_key"])) as path:
                 yield Path(path)
             return
         yield self._asset_path(asset)

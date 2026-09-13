@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from service.cover_monitor.store import CoverAccessScope, CoverMonitorStore, init_cover_db
+from service.cover_monitor.store import (
+    SCHEMA_PATH,
+    CoverAccessScope,
+    CoverMonitorStore,
+    init_cover_db,
+)
 
 
 def test_init_cover_db_is_idempotent_and_enables_required_tables(tmp_path: Path) -> None:
@@ -31,7 +36,7 @@ def test_init_cover_db_is_idempotent_and_enables_required_tables(tmp_path: Path)
             ).fetchall()
         }
 
-    assert version == 6
+    assert version == 7
     assert "idx_cover_runs_claim" in indexes
     assert "idx_cover_task_items_run_claim" in indexes
     assert "uq_cover_detections_task_item" in indexes
@@ -48,6 +53,47 @@ def test_init_cover_db_is_idempotent_and_enables_required_tables(tmp_path: Path)
         "cover_import_conflicts",
         "cover_historical_observations",
     }.issubset(tables)
+
+
+def test_init_cover_db_migrates_existing_assets_to_local_storage_backend(tmp_path: Path) -> None:
+    db_path = tmp_path / "cover-monitor-v6.sqlite3"
+    legacy_schema = SCHEMA_PATH.read_text(encoding="utf-8").replace(
+        "    storage_backend TEXT NOT NULL DEFAULT 'local' CHECK (storage_backend IN ('local', 'oss')),\n",
+        "",
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(legacy_schema)
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute(
+            "INSERT INTO cover_schema_versions (version, applied_at) VALUES (6, '2026-09-12T00:00:00+00:00')"
+        )
+        conn.execute(
+            """
+            INSERT INTO cover_assets (
+                asset_id, workspace_key, video_pk, content_sha256, storage_key,
+                original_url, fetched_url, mime_type, byte_size, width, height,
+                fetched_at, created_at
+            ) VALUES ('legacy', 'internal', 999, ?, ?, ?, ?, 'image/jpeg', 1024, 1280, 720, ?, ?)
+            """,
+            (
+                "a" * 64,
+                f"video-legacy/{'a' * 64}.jpg",
+                "https://i.ytimg.com/vi/video-legacy/hqdefault.jpg",
+                "https://i.ytimg.com/vi/video-legacy/hqdefault.jpg",
+                "2026-09-12T00:00:00+00:00",
+                "2026-09-12T00:00:00+00:00",
+            ),
+        )
+
+    init_cover_db(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        backend = conn.execute(
+            "SELECT storage_backend FROM cover_assets WHERE asset_id = 'legacy'"
+        ).fetchone()[0]
+        version = conn.execute("SELECT MAX(version) FROM cover_schema_versions").fetchone()[0]
+    assert backend == "local"
+    assert version == 7
 
 
 def test_channel_and_video_identity_are_unique_inside_workspace(tmp_path: Path) -> None:
@@ -92,6 +138,99 @@ def test_channel_and_video_identity_are_unique_inside_workspace(tmp_path: Path) 
     assert first_video["video_pk"] == updated_video["video_pk"]
     assert updated_video["title"] == "更新后的标题"
     assert len(store.list_channels(scope)) == 1
+
+
+def test_save_asset_persists_and_validates_storage_backend(tmp_path: Path) -> None:
+    store = CoverMonitorStore(tmp_path / "cover-monitor.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    channel = store.upsert_channel(
+        scope,
+        platform="youtube",
+        channel_id="UC-storage",
+        name="Storage Channel",
+        source_url="https://www.youtube.com/channel/UC-storage",
+    )
+    video = store.upsert_video(
+        scope,
+        channel_pk=channel["channel_pk"],
+        platform="youtube",
+        video_id="video-storage",
+        title="Storage Video",
+        video_url="https://www.youtube.com/watch?v=video-storage",
+        thumbnail_url="https://i.ytimg.com/vi/video-storage/hqdefault.jpg",
+    )
+    asset = {
+        "storage_backend": "oss",
+        "content_sha256": "b" * 64,
+        "storage_key": f"video-storage/{'b' * 64}.jpg",
+        "original_url": video["thumbnail_url"],
+        "fetched_url": video["thumbnail_url"],
+        "mime_type": "image/jpeg",
+        "byte_size": 1024,
+        "width": 1280,
+        "height": 720,
+    }
+
+    saved = store.save_asset(scope, video_pk=video["video_pk"], asset=asset)
+
+    assert saved["storage_backend"] == "oss"
+    with pytest.raises(ValueError, match="storage_backend"):
+        store.save_asset(
+            scope,
+            video_pk=video["video_pk"],
+            asset={**asset, "content_sha256": "c" * 64, "storage_backend": "unknown"},
+        )
+
+
+def test_save_asset_promotes_duplicate_local_content_to_oss_without_downgrade(tmp_path: Path) -> None:
+    store = CoverMonitorStore(tmp_path / "cover-monitor.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    channel = store.upsert_channel(
+        scope,
+        platform="youtube",
+        channel_id="UC-promote",
+        name="Promote Channel",
+        source_url="https://www.youtube.com/channel/UC-promote",
+    )
+    video = store.upsert_video(
+        scope,
+        channel_pk=channel["channel_pk"],
+        platform="youtube",
+        video_id="video-promote",
+        title="Promote Video",
+        video_url="https://www.youtube.com/watch?v=video-promote",
+        thumbnail_url="https://i.ytimg.com/vi/video-promote/hqdefault.jpg",
+    )
+    base_asset = {
+        "content_sha256": "d" * 64,
+        "storage_key": f"video-promote/{'d' * 64}.jpg",
+        "original_url": video["thumbnail_url"],
+        "fetched_url": video["thumbnail_url"],
+        "mime_type": "image/jpeg",
+        "byte_size": 1024,
+        "width": 1280,
+        "height": 720,
+    }
+
+    local = store.save_asset(
+        scope,
+        video_pk=video["video_pk"],
+        asset={**base_asset, "storage_backend": "local"},
+    )
+    promoted = store.save_asset(
+        scope,
+        video_pk=video["video_pk"],
+        asset={**base_asset, "storage_backend": "oss"},
+    )
+    not_downgraded = store.save_asset(
+        scope,
+        video_pk=video["video_pk"],
+        asset={**base_asset, "storage_backend": "local"},
+    )
+
+    assert promoted["asset_id"] == local["asset_id"]
+    assert promoted["storage_backend"] == "oss"
+    assert not_downgraded["storage_backend"] == "oss"
 
 
 def test_workspace_scope_blocks_cross_workspace_reads(tmp_path: Path) -> None:

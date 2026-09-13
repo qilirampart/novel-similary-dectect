@@ -22,6 +22,7 @@ from service.cover_monitor.storage import (
     CoverAssetStorage,
     CoverAssetStorageError,
     LocalCoverAssetStorage,
+    select_cover_asset_storage,
 )
 
 
@@ -440,7 +441,14 @@ def build_cover_monitor_router(
         if asset is None:
             raise HTTPException(status_code=404, detail="封面证据不存在")
         try:
-            delivery = storage.delivery(str(asset["storage_key"]), expires_seconds=300)
+            asset_storage = select_cover_asset_storage(
+                storage,
+                str(asset.get("storage_backend") or "local"),
+            )
+            delivery = asset_storage.delivery(
+                str(asset["storage_key"]),
+                expires_seconds=300,
+            )
         except (CoverAssetNotFoundError, CoverAssetStorageError, ValueError) as exc:
             raise HTTPException(status_code=404, detail="封面证据不存在") from exc
         if delivery.kind == "redirect":

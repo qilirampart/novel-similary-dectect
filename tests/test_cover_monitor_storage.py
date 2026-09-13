@@ -7,10 +7,13 @@ import pytest
 
 from service.cover_monitor.storage import (
     CoverAssetConflictError,
+    CoverAssetStorageError,
     InvalidCoverStorageKey,
     LocalCoverAssetStorage,
     OssCoverAssetStorage,
+    RoutedCoverAssetStorage,
     build_cover_asset_storage,
+    select_cover_asset_storage,
 )
 
 
@@ -195,6 +198,7 @@ def test_storage_factory_keeps_local_as_the_safe_default(tmp_path: Path) -> None
     )
 
     assert isinstance(storage, LocalCoverAssetStorage)
+    assert storage.backend_name == "local"
     assert storage.root == (tmp_path / "assets").resolve()
 
 
@@ -221,4 +225,35 @@ def test_storage_factory_builds_oss_with_an_injected_client(tmp_path: Path) -> N
         oss_client=FakeOssClient(),
     )
 
-    assert isinstance(storage, OssCoverAssetStorage)
+    assert isinstance(storage, RoutedCoverAssetStorage)
+    assert storage.backend_name == "oss"
+
+
+def test_routed_storage_writes_to_active_oss_and_selects_historical_local(tmp_path: Path) -> None:
+    local = LocalCoverAssetStorage(tmp_path / "assets")
+    client = FakeOssClient()
+    oss = OssCoverAssetStorage(
+        client=client,
+        bucket="private-covers",
+        prefix="cover-monitor/v1",
+        staging_root=tmp_path / "staging",
+    )
+    storage = RoutedCoverAssetStorage(active=oss, backends={"local": local, "oss": oss})
+    content = b"new-oss-cover"
+    key = _content_addressed_key(content)
+
+    storage.put_bytes(key, content)
+
+    assert storage.backend_name == "oss"
+    assert client.put_calls == [("private-covers", f"cover-monitor/v1/{key}")]
+    assert select_cover_asset_storage(storage, "local") is local
+    assert select_cover_asset_storage(storage, "oss") is oss
+
+
+def test_storage_selection_rejects_unconfigured_or_invalid_backends(tmp_path: Path) -> None:
+    local = LocalCoverAssetStorage(tmp_path / "assets")
+
+    with pytest.raises(CoverAssetStorageError, match="未配置"):
+        select_cover_asset_storage(local, "oss")
+    with pytest.raises(ValueError, match="storage_backend"):
+        select_cover_asset_storage(local, "unknown")
