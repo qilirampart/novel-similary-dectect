@@ -2057,6 +2057,41 @@ class CoverMonitorStore:
         candidate_bytes = sum(item[2] for item in normalized_items)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                SELECT * FROM cover_cleanup_runs
+                 WHERE workspace_key = ? AND cleanup_kind = ? AND manifest_sha256 = ?
+                """,
+                (workspace_key, normalized_kind, normalized_digest),
+            ).fetchone()
+            if existing is not None:
+                existing_items = conn.execute(
+                    """
+                    SELECT item_key, reason, byte_size, execution_status,
+                           result_message, executed_at
+                      FROM cover_cleanup_items
+                     WHERE cleanup_run_id = ?
+                     ORDER BY cleanup_item_id
+                    """,
+                    (str(existing["cleanup_run_id"]),),
+                ).fetchall()
+                existing_candidates = [
+                    (str(item["item_key"]), str(item["reason"]), int(item["byte_size"]))
+                    for item in existing_items
+                ]
+                same_plan = (
+                    str(existing["policy_json"]) == policy_json
+                    and int(existing["total_count"]) == normalized_total
+                    and int(existing["candidate_count"]) == len(normalized_items)
+                    and int(existing["candidate_bytes"]) == candidate_bytes
+                    and existing_candidates == normalized_items
+                )
+                if not same_plan:
+                    raise ValueError("manifest digest is already registered with different plan data")
+                result = dict(existing)
+                result["policy"] = json.loads(str(result.pop("policy_json")))
+                result["items"] = [dict(item) for item in existing_items]
+                return result
             conn.execute(
                 """
                 INSERT INTO cover_cleanup_runs (

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
+import sqlite3
+import subprocess
+import sys
 
 import pytest
 
@@ -152,3 +156,48 @@ def test_staging_plan_marks_only_recognized_files_older_than_24_hours(tmp_path: 
 def test_staging_plan_rejects_invalid_retention_window(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="stale_hours"):
         build_staging_cleanup_plan(tmp_path, now=NOW, stale_hours=0)
+
+
+def test_staging_cli_can_bind_generated_manifest_to_audit_record(tmp_path: Path) -> None:
+    digest = "d" * 64
+    _write_staging_file(
+        tmp_path / "staging",
+        f"video001/{digest}.jpg",
+        modified_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+    )
+    output = tmp_path / "manifest.csv"
+    db_path = tmp_path / "cover.sqlite3"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/plan_cover_staging_cleanup_v1.py",
+            "--staging-root",
+            str(tmp_path / "staging"),
+            "--output",
+            str(output),
+            "--db",
+            str(db_path),
+            "--register-audit",
+            "--workspace",
+            "audit-test",
+            "--user-id",
+            "9",
+        ],
+        cwd=Path(__file__).resolve().parent.parent,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = json.loads(completed.stdout)
+
+    assert result["cleanup_run_id"]
+    assert result["delete_candidate_count"] == 1
+    with sqlite3.connect(db_path) as conn:
+        audit = conn.execute(
+            """
+            SELECT workspace_key, cleanup_kind, status, candidate_count
+              FROM cover_cleanup_runs
+            """
+        ).fetchone()
+    assert audit == ("audit-test", "staging", "planned", 1)

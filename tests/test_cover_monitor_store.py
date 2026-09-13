@@ -140,6 +140,23 @@ def test_cleanup_plan_registration_is_workspace_scoped_and_auditable(tmp_path: P
         }
     ]
 
+    repeated = store.register_cleanup_plan(
+        scope,
+        cleanup_kind="staging",
+        manifest_path="manifests/staging-20260913.csv",
+        manifest_sha256="a" * 64,
+        policy={"stale_hours": 24},
+        total_count=9,
+        candidate_items=[
+            {
+                "item_key": f"video001/{'b' * 64}.jpg",
+                "reason": "staging_retention_expired",
+                "byte_size": 2048,
+            }
+        ],
+    )
+    assert repeated["cleanup_run_id"] == cleanup["cleanup_run_id"]
+
 
 def test_cleanup_plan_registration_rejects_invalid_digest_and_duplicate_items(
     tmp_path: Path,
