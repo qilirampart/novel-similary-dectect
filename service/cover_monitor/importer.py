@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import chain
 from pathlib import Path
 import re
 from typing import Any, Iterator, Optional
@@ -45,6 +46,11 @@ def _extract_channel_id(channel_url: str) -> str:
     path = urlparse(channel_url).path.strip("/")
     match = re.search(r"(?:^|/)channel/(UC[A-Za-z0-9_-]+)(?:/|$)", path)
     return match.group(1) if match else ""
+
+
+def _is_headerless_channel_url_row(values: tuple[Any, ...]) -> bool:
+    nonempty = [_text(value) for value in values if _text(value)]
+    return len(nonempty) == 1 and bool(_extract_channel_id(nonempty[0]))
 
 
 def _extract_video_id(video_url: str) -> str:
@@ -127,13 +133,21 @@ class WorkbookImportParser:
             self.sheet_name = worksheet.title
             row_iter = worksheet.iter_rows(values_only=True)
             try:
-                headers = [_text(value) for value in next(row_iter)]
+                first_values = tuple(next(row_iter))
             except StopIteration as exc:
                 raise ValueError("workbook has no header row") from exc
+            if self.import_kind == "channels" and _is_headerless_channel_url_row(first_values):
+                headers = ["频道链接"]
+                data_rows = chain([first_values], row_iter)
+                first_data_row = 1
+            else:
+                headers = [_text(value) for value in first_values]
+                data_rows = row_iter
+                first_data_row = 2
             self.mapping = self._resolve_mapping(headers)
             seen_channels: dict[str, dict[str, Any]] = {}
             seen_videos: dict[str, dict[str, Any]] = {}
-            for row_number, values in enumerate(row_iter, start=2):
+            for row_number, values in enumerate(data_rows, start=first_data_row):
                 raw = {headers[index]: value for index, value in enumerate(values) if index < len(headers)}
                 if not any(_text(value) for value in values):
                     continue
@@ -211,9 +225,9 @@ class WorkbookImportParser:
                 if header:
                     mapping[field] = header
                     break
-        required = {"channel_name"}
+        required = set()
         if self.import_kind != "channels":
-            required.update({"video_title", "thumbnail_url"})
+            required.update({"channel_name", "video_title", "thumbnail_url"})
         missing = sorted(field for field in required if field not in mapping)
         if "channel_id" not in mapping and "channel_url" not in mapping:
             missing.append("channel_id/channel_url")
@@ -232,6 +246,9 @@ class WorkbookImportParser:
         channel_id = _text(value("channel_id")) or _extract_channel_id(channel_url)
         if not channel_url and channel_id:
             channel_url = f"https://www.youtube.com/channel/{channel_id}"
+        channel_name = _text(value("channel_name"))
+        if self.import_kind == "channels" and not channel_name:
+            channel_name = channel_id
         video_url = _text(value("video_url"))
         video_id = _text(value("video_id")) or _extract_video_id(video_url)
         if not video_url and video_id:
@@ -241,7 +258,7 @@ class WorkbookImportParser:
             "platform": "youtube",
             "operator_name": _text(value("operator_name")),
             "channel_id": channel_id,
-            "channel_name": _text(value("channel_name")),
+            "channel_name": channel_name,
             "channel_url": channel_url,
             "video_id": video_id,
             "video_title": _text(value("video_title")),

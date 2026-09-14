@@ -92,6 +92,39 @@ def test_preview_reports_duplicate_conflict_and_missing_rows(tmp_path: Path) -> 
     assert store.get_overview(scope)["channel_count"] == 0
 
 
+def test_headerless_single_column_channel_urls_are_imported_without_dropping_first_row(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "headerless-channels.xlsx"
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.append(["https://www.youtube.com/channel/UCX8oe3DG5lg7FYWguvuGW0Q"])
+    worksheet.append(["https://www.youtube.com/channel/UCcO2KUInJzw53A5qJj9BNhg"])
+    workbook.save(source)
+    store = CoverMonitorStore(tmp_path / "cover.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+
+    preview = store.create_import_preview(
+        scope,
+        import_kind="channels",
+        source_file_name=source.name,
+        source_file_sha256="headerless-channels",
+        source_file_path=str(source),
+    )
+
+    assert preview["mapping"] == {"channel_url": "频道链接"}
+    assert preview["stats"]["total_rows"] == 2
+    assert preview["stats"]["valid_rows"] == 2
+    assert preview["stats"]["unique_channels"] == 2
+    confirmed = store.confirm_import(scope, preview["import_id"])
+    assert confirmed["stats"]["applied_channels"] == 2
+    channels = store.search_channels(scope, limit=10, offset=0)["items"]
+    assert {item["name"] for item in channels} == {
+        "UCX8oe3DG5lg7FYWguvuGW0Q",
+        "UCcO2KUInJzw53A5qJj9BNhg",
+    }
+
+
 def test_confirm_import_is_idempotent_and_preserves_legacy_observation(tmp_path: Path) -> None:
     source = tmp_path / "baseline.xlsx"
     _write_workbook(source, [_row("代理甲", "UC-1", "video-1", "risk")])
