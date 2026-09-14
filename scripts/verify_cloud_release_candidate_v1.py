@@ -23,7 +23,7 @@ REQUIRED_FILES = (
     "api/runtime_worker.py",
     "scripts/run_cover_worker_v1.py",
     "requirements-deploy.txt",
-    "web/dist/index.html",
+    "web-dist/index.html",
 )
 
 
@@ -50,7 +50,7 @@ def main() -> int:
         f"test -f {shlex.quote(posixpath.join(candidate, relative))}"
         for relative in REQUIRED_FILES
     )
-    web_dist = posixpath.join(candidate, "web", "dist")
+    web_dist = posixpath.join(candidate, "web-dist")
     command = (
         f"current=$(readlink -f {shlex.quote(posixpath.join(args.remote_root, 'current'))}) && "
         f"test \"$current\" != {shlex.quote(candidate)} && "
