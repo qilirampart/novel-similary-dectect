@@ -17,7 +17,7 @@ except Exception:
 
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 DEFAULT_BUSY_TIMEOUT_MS = 30_000
 
 
@@ -30,6 +30,24 @@ def _required_text(value: str, field: str) -> str:
     if not normalized:
         raise ValueError(f"{field} is required")
     return normalized
+
+
+def _parse_aware_datetime(value: str, field: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field} must include timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _public_cleanup_plan(row: Any, item_rows: Any) -> dict[str, Any]:
+    result = dict(row)
+    result.pop("execution_token_hash", None)
+    result["policy"] = json.loads(str(result.pop("policy_json")))
+    result["items"] = [dict(item) for item in item_rows]
+    return result
 
 
 @dataclass(frozen=True)
@@ -77,6 +95,15 @@ def init_cover_db(path: str | Path) -> None:
                 ALTER TABLE cover_assets ADD COLUMN storage_backend TEXT NOT NULL
                     DEFAULT 'local' CHECK (storage_backend IN ('local', 'oss'))
                 """
+            )
+        cleanup_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(cover_cleanup_runs)").fetchall()
+        }
+        if "execution_token_hash" not in cleanup_columns:
+            conn.execute("ALTER TABLE cover_cleanup_runs ADD COLUMN execution_token_hash TEXT")
+        if "execution_token_expires_at" not in cleanup_columns:
+            conn.execute(
+                "ALTER TABLE cover_cleanup_runs ADD COLUMN execution_token_expires_at TEXT"
             )
         conn.execute(
             "INSERT OR IGNORE INTO cover_schema_versions (version, applied_at) VALUES (?, ?)",
@@ -2132,10 +2159,7 @@ class CoverMonitorStore:
                 )
                 if not same_plan:
                     raise ValueError("manifest digest is already registered with different plan data")
-                result = dict(existing)
-                result["policy"] = json.loads(str(result.pop("policy_json")))
-                result["items"] = [dict(item) for item in existing_items]
-                return result
+                return _public_cleanup_plan(existing, existing_items)
             conn.execute(
                 """
                 INSERT INTO cover_cleanup_runs (
@@ -2183,12 +2207,9 @@ class CoverMonitorStore:
                 """,
                 (cleanup_run_id,),
             ).fetchall()
-        result = self._row(row)
-        if result is None:
+        if row is None:
             raise RuntimeError("cleanup plan registration did not return a row")
-        result["policy"] = json.loads(str(result.pop("policy_json")))
-        result["items"] = [dict(item) for item in item_rows]
-        return result
+        return _public_cleanup_plan(row, item_rows)
 
     def get_cleanup_plan(
         self,
@@ -2217,10 +2238,81 @@ class CoverMonitorStore:
                 """,
                 (normalized_run_id,),
             ).fetchall()
-        result = dict(row)
-        result["policy"] = json.loads(str(result.pop("policy_json")))
-        result["items"] = [dict(item) for item in item_rows]
-        return result
+        return _public_cleanup_plan(row, item_rows)
+
+    def approve_cleanup_plan(
+        self,
+        scope: CoverAccessScope,
+        cleanup_run_id: str,
+        *,
+        expected_manifest_sha256: str,
+        execution_token_hash: str,
+        approved_at: str,
+        execution_token_expires_at: str,
+    ) -> dict[str, Any]:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        normalized_run_id = _required_text(cleanup_run_id, "cleanup_run_id")
+        expected_digest = str(expected_manifest_sha256 or "").strip().lower()
+        token_hash = str(execution_token_hash or "").strip().lower()
+        if re.fullmatch(r"[a-f0-9]{64}", expected_digest) is None:
+            raise ValueError("expected manifest digest is invalid")
+        if re.fullmatch(r"[a-f0-9]{64}", token_hash) is None:
+            raise ValueError("execution token hash is invalid")
+        approved_time = _parse_aware_datetime(approved_at, "approved_at")
+        expires_time = _parse_aware_datetime(
+            execution_token_expires_at,
+            "execution_token_expires_at",
+        )
+        if expires_time <= approved_time:
+            raise ValueError("execution token expiry must be after approval")
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT * FROM cover_cleanup_runs
+                 WHERE cleanup_run_id = ? AND workspace_key = ?
+                """,
+                (normalized_run_id, workspace_key),
+            ).fetchone()
+            if row is None:
+                raise ValueError("cleanup plan not found")
+            if str(row["status"]) != "planned":
+                raise ValueError("cleanup plan is not planned")
+            if str(row["manifest_sha256"]) != expected_digest:
+                raise ValueError("manifest digest does not match cleanup plan")
+            conn.execute(
+                """
+                UPDATE cover_cleanup_runs
+                   SET status = 'approved', approved_by_user_id = ?, approved_at = ?,
+                       execution_token_hash = ?, execution_token_expires_at = ?
+                 WHERE cleanup_run_id = ? AND workspace_key = ? AND status = 'planned'
+                """,
+                (
+                    int(scope.user_id),
+                    approved_time.isoformat(timespec="seconds"),
+                    token_hash,
+                    expires_time.isoformat(timespec="seconds"),
+                    normalized_run_id,
+                    workspace_key,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM cover_cleanup_runs WHERE cleanup_run_id = ?",
+                (normalized_run_id,),
+            ).fetchone()
+            item_rows = conn.execute(
+                """
+                SELECT item_key, reason, byte_size, execution_status,
+                       result_message, executed_at
+                  FROM cover_cleanup_items
+                 WHERE cleanup_run_id = ? ORDER BY cleanup_item_id
+                """,
+                (normalized_run_id,),
+            ).fetchall()
+        if updated is None:
+            raise RuntimeError("cleanup approval did not return a row")
+        return _public_cleanup_plan(updated, item_rows)
 
     def start_task_attempt(
         self,
