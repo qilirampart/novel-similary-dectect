@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import os
 from pathlib import Path
@@ -136,6 +136,7 @@ def test_approval_is_single_transition_and_workspace_scoped(tmp_path: Path) -> N
             staging_root=root,
             now=NOW,
         )
+
     other_scope = CoverAccessScope(workspace_key="other", user_id=9)
     with pytest.raises(ValueError, match="not found"):
         approve_cleanup_plan(
@@ -146,3 +147,86 @@ def test_approval_is_single_transition_and_workspace_scoped(tmp_path: Path) -> N
             staging_root=root,
             now=NOW,
         )
+
+
+def test_execution_token_is_consumed_once_when_run_is_claimed(tmp_path: Path) -> None:
+    store, scope, plan, root = _staging_plan(tmp_path)
+    approval = approve_cleanup_plan(
+        store,
+        scope,
+        plan["cleanup_run_id"],
+        expected_manifest_sha256=plan["manifest_sha256"],
+        staging_root=root,
+        now=NOW,
+    )
+
+    claimed = store.claim_cleanup_execution(
+        scope,
+        plan["cleanup_run_id"],
+        execution_token=approval.execution_token,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert claimed["status"] == "running"
+    assert claimed["started_at"] == "2026-09-14T08:01:00+00:00"
+    with store._connect() as conn:
+        token_fields = conn.execute(
+            """
+            SELECT execution_token_hash, execution_token_expires_at
+              FROM cover_cleanup_runs WHERE cleanup_run_id = ?
+            """,
+            (plan["cleanup_run_id"],),
+        ).fetchone()
+    assert tuple(token_fields) == (None, None)
+    with pytest.raises(ValueError, match="not approved"):
+        store.claim_cleanup_execution(
+            scope,
+            plan["cleanup_run_id"],
+            execution_token=approval.execution_token,
+            now=NOW + timedelta(minutes=2),
+        )
+
+
+def test_wrong_execution_token_does_not_change_approval(tmp_path: Path) -> None:
+    store, scope, plan, root = _staging_plan(tmp_path)
+    approve_cleanup_plan(
+        store,
+        scope,
+        plan["cleanup_run_id"],
+        expected_manifest_sha256=plan["manifest_sha256"],
+        staging_root=root,
+        now=NOW,
+    )
+
+    with pytest.raises(ValueError, match="token is invalid"):
+        store.claim_cleanup_execution(
+            scope,
+            plan["cleanup_run_id"],
+            execution_token="wrong-token-value",
+            now=NOW + timedelta(minutes=1),
+        )
+    assert store.get_cleanup_plan(scope, plan["cleanup_run_id"])["status"] == "approved"
+
+
+def test_expired_execution_token_cancels_the_plan(tmp_path: Path) -> None:
+    store, scope, plan, root = _staging_plan(tmp_path)
+    approval = approve_cleanup_plan(
+        store,
+        scope,
+        plan["cleanup_run_id"],
+        expected_manifest_sha256=plan["manifest_sha256"],
+        staging_root=root,
+        now=NOW,
+    )
+
+    with pytest.raises(ValueError, match="token has expired"):
+        store.claim_cleanup_execution(
+            scope,
+            plan["cleanup_run_id"],
+            execution_token=approval.execution_token,
+            now=NOW + timedelta(minutes=16),
+        )
+
+    expired = store.get_cleanup_plan(scope, plan["cleanup_run_id"])
+    assert expired["status"] == "cancelled"
+    assert expired["finished_at"] == "2026-09-14T08:16:00+00:00"

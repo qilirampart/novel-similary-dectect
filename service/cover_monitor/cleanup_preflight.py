@@ -41,7 +41,7 @@ def preflight_cleanup_plan(
     plan = store.get_cleanup_plan(scope, cleanup_run_id)
     if plan is None:
         return _blocked(cleanup_run_id, "cleanup_plan_not_found")
-    if str(plan["status"]) not in {"planned", "approved"}:
+    if str(plan["status"]) not in {"planned", "approved", "running"}:
         return _blocked(cleanup_run_id, "cleanup_plan_not_active")
     manifest_path = Path(str(plan["manifest_path"]))
     try:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
+import hmac
 import json
 from pathlib import Path
 import re
@@ -2312,6 +2314,99 @@ class CoverMonitorStore:
             ).fetchall()
         if updated is None:
             raise RuntimeError("cleanup approval did not return a row")
+        return _public_cleanup_plan(updated, item_rows)
+
+    def claim_cleanup_execution(
+        self,
+        scope: CoverAccessScope,
+        cleanup_run_id: str,
+        *,
+        execution_token: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        normalized_run_id = _required_text(cleanup_run_id, "cleanup_run_id")
+        raw_token = _required_text(execution_token, "execution_token")
+        if len(raw_token) > 512:
+            raise ValueError("execution token is invalid")
+        effective_now = now or datetime.now(timezone.utc)
+        if effective_now.tzinfo is None:
+            raise ValueError("now must include timezone")
+        effective_now = effective_now.astimezone(timezone.utc)
+        expired = False
+        updated = None
+        item_rows: list[Any] = []
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT * FROM cover_cleanup_runs
+                 WHERE cleanup_run_id = ? AND workspace_key = ?
+                """,
+                (normalized_run_id, workspace_key),
+            ).fetchone()
+            if row is None:
+                raise ValueError("cleanup plan not found")
+            if str(row["status"]) != "approved":
+                raise ValueError("cleanup plan is not approved")
+            stored_hash = str(row["execution_token_hash"] or "")
+            expires_text = str(row["execution_token_expires_at"] or "")
+            if not stored_hash or not expires_text:
+                raise ValueError("cleanup approval token is missing")
+            expires_at = _parse_aware_datetime(expires_text, "execution_token_expires_at")
+            if effective_now >= expires_at:
+                conn.execute(
+                    """
+                    UPDATE cover_cleanup_runs
+                       SET status = 'cancelled', execution_token_hash = NULL,
+                           execution_token_expires_at = NULL, finished_at = ?
+                     WHERE cleanup_run_id = ? AND workspace_key = ? AND status = 'approved'
+                    """,
+                    (
+                        effective_now.isoformat(timespec="seconds"),
+                        normalized_run_id,
+                        workspace_key,
+                    ),
+                )
+                conn.commit()
+                expired = True
+            else:
+                supplied_hash = sha256(raw_token.encode("utf-8")).hexdigest()
+                if not hmac.compare_digest(stored_hash, supplied_hash):
+                    raise ValueError("execution token is invalid")
+                changed = conn.execute(
+                    """
+                    UPDATE cover_cleanup_runs
+                       SET status = 'running', started_at = ?,
+                           execution_token_hash = NULL,
+                           execution_token_expires_at = NULL
+                     WHERE cleanup_run_id = ? AND workspace_key = ? AND status = 'approved'
+                    """,
+                    (
+                        effective_now.isoformat(timespec="seconds"),
+                        normalized_run_id,
+                        workspace_key,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise ValueError("cleanup plan is not approved")
+                updated = conn.execute(
+                    "SELECT * FROM cover_cleanup_runs WHERE cleanup_run_id = ?",
+                    (normalized_run_id,),
+                ).fetchone()
+                item_rows = conn.execute(
+                    """
+                    SELECT item_key, reason, byte_size, execution_status,
+                           result_message, executed_at
+                      FROM cover_cleanup_items
+                     WHERE cleanup_run_id = ? ORDER BY cleanup_item_id
+                    """,
+                    (normalized_run_id,),
+                ).fetchall()
+        if expired:
+            raise ValueError("execution token has expired")
+        if updated is None:
+            raise RuntimeError("cleanup execution claim did not return a row")
         return _public_cleanup_plan(updated, item_rows)
 
     def start_task_attempt(
