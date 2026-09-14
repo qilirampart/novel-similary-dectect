@@ -16,6 +16,7 @@ import {
   type CoverRunSummary
 } from "../api";
 import { Icon } from "../icons";
+import { coverRunStatusLabel } from "../coverDisplay";
 import { CoverChannelPanel } from "./CoverChannelPanel";
 import { CoverRiskReviewPanel } from "./CoverRiskReviewPanel";
 
@@ -352,7 +353,7 @@ export function CoverMonitorPage() {
               {run?.status === "paused" && <button className="outline-button slim" type="button" disabled={runBusy} onClick={() => void controlRun("resume")}>继续</button>}
               {run && ["queued", "running"].includes(run.status) && <button className="outline-button slim" type="button" disabled={runBusy} onClick={() => void controlRun("pause")}>暂停</button>}
               {run && ["queued", "running", "pause_requested", "paused"].includes(run.status) && <button className="ghost-button slim danger" type="button" disabled={runBusy} onClick={() => void controlRun("cancel")}>取消</button>}
-              {run && <span className={`cover-run-status ${run.status}`}>{statusLabel(run.status)}</span>}
+              {run && <span className={`cover-run-status ${run.status}`}>{coverRunStatusLabel(run.status, run.failed_item_count)}</span>}
             </div>
           </div>
           {run ? (
@@ -432,7 +433,7 @@ export function CoverMonitorPage() {
             <div className="cover-run-list-items">
               {runs.map((item) => (
                 <button key={item.run_id} type="button" className={selectedRunId === item.run_id ? "active" : ""} onClick={() => void loadRunDetail(item.run_id, 0)}>
-                  <span><strong>{item.run_id.slice(0, 8)}</strong><i className={item.status}>{statusLabel(item.status)}</i></span>
+                  <span><strong>{item.run_id.slice(0, 8)}</strong><i className={item.status}>{coverRunStatusLabel(item.status, item.failed_item_count)}</i></span>
                   <small>{item.total_channel_count} 个频道 · {item.completed_item_count + item.failed_item_count}/{item.total_item_count} 条</small>
                   <time>{new Date(item.created_at).toLocaleString("zh-CN")}</time>
                 </button>
@@ -448,7 +449,7 @@ export function CoverMonitorPage() {
                 <div className="cover-run-heading-actions">
                   <button className="outline-button slim" type="button" disabled={Boolean(exportBusy)} onClick={() => void exportRun("new-findings")}>{exportBusy === "new-findings" ? "生成中..." : "导出新增报告"}</button>
                   <button className="outline-button slim" type="button" disabled={Boolean(exportBusy)} onClick={() => void exportRun("historical-rectification")}>{exportBusy === "historical-rectification" ? "生成中..." : "导出整改报告"}</button>
-                  <span className={`cover-run-status ${runDetail.run.status}`}>{statusLabel(runDetail.run.status)}</span>
+                  <span className={`cover-run-status ${runDetail.run.status}`}>{coverRunStatusLabel(runDetail.run.status, runDetail.run.failed_item_count)}</span>
                 </div>
               </div>
               {exportMessage && <div className="cover-channel-message" role="status">{exportMessage}</div>}

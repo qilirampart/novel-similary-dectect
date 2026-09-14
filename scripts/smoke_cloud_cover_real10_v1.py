@@ -62,6 +62,7 @@ def save_report(path: Path, report: dict[str, Any]) -> None:
 
 def main() -> int:
     args = parse_args()
+    overall_started = time.perf_counter()
     password = os.environ.get(args.password_env, "")
     if not password:
         raise SystemExit(f"Missing password in environment variable: {args.password_env}")
@@ -216,9 +217,9 @@ def main() -> int:
         "content_type": export_response.headers.get("content-type"),
     }
     report["finished_at_epoch"] = time.time()
-    report["total_elapsed_seconds"] = round(time.perf_counter() - started, 3)
+    report["total_elapsed_seconds"] = round(time.perf_counter() - overall_started, 3)
     save_report(args.report, report)
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print(json.dumps(report, ensure_ascii=True, indent=2))
     return 0
 
 
