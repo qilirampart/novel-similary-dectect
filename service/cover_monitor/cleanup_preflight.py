@@ -93,7 +93,7 @@ def preflight_cleanup_plan(
             items.append(_skipped(str(item.get("item_key") or ""), "cleanup_item_not_pending"))
         else:
             items.append(
-                _preflight_staging_item(
+                preflight_staging_item(
                     allowed_root,
                     item,
                     now=effective_now,
@@ -175,7 +175,7 @@ def _preflight_asset_plan(
     )
 
 
-def _preflight_staging_item(
+def preflight_staging_item(
     root: Path,
     item: dict[str, object],
     *,
