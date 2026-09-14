@@ -38,6 +38,12 @@ def test_worker_installer_accepts_the_isolated_project_root() -> None:
     )
 
 
+def test_resource_parser_preserves_password_punctuation() -> None:
+    lines = ["密码：abc$123!xyz".encode("utf-8")]
+
+    assert installer._ascii_value(lines, 0) == "abc$123!xyz"
+
+
 def test_worker_preflight_reports_missing_required_environment_keys() -> None:
     missing = installer.missing_required_environment_keys(
         {

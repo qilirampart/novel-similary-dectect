@@ -273,7 +273,16 @@ class RemoteSession:
 def _ascii_value(lines: list[bytes], line_number: int) -> str:
     if line_number >= len(lines):
         raise ValueError(f"resource file has no line {line_number + 1}")
-    matches = re.findall(rb"[A-Za-z0-9._-]{4,}", lines[line_number])
+    raw_line = lines[line_number].strip()
+    for separator in ("：".encode("utf-8"), b":"):
+        if separator in raw_line:
+            value = raw_line.split(separator, 1)[1].decode("utf-8").strip()
+            if not value:
+                raise ValueError(
+                    f"resource file line {line_number + 1} has no credential value"
+                )
+            return value
+    matches = re.findall(rb"[A-Za-z0-9._-]{4,}", raw_line)
     if not matches:
         raise ValueError(f"resource file line {line_number + 1} has no credential value")
     return matches[-1].decode("ascii")
