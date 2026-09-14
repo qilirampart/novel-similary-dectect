@@ -2409,6 +2409,148 @@ class CoverMonitorStore:
             raise RuntimeError("cleanup execution claim did not return a row")
         return _public_cleanup_plan(updated, item_rows)
 
+    def record_cleanup_item_result(
+        self,
+        scope: CoverAccessScope,
+        cleanup_run_id: str,
+        *,
+        item_key: str,
+        execution_status: str,
+        result_message: str,
+        executed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        normalized_run_id = _required_text(cleanup_run_id, "cleanup_run_id")
+        normalized_item_key = _required_text(item_key, "item_key")
+        normalized_status = _required_text(execution_status, "execution_status")
+        if normalized_status not in {"deleted", "skipped", "failed"}:
+            raise ValueError("unsupported cleanup item result")
+        message = str(result_message or "")[:1000] or None
+        effective_time = executed_at or datetime.now(timezone.utc)
+        if effective_time.tzinfo is None:
+            raise ValueError("executed_at must include timezone")
+        executed_text = effective_time.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                """
+                SELECT status FROM cover_cleanup_runs
+                 WHERE cleanup_run_id = ? AND workspace_key = ?
+                """,
+                (normalized_run_id, workspace_key),
+            ).fetchone()
+            if run is None:
+                raise ValueError("cleanup plan not found")
+            if str(run["status"]) != "running":
+                raise ValueError("cleanup plan is not running")
+            item = conn.execute(
+                """
+                SELECT item_key, reason, byte_size, execution_status,
+                       result_message, executed_at
+                  FROM cover_cleanup_items
+                 WHERE cleanup_run_id = ? AND item_key = ?
+                """,
+                (normalized_run_id, normalized_item_key),
+            ).fetchone()
+            if item is None:
+                raise ValueError("cleanup item not found")
+            current_status = str(item["execution_status"])
+            if current_status != "pending":
+                if current_status == normalized_status and item["result_message"] == message:
+                    return dict(item)
+                raise ValueError("cleanup item is already finalized")
+            changed = conn.execute(
+                """
+                UPDATE cover_cleanup_items
+                   SET execution_status = ?, result_message = ?, executed_at = ?
+                 WHERE cleanup_run_id = ? AND item_key = ? AND execution_status = 'pending'
+                """,
+                (
+                    normalized_status,
+                    message,
+                    executed_text,
+                    normalized_run_id,
+                    normalized_item_key,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("cleanup item is already finalized")
+            updated = conn.execute(
+                """
+                SELECT item_key, reason, byte_size, execution_status,
+                       result_message, executed_at
+                  FROM cover_cleanup_items
+                 WHERE cleanup_run_id = ? AND item_key = ?
+                """,
+                (normalized_run_id, normalized_item_key),
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("cleanup item result did not return a row")
+        return dict(updated)
+
+    def finish_cleanup_execution(
+        self,
+        scope: CoverAccessScope,
+        cleanup_run_id: str,
+        *,
+        finished_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        normalized_run_id = _required_text(cleanup_run_id, "cleanup_run_id")
+        effective_time = finished_at or datetime.now(timezone.utc)
+        if effective_time.tzinfo is None:
+            raise ValueError("finished_at must include timezone")
+        finished_text = effective_time.astimezone(timezone.utc).isoformat(timespec="seconds")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                """
+                SELECT status FROM cover_cleanup_runs
+                 WHERE cleanup_run_id = ? AND workspace_key = ?
+                """,
+                (normalized_run_id, workspace_key),
+            ).fetchone()
+            if run is None:
+                raise ValueError("cleanup plan not found")
+            if str(run["status"]) != "running":
+                raise ValueError("cleanup plan is not running")
+            counts = conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN execution_status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+                    SUM(CASE WHEN execution_status = 'failed' THEN 1 ELSE 0 END) AS failed_count
+                  FROM cover_cleanup_items WHERE cleanup_run_id = ?
+                """,
+                (normalized_run_id,),
+            ).fetchone()
+            if int(counts["pending_count"] or 0) > 0:
+                raise ValueError("cleanup execution still has pending items")
+            status = "partial_failed" if int(counts["failed_count"] or 0) > 0 else "completed"
+            conn.execute(
+                """
+                UPDATE cover_cleanup_runs SET status = ?, finished_at = ?
+                 WHERE cleanup_run_id = ? AND workspace_key = ? AND status = 'running'
+                """,
+                (status, finished_text, normalized_run_id, workspace_key),
+            )
+            updated = conn.execute(
+                "SELECT * FROM cover_cleanup_runs WHERE cleanup_run_id = ?",
+                (normalized_run_id,),
+            ).fetchone()
+            item_rows = conn.execute(
+                """
+                SELECT item_key, reason, byte_size, execution_status,
+                       result_message, executed_at
+                  FROM cover_cleanup_items
+                 WHERE cleanup_run_id = ? ORDER BY cleanup_item_id
+                """,
+                (normalized_run_id,),
+            ).fetchall()
+        if updated is None:
+            raise RuntimeError("cleanup execution finish did not return a row")
+        return _public_cleanup_plan(updated, item_rows)
+
     def start_task_attempt(
         self,
         task_item_id: int,

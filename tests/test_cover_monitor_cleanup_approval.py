@@ -230,3 +230,83 @@ def test_expired_execution_token_cancels_the_plan(tmp_path: Path) -> None:
     expired = store.get_cleanup_plan(scope, plan["cleanup_run_id"])
     assert expired["status"] == "cancelled"
     assert expired["finished_at"] == "2026-09-14T08:16:00+00:00"
+
+
+def test_cleanup_item_results_are_immutable_and_finish_the_run(tmp_path: Path) -> None:
+    store, scope, plan, root = _staging_plan(tmp_path)
+    approval = approve_cleanup_plan(
+        store,
+        scope,
+        plan["cleanup_run_id"],
+        expected_manifest_sha256=plan["manifest_sha256"],
+        staging_root=root,
+        now=NOW,
+    )
+    claimed = store.claim_cleanup_execution(
+        scope,
+        plan["cleanup_run_id"],
+        execution_token=approval.execution_token,
+        now=NOW + timedelta(minutes=1),
+    )
+    item_key = claimed["items"][0]["item_key"]
+
+    recorded = store.record_cleanup_item_result(
+        scope,
+        plan["cleanup_run_id"],
+        item_key=item_key,
+        execution_status="deleted",
+        result_message="staging file deleted",
+        executed_at=NOW + timedelta(minutes=2),
+    )
+    repeated = store.record_cleanup_item_result(
+        scope,
+        plan["cleanup_run_id"],
+        item_key=item_key,
+        execution_status="deleted",
+        result_message="staging file deleted",
+        executed_at=NOW + timedelta(minutes=3),
+    )
+    assert recorded["execution_status"] == "deleted"
+    assert repeated == recorded
+    with pytest.raises(ValueError, match="already finalized"):
+        store.record_cleanup_item_result(
+            scope,
+            plan["cleanup_run_id"],
+            item_key=item_key,
+            execution_status="failed",
+            result_message="rewrite attempt",
+            executed_at=NOW + timedelta(minutes=3),
+        )
+
+    finished = store.finish_cleanup_execution(
+        scope,
+        plan["cleanup_run_id"],
+        finished_at=NOW + timedelta(minutes=4),
+    )
+    assert finished["status"] == "completed"
+    assert finished["finished_at"] == "2026-09-14T08:04:00+00:00"
+
+
+def test_cleanup_run_cannot_finish_with_pending_items(tmp_path: Path) -> None:
+    store, scope, plan, root = _staging_plan(tmp_path)
+    approval = approve_cleanup_plan(
+        store,
+        scope,
+        plan["cleanup_run_id"],
+        expected_manifest_sha256=plan["manifest_sha256"],
+        staging_root=root,
+        now=NOW,
+    )
+    store.claim_cleanup_execution(
+        scope,
+        plan["cleanup_run_id"],
+        execution_token=approval.execution_token,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    with pytest.raises(ValueError, match="pending items"):
+        store.finish_cleanup_execution(
+            scope,
+            plan["cleanup_run_id"],
+            finished_at=NOW + timedelta(minutes=2),
+        )
