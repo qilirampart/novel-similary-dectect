@@ -31,7 +31,9 @@ SCHEMA_PATH = ROOT_DIR / "service" / "business_schema_v1.sql"
 HIGH_RISK_REVIEW_LABEL = "强证据"
 DEFAULT_TASK_RECOVERY_STALE_SECONDS = 120.0
 DEFAULT_BUSINESS_DB_BUSY_TIMEOUT_MS = 60000
-BACKGROUND_DB_BUSY_TIMEOUT_MS = 250
+# Background maintenance already performs bounded retries. Keep SQLite's own
+# lock wait short so the nested waits stay comfortably inside the worker SLA.
+BACKGROUND_DB_BUSY_TIMEOUT_MS = 100
 BACKGROUND_DB_LOCK_ATTEMPTS = 3
 
 
