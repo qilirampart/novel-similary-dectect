@@ -8,6 +8,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
+from pathlib import PurePosixPath
 
 import paramiko
 
@@ -63,6 +64,12 @@ def parse_args() -> argparse.Namespace:
         help="Upload mapping in LOCAL=REMOTE form, useful for web-dist assets.",
     )
     parser.add_argument(
+        "--replace-dir",
+        action="append",
+        default=[],
+        help="Clear a release-relative directory in the inactive candidate before uploading.",
+    )
+    parser.add_argument(
         "--set-env",
         action="append",
         default=[],
@@ -109,6 +116,19 @@ def quote_remote(path: str) -> str:
 
 def safe_release_component(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-") or "release"
+
+
+def validate_release_relative_dir(value: str) -> str:
+    normalized = value.strip().replace("\\", "/")
+    raw_parts = normalized.split("/")
+    candidate = PurePosixPath(normalized)
+    if (
+        not normalized
+        or candidate.is_absolute()
+        or any(part in {"", ".", ".."} for part in raw_parts)
+    ):
+        raise ValueError(f"Unsafe release-relative directory: {value}")
+    return candidate.as_posix()
 
 
 class RemoteSession:
@@ -226,6 +246,7 @@ def deploy_release(
     release_name: str,
     files: list[str],
     file_maps: list[str],
+    replace_dirs: list[str],
     prepare_only: bool,
     set_env: list[str],
     skip_health_check: bool,
@@ -261,6 +282,16 @@ def deploy_release(
     remote.run(f"test ! -e {quote_remote(new_release)}")
     remote.run(f"mkdir -p {quote_remote(new_release)}")
     remote.run(f"cp -a {quote_remote(current_target)}/. {quote_remote(new_release)}/")
+
+    for relative_dir in replace_dirs:
+        safe_relative_dir = validate_release_relative_dir(relative_dir)
+        remote_dir = posixpath.join(new_release, safe_relative_dir)
+        quoted_dir = quote_remote(remote_dir)
+        remote.run(
+            f"test \"$(realpath -m -- {quoted_dir})\" = {quoted_dir} && "
+            f"mkdir -p {quoted_dir} && find {quoted_dir} -xdev -mindepth 1 -delete"
+        )
+        print("replace_dir:", safe_relative_dir)
 
     for relative_file in files:
         local_path = (ROOT_DIR / relative_file).resolve()
@@ -340,6 +371,7 @@ def main() -> int:
             release_name=release_name,
             files=args.files,
             file_maps=args.file_map,
+            replace_dirs=args.replace_dir,
             prepare_only=bool(args.prepare_only),
             set_env=args.set_env,
             skip_health_check=bool(args.skip_health_check),
