@@ -7,6 +7,7 @@ import hmac
 import json
 from pathlib import Path
 import re
+import secrets
 from typing import Any
 from uuid import uuid4
 
@@ -19,7 +20,7 @@ except Exception:
 
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 DEFAULT_BUSY_TIMEOUT_MS = 30_000
 
 
@@ -47,9 +48,17 @@ def _parse_aware_datetime(value: str, field: str) -> datetime:
 def _public_cleanup_plan(row: Any, item_rows: Any) -> dict[str, Any]:
     result = dict(row)
     result.pop("execution_token_hash", None)
+    result.pop("worker_lease_hash", None)
     result["policy"] = json.loads(str(result.pop("policy_json")))
     result["items"] = [dict(item) for item in item_rows]
     return result
+
+
+def _cleanup_lease_hash(value: str) -> str:
+    raw_token = _required_text(value, "worker_lease_token")
+    if len(raw_token) > 512:
+        raise ValueError("cleanup worker lease is invalid")
+    return sha256(raw_token.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -107,6 +116,12 @@ def init_cover_db(path: str | Path) -> None:
             conn.execute(
                 "ALTER TABLE cover_cleanup_runs ADD COLUMN execution_token_expires_at TEXT"
             )
+        if "worker_lease_hash" not in cleanup_columns:
+            conn.execute("ALTER TABLE cover_cleanup_runs ADD COLUMN worker_lease_hash TEXT")
+        if "worker_name" not in cleanup_columns:
+            conn.execute("ALTER TABLE cover_cleanup_runs ADD COLUMN worker_name TEXT")
+        if "last_heartbeat_at" not in cleanup_columns:
+            conn.execute("ALTER TABLE cover_cleanup_runs ADD COLUMN last_heartbeat_at TEXT")
         conn.execute(
             "INSERT OR IGNORE INTO cover_schema_versions (version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, _now()),
@@ -2322,6 +2337,7 @@ class CoverMonitorStore:
         cleanup_run_id: str,
         *,
         execution_token: str,
+        worker_name: str = "cover-cleanup-worker",
         now: datetime | None = None,
     ) -> dict[str, Any]:
         workspace_key = _required_text(scope.workspace_key, "workspace_key")
@@ -2329,11 +2345,14 @@ class CoverMonitorStore:
         raw_token = _required_text(execution_token, "execution_token")
         if len(raw_token) > 512:
             raise ValueError("execution token is invalid")
+        normalized_worker_name = _required_text(worker_name, "worker_name")[:200]
         effective_now = now or datetime.now(timezone.utc)
         if effective_now.tzinfo is None:
             raise ValueError("now must include timezone")
         effective_now = effective_now.astimezone(timezone.utc)
         expired = False
+        execution_lease_token = secrets.token_urlsafe(32)
+        worker_lease_hash = sha256(execution_lease_token.encode("utf-8")).hexdigest()
         updated = None
         item_rows: list[Any] = []
         with self._connect() as conn:
@@ -2379,10 +2398,14 @@ class CoverMonitorStore:
                     UPDATE cover_cleanup_runs
                        SET status = 'running', started_at = ?,
                            execution_token_hash = NULL,
-                           execution_token_expires_at = NULL
+                           execution_token_expires_at = NULL,
+                           worker_lease_hash = ?, worker_name = ?, last_heartbeat_at = ?
                      WHERE cleanup_run_id = ? AND workspace_key = ? AND status = 'approved'
                     """,
                     (
+                        effective_now.isoformat(timespec="seconds"),
+                        worker_lease_hash,
+                        normalized_worker_name,
                         effective_now.isoformat(timespec="seconds"),
                         normalized_run_id,
                         workspace_key,
@@ -2407,7 +2430,45 @@ class CoverMonitorStore:
             raise ValueError("execution token has expired")
         if updated is None:
             raise RuntimeError("cleanup execution claim did not return a row")
-        return _public_cleanup_plan(updated, item_rows)
+        result = _public_cleanup_plan(updated, item_rows)
+        result["execution_lease_token"] = execution_lease_token
+        return result
+
+    def heartbeat_cleanup_execution(
+        self,
+        scope: CoverAccessScope,
+        cleanup_run_id: str,
+        *,
+        worker_lease_token: str,
+        now: datetime | None = None,
+    ) -> bool:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        normalized_run_id = _required_text(cleanup_run_id, "cleanup_run_id")
+        lease_hash = _cleanup_lease_hash(worker_lease_token)
+        effective_time = now or datetime.now(timezone.utc)
+        if effective_time.tzinfo is None:
+            raise ValueError("now must include timezone")
+        heartbeat_at = effective_time.astimezone(timezone.utc).isoformat(timespec="seconds")
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT worker_lease_hash FROM cover_cleanup_runs
+                 WHERE cleanup_run_id = ? AND workspace_key = ? AND status = 'running'
+                """,
+                (normalized_run_id, workspace_key),
+            ).fetchone()
+            if row is None or not hmac.compare_digest(
+                str(row["worker_lease_hash"] or ""), lease_hash
+            ):
+                return False
+            changed = conn.execute(
+                """
+                UPDATE cover_cleanup_runs SET last_heartbeat_at = ?
+                 WHERE cleanup_run_id = ? AND workspace_key = ? AND status = 'running'
+                """,
+                (heartbeat_at, normalized_run_id, workspace_key),
+            ).rowcount
+        return changed == 1
 
     def record_cleanup_item_result(
         self,
@@ -2415,6 +2476,7 @@ class CoverMonitorStore:
         cleanup_run_id: str,
         *,
         item_key: str,
+        worker_lease_token: str,
         execution_status: str,
         result_message: str,
         executed_at: datetime | None = None,
@@ -2422,6 +2484,7 @@ class CoverMonitorStore:
         workspace_key = _required_text(scope.workspace_key, "workspace_key")
         normalized_run_id = _required_text(cleanup_run_id, "cleanup_run_id")
         normalized_item_key = _required_text(item_key, "item_key")
+        lease_hash = _cleanup_lease_hash(worker_lease_token)
         normalized_status = _required_text(execution_status, "execution_status")
         if normalized_status not in {"deleted", "skipped", "failed"}:
             raise ValueError("unsupported cleanup item result")
@@ -2435,7 +2498,7 @@ class CoverMonitorStore:
             conn.execute("BEGIN IMMEDIATE")
             run = conn.execute(
                 """
-                SELECT status FROM cover_cleanup_runs
+                SELECT status, worker_lease_hash FROM cover_cleanup_runs
                  WHERE cleanup_run_id = ? AND workspace_key = ?
                 """,
                 (normalized_run_id, workspace_key),
@@ -2444,6 +2507,8 @@ class CoverMonitorStore:
                 raise ValueError("cleanup plan not found")
             if str(run["status"]) != "running":
                 raise ValueError("cleanup plan is not running")
+            if not hmac.compare_digest(str(run["worker_lease_hash"] or ""), lease_hash):
+                raise ValueError("cleanup worker lease is invalid")
             item = conn.execute(
                 """
                 SELECT item_key, reason, byte_size, execution_status,
@@ -2494,10 +2559,12 @@ class CoverMonitorStore:
         scope: CoverAccessScope,
         cleanup_run_id: str,
         *,
+        worker_lease_token: str,
         finished_at: datetime | None = None,
     ) -> dict[str, Any]:
         workspace_key = _required_text(scope.workspace_key, "workspace_key")
         normalized_run_id = _required_text(cleanup_run_id, "cleanup_run_id")
+        lease_hash = _cleanup_lease_hash(worker_lease_token)
         effective_time = finished_at or datetime.now(timezone.utc)
         if effective_time.tzinfo is None:
             raise ValueError("finished_at must include timezone")
@@ -2506,7 +2573,7 @@ class CoverMonitorStore:
             conn.execute("BEGIN IMMEDIATE")
             run = conn.execute(
                 """
-                SELECT status FROM cover_cleanup_runs
+                SELECT status, worker_lease_hash FROM cover_cleanup_runs
                  WHERE cleanup_run_id = ? AND workspace_key = ?
                 """,
                 (normalized_run_id, workspace_key),
@@ -2515,6 +2582,8 @@ class CoverMonitorStore:
                 raise ValueError("cleanup plan not found")
             if str(run["status"]) != "running":
                 raise ValueError("cleanup plan is not running")
+            if not hmac.compare_digest(str(run["worker_lease_hash"] or ""), lease_hash):
+                raise ValueError("cleanup worker lease is invalid")
             counts = conn.execute(
                 """
                 SELECT
@@ -2529,7 +2598,9 @@ class CoverMonitorStore:
             status = "partial_failed" if int(counts["failed_count"] or 0) > 0 else "completed"
             conn.execute(
                 """
-                UPDATE cover_cleanup_runs SET status = ?, finished_at = ?
+                UPDATE cover_cleanup_runs
+                   SET status = ?, finished_at = ?, worker_lease_hash = NULL,
+                       worker_name = NULL, last_heartbeat_at = NULL
                  WHERE cleanup_run_id = ? AND workspace_key = ? AND status = 'running'
                 """,
                 (status, finished_text, normalized_run_id, workspace_key),
@@ -2549,6 +2620,79 @@ class CoverMonitorStore:
             ).fetchall()
         if updated is None:
             raise RuntimeError("cleanup execution finish did not return a row")
+        return _public_cleanup_plan(updated, item_rows)
+
+    def recover_stale_cleanup_execution(
+        self,
+        scope: CoverAccessScope,
+        cleanup_run_id: str,
+        *,
+        stale_before: datetime,
+        recovered_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        normalized_run_id = _required_text(cleanup_run_id, "cleanup_run_id")
+        if stale_before.tzinfo is None:
+            raise ValueError("stale_before must include timezone")
+        effective_recovered_at = recovered_at or datetime.now(timezone.utc)
+        if effective_recovered_at.tzinfo is None:
+            raise ValueError("recovered_at must include timezone")
+        stale_time = stale_before.astimezone(timezone.utc)
+        recovered_text = effective_recovered_at.astimezone(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                """
+                SELECT status, last_heartbeat_at FROM cover_cleanup_runs
+                 WHERE cleanup_run_id = ? AND workspace_key = ?
+                """,
+                (normalized_run_id, workspace_key),
+            ).fetchone()
+            if run is None:
+                raise ValueError("cleanup plan not found")
+            if str(run["status"]) != "running":
+                raise ValueError("cleanup plan is not running")
+            heartbeat = str(run["last_heartbeat_at"] or "")
+            if not heartbeat or _parse_aware_datetime(
+                heartbeat, "last_heartbeat_at"
+            ) >= stale_time:
+                raise ValueError("cleanup execution is not stale")
+            conn.execute(
+                """
+                UPDATE cover_cleanup_items
+                   SET execution_status = 'failed', result_message = 'execution_interrupted',
+                       executed_at = ?
+                 WHERE cleanup_run_id = ? AND execution_status = 'pending'
+                """,
+                (recovered_text, normalized_run_id),
+            )
+            conn.execute(
+                """
+                UPDATE cover_cleanup_runs
+                   SET status = 'partial_failed', finished_at = ?,
+                       worker_lease_hash = NULL, worker_name = NULL,
+                       last_heartbeat_at = NULL
+                 WHERE cleanup_run_id = ? AND workspace_key = ? AND status = 'running'
+                """,
+                (recovered_text, normalized_run_id, workspace_key),
+            )
+            updated = conn.execute(
+                "SELECT * FROM cover_cleanup_runs WHERE cleanup_run_id = ?",
+                (normalized_run_id,),
+            ).fetchone()
+            item_rows = conn.execute(
+                """
+                SELECT item_key, reason, byte_size, execution_status,
+                       result_message, executed_at
+                  FROM cover_cleanup_items
+                 WHERE cleanup_run_id = ? ORDER BY cleanup_item_id
+                """,
+                (normalized_run_id,),
+            ).fetchall()
+        if updated is None:
+            raise RuntimeError("cleanup recovery did not return a row")
         return _public_cleanup_plan(updated, item_rows)
 
     def start_task_attempt(

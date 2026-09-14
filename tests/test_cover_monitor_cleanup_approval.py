@@ -169,15 +169,23 @@ def test_execution_token_is_consumed_once_when_run_is_claimed(tmp_path: Path) ->
 
     assert claimed["status"] == "running"
     assert claimed["started_at"] == "2026-09-14T08:01:00+00:00"
+    assert claimed["execution_lease_token"]
+    assert "worker_lease_hash" not in claimed
     with store._connect() as conn:
         token_fields = conn.execute(
             """
-            SELECT execution_token_hash, execution_token_expires_at
+            SELECT execution_token_hash, execution_token_expires_at,
+                   worker_lease_hash, last_heartbeat_at
               FROM cover_cleanup_runs WHERE cleanup_run_id = ?
             """,
             (plan["cleanup_run_id"],),
         ).fetchone()
-    assert tuple(token_fields) == (None, None)
+    assert tuple(token_fields) == (
+        None,
+        None,
+        sha256(claimed["execution_lease_token"].encode("utf-8")).hexdigest(),
+        "2026-09-14T08:01:00+00:00",
+    )
     with pytest.raises(ValueError, match="not approved"):
         store.claim_cleanup_execution(
             scope,
@@ -249,11 +257,13 @@ def test_cleanup_item_results_are_immutable_and_finish_the_run(tmp_path: Path) -
         now=NOW + timedelta(minutes=1),
     )
     item_key = claimed["items"][0]["item_key"]
+    lease_token = claimed["execution_lease_token"]
 
     recorded = store.record_cleanup_item_result(
         scope,
         plan["cleanup_run_id"],
         item_key=item_key,
+        worker_lease_token=lease_token,
         execution_status="deleted",
         result_message="staging file deleted",
         executed_at=NOW + timedelta(minutes=2),
@@ -262,6 +272,7 @@ def test_cleanup_item_results_are_immutable_and_finish_the_run(tmp_path: Path) -
         scope,
         plan["cleanup_run_id"],
         item_key=item_key,
+        worker_lease_token=lease_token,
         execution_status="deleted",
         result_message="staging file deleted",
         executed_at=NOW + timedelta(minutes=3),
@@ -273,6 +284,7 @@ def test_cleanup_item_results_are_immutable_and_finish_the_run(tmp_path: Path) -
             scope,
             plan["cleanup_run_id"],
             item_key=item_key,
+            worker_lease_token=lease_token,
             execution_status="failed",
             result_message="rewrite attempt",
             executed_at=NOW + timedelta(minutes=3),
@@ -281,6 +293,7 @@ def test_cleanup_item_results_are_immutable_and_finish_the_run(tmp_path: Path) -
     finished = store.finish_cleanup_execution(
         scope,
         plan["cleanup_run_id"],
+        worker_lease_token=lease_token,
         finished_at=NOW + timedelta(minutes=4),
     )
     assert finished["status"] == "completed"
@@ -297,7 +310,7 @@ def test_cleanup_run_cannot_finish_with_pending_items(tmp_path: Path) -> None:
         staging_root=root,
         now=NOW,
     )
-    store.claim_cleanup_execution(
+    claimed = store.claim_cleanup_execution(
         scope,
         plan["cleanup_run_id"],
         execution_token=approval.execution_token,
@@ -308,5 +321,80 @@ def test_cleanup_run_cannot_finish_with_pending_items(tmp_path: Path) -> None:
         store.finish_cleanup_execution(
             scope,
             plan["cleanup_run_id"],
+            worker_lease_token=claimed["execution_lease_token"],
             finished_at=NOW + timedelta(minutes=2),
         )
+
+
+def test_cleanup_execution_lease_controls_heartbeat_and_result_writes(tmp_path: Path) -> None:
+    store, scope, plan, root = _staging_plan(tmp_path)
+    approval = approve_cleanup_plan(
+        store,
+        scope,
+        plan["cleanup_run_id"],
+        expected_manifest_sha256=plan["manifest_sha256"],
+        staging_root=root,
+        now=NOW,
+    )
+    claimed = store.claim_cleanup_execution(
+        scope,
+        plan["cleanup_run_id"],
+        execution_token=approval.execution_token,
+        worker_name="cleanup-test-worker",
+        now=NOW + timedelta(minutes=1),
+    )
+    lease_token = claimed["execution_lease_token"]
+    item_key = claimed["items"][0]["item_key"]
+
+    assert store.heartbeat_cleanup_execution(
+        scope,
+        plan["cleanup_run_id"],
+        worker_lease_token=lease_token,
+        now=NOW + timedelta(minutes=2),
+    )
+    assert not store.heartbeat_cleanup_execution(
+        scope,
+        plan["cleanup_run_id"],
+        worker_lease_token="wrong-lease",
+        now=NOW + timedelta(minutes=3),
+    )
+    with pytest.raises(ValueError, match="worker lease"):
+        store.record_cleanup_item_result(
+            scope,
+            plan["cleanup_run_id"],
+            item_key=item_key,
+            worker_lease_token="wrong-lease",
+            execution_status="deleted",
+            result_message="must not write",
+            executed_at=NOW + timedelta(minutes=3),
+        )
+
+
+def test_stale_cleanup_execution_is_closed_and_pending_items_are_failed(tmp_path: Path) -> None:
+    store, scope, plan, root = _staging_plan(tmp_path)
+    approval = approve_cleanup_plan(
+        store,
+        scope,
+        plan["cleanup_run_id"],
+        expected_manifest_sha256=plan["manifest_sha256"],
+        staging_root=root,
+        now=NOW,
+    )
+    store.claim_cleanup_execution(
+        scope,
+        plan["cleanup_run_id"],
+        execution_token=approval.execution_token,
+        worker_name="crashed-worker",
+        now=NOW + timedelta(minutes=1),
+    )
+
+    recovered = store.recover_stale_cleanup_execution(
+        scope,
+        plan["cleanup_run_id"],
+        stale_before=NOW + timedelta(minutes=5),
+        recovered_at=NOW + timedelta(minutes=10),
+    )
+
+    assert recovered["status"] == "partial_failed"
+    assert recovered["items"][0]["execution_status"] == "failed"
+    assert recovered["items"][0]["result_message"] == "execution_interrupted"

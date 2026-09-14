@@ -36,7 +36,7 @@ def test_init_cover_db_is_idempotent_and_enables_required_tables(tmp_path: Path)
             ).fetchall()
         }
 
-    assert version == 10
+    assert version == 11
     assert "idx_cover_runs_claim" in indexes
     assert "idx_cover_task_items_run_claim" in indexes
     assert "uq_cover_detections_task_item" in indexes
@@ -98,13 +98,16 @@ def test_init_cover_db_migrates_existing_assets_to_local_storage_backend(tmp_pat
         ).fetchone()[0]
         version = conn.execute("SELECT MAX(version) FROM cover_schema_versions").fetchone()[0]
     assert backend == "local"
-    assert version == 10
+    assert version == 11
 
 
-def test_init_cover_db_adds_cleanup_token_columns_to_v9_database(tmp_path: Path) -> None:
+def test_init_cover_db_adds_cleanup_execution_columns_to_v9_database(tmp_path: Path) -> None:
     db_path = tmp_path / "cover-monitor-v9.sqlite3"
     legacy_schema = SCHEMA_PATH.read_text(encoding="utf-8").replace(
         "    execution_token_hash TEXT,\n    execution_token_expires_at TEXT,\n",
+        "",
+    ).replace(
+        "    worker_lease_hash TEXT,\n    worker_name TEXT,\n    last_heartbeat_at TEXT,\n",
         "",
     )
     with sqlite3.connect(db_path) as conn:
@@ -121,8 +124,14 @@ def test_init_cover_db_adds_cleanup_token_columns_to_v9_database(tmp_path: Path)
             row[1] for row in conn.execute("PRAGMA table_info(cover_cleanup_runs)").fetchall()
         }
         version = conn.execute("SELECT MAX(version) FROM cover_schema_versions").fetchone()[0]
-    assert {"execution_token_hash", "execution_token_expires_at"}.issubset(columns)
-    assert version == 10
+    assert {
+        "execution_token_hash",
+        "execution_token_expires_at",
+        "worker_lease_hash",
+        "worker_name",
+        "last_heartbeat_at",
+    }.issubset(columns)
+    assert version == 11
 
 
 def test_cleanup_plan_registration_is_workspace_scoped_and_auditable(tmp_path: Path) -> None:

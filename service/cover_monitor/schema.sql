@@ -394,6 +394,9 @@ CREATE TABLE IF NOT EXISTS cover_cleanup_runs (
     approved_at TEXT,
     execution_token_hash TEXT,
     execution_token_expires_at TEXT,
+    worker_lease_hash TEXT,
+    worker_name TEXT,
+    last_heartbeat_at TEXT,
     started_at TEXT,
     finished_at TEXT,
     UNIQUE (workspace_key, cleanup_kind, manifest_sha256)
