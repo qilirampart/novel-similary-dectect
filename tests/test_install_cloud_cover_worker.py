@@ -62,6 +62,8 @@ class FakeRemote:
             "current_release": str(remote_root / "releases" / "test"),
             "worker_script_ready": True,
             "python_ready": True,
+            "dependencies_ready": True,
+            "missing_dependencies": [],
             "environment_file_ready": True,
             "environment_keys": sorted(installer.REQUIRED_ENVIRONMENT_KEYS),
             "proxy_service": "active",
@@ -110,3 +112,26 @@ def test_execute_installs_and_starts_only_after_preflight_passes() -> None:
         "systemctl enable --now novel-similarity-cover-worker.service",
         "systemctl is-active novel-similarity-cover-worker.service",
     ]
+
+
+def test_execute_is_blocked_when_cover_worker_dependencies_are_missing() -> None:
+    remote = FakeRemote()
+    original_inspect = remote.inspect_worker_prerequisites
+
+    def missing_dependencies(remote_root: PurePosixPath) -> dict[str, object]:
+        result = original_inspect(remote_root)
+        result["dependencies_ready"] = False
+        return result
+
+    remote.inspect_worker_prerequisites = missing_dependencies  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="dependencies_ready"):
+        installer.provision_worker(
+            remote,
+            remote_root="/opt/novel-similarity-service",
+            service_name="novel-similarity-cover-worker.service",
+            api_service="novel-similarity-api.service",
+            execute=True,
+        )
+
+    assert remote.installed_units == []

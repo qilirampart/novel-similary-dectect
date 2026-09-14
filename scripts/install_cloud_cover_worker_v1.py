@@ -29,6 +29,7 @@ REQUIRED_ENVIRONMENT_KEYS = frozenset(
         "COVER_MONITOR_VISION_MODEL",
     }
 )
+REQUIRED_PYTHON_MODULES = ("PIL", "yt_dlp", "alibabacloud_oss_v2")
 _SERVICE_NAME = re.compile(r"[A-Za-z0-9_.@-]+\.service")
 
 
@@ -102,7 +103,12 @@ def provision_worker(
     }
     missing_keys = missing_required_environment_keys(environment_keys)
     blockers = []
-    for key in ("worker_script_ready", "python_ready", "environment_file_ready"):
+    for key in (
+        "worker_script_ready",
+        "python_ready",
+        "dependencies_ready",
+        "environment_file_ready",
+    ):
         if prerequisites.get(key) is not True:
             blockers.append(key)
     if missing_keys:
@@ -185,10 +191,13 @@ class RemoteSession:
             f"{shlex.quote(env_path)} "
             "|| true"
         )
+        dependencies_ready, missing_dependencies = self._dependency_status(python_path)
         return {
             "current_release": self.run(f"readlink -f {shlex.quote(current)}").strip(),
             "worker_script_ready": self._path_test(worker_path, "-f"),
             "python_ready": self._path_test(python_path, "-x"),
+            "dependencies_ready": dependencies_ready,
+            "missing_dependencies": missing_dependencies,
             "environment_file_ready": self._path_test(env_path, "-f"),
             "environment_keys": sorted(set(environment_output.splitlines())),
             "proxy_service": self.run(
@@ -201,6 +210,23 @@ class RemoteSession:
             f"if test {predicate} {shlex.quote(path)}; then printf ready; else printf missing; fi"
         )
         return result.strip() == "ready"
+
+    def _dependency_status(self, python_path: str) -> tuple[bool, list[str]]:
+        command = (
+            "import importlib.util,json;"
+            f"names={list(REQUIRED_PYTHON_MODULES)!r};"
+            "print(json.dumps([name for name in names if importlib.util.find_spec(name) is None]))"
+        )
+        result = self.run(
+            f"{shlex.quote(python_path)} -c {shlex.quote(command)} || true"
+        )
+        try:
+            missing = json.loads(result)
+        except json.JSONDecodeError:
+            return False, list(REQUIRED_PYTHON_MODULES)
+        if not isinstance(missing, list) or not all(isinstance(item, str) for item in missing):
+            return False, list(REQUIRED_PYTHON_MODULES)
+        return not missing, sorted(set(missing))
 
     def install_unit(self, service_name: str, content: str) -> bytes | None:
         unit_path = f"/etc/systemd/system/{service_name}"
