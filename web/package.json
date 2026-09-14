@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
-    "test": "node test/workflowLinks.test.mjs",
+    "build": "node scripts/clean-dist.mjs && tsc && vite build",
+    "test": "node test/workflowLinks.test.mjs && node test/cleanDist.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

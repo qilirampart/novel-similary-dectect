@@ -6,6 +6,9 @@ const appBasePath = process.env.VITE_APP_BASE_PATH || "/";
 export default defineConfig({
   base: appBasePath,
   plugins: [react()],
+  build: {
+    emptyOutDir: true
+  },
   server: {
     host: "127.0.0.1",
     port: 4175,

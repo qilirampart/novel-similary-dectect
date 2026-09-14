@@ -168,7 +168,8 @@ def inspect_remote(
     print("service_state:")
     print(
         remote.run(
-            f"systemctl show {quote_remote(service_name)} --property=ActiveState,SubState,FragmentPath,Environment",
+            f"systemctl show {quote_remote(service_name)} "
+            "--property=ActiveState,SubState,MainPID,FragmentPath",
             allow_failure=True,
         ).strip()
     )
