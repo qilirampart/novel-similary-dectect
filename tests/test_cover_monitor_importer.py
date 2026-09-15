@@ -160,6 +160,49 @@ def test_confirm_import_is_idempotent_and_preserves_legacy_observation(tmp_path:
         assert conn.execute("SELECT COUNT(*) FROM cover_videos").fetchone()[0] == 1
 
 
+def test_historical_baseline_controls_incremental_scan_reasons(tmp_path: Path) -> None:
+    source = tmp_path / "baseline.xlsx"
+    _write_workbook(
+        source,
+        [
+            _row("代理甲", "UC-1", "video-safe", "safe"),
+            _row("代理甲", "UC-1", "video-risk", "risk"),
+            _row("代理甲", "UC-1", "video-review", "review"),
+            _row("代理甲", "UC-1", "video-unknown", "unknown"),
+        ],
+    )
+    store = CoverMonitorStore(tmp_path / "cover.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    preview = store.create_import_preview(
+        scope,
+        import_kind="baseline",
+        source_file_name=source.name,
+        source_file_sha256="sha-scan-reasons",
+        source_file_path=str(source),
+    )
+    store.confirm_import(scope, preview["import_id"])
+
+    with sqlite3.connect(store.path) as conn:
+        conn.row_factory = sqlite3.Row
+        videos = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT video_pk, video_id FROM cover_videos ORDER BY video_id"
+            )
+        ]
+    reasons = {
+        video["video_id"]: store.get_video_scan_reason(scope, video["video_pk"])
+        for video in videos
+    }
+
+    assert reasons == {
+        "video-safe": None,
+        "video-risk": "historical_risk",
+        "video-review": "historical_risk",
+        "video-unknown": "retry_unknown",
+    }
+
+
 def test_same_file_hash_returns_existing_preview_without_duplicate_rows(tmp_path: Path) -> None:
     source = tmp_path / "channels.xlsx"
     _write_workbook(source, [_row("代理甲", "UC-1", "video-1")])

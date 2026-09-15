@@ -1779,6 +1779,8 @@ class CoverMonitorStore:
                         reason = "historical_risk"
                     elif historical_risk == "unknown":
                         reason = "retry_unknown"
+                    elif historical_risk == "safe":
+                        reason = None
                     else:
                         # Imported videos without a current-model result are new to this detector.
                         reason = "new_video"

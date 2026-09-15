@@ -16,7 +16,7 @@ import {
   type CoverRunSummary
 } from "../api";
 import { Icon } from "../icons";
-import { coverRunStatusLabel } from "../coverDisplay";
+import { coverRunActions, coverRunStatusLabel, type CoverRunAction } from "../coverDisplay";
 import { CoverChannelPanel } from "./CoverChannelPanel";
 import { CoverRiskReviewPanel } from "./CoverRiskReviewPanel";
 
@@ -213,14 +213,20 @@ export function CoverMonitorPage() {
     }
   }
 
-  async function controlRun(action: "pause" | "resume" | "cancel") {
-    const runId = overview.latest_run?.run_id;
+  async function controlRun(action: CoverRunAction, requestedRunId?: string) {
+    const runId = requestedRunId || overview.latest_run?.run_id;
     if (!runId) return;
     setRunBusy(true);
     setError("");
     try {
       await controlCoverMonitorRun(runId, action);
       await loadOverview(true);
+      if (activeTab === "巡检批次" && runId === selectedRunId) {
+        await loadRunDetail(runId, itemOffset, true);
+        const response = await listCoverMonitorRuns(50, 0);
+        setRuns(response.items);
+        setRunTotal(response.total);
+      }
     } catch (controlError) {
       setError(controlError instanceof Error ? controlError.message : "巡检状态更新失败");
     } finally {
@@ -281,6 +287,8 @@ export function CoverMonitorPage() {
 
   const run = overview.latest_run;
   const progress = runProgress(overview);
+  const currentRunActions = coverRunActions(run?.status || "");
+  const selectedRunActions = coverRunActions(runDetail?.run.status || "");
   const distributionTotal = Object.values(overview.risk_distribution).reduce(
     (total, value) => total + value,
     0
@@ -350,9 +358,9 @@ export function CoverMonitorPage() {
           <div className="section-heading">
             <div><h2>当前巡检批次</h2><p>采集、封面下载和模型检测将分别记录进度。</p></div>
             <div className="cover-run-heading-actions">
-              {run?.status === "paused" && <button className="outline-button slim" type="button" disabled={runBusy} onClick={() => void controlRun("resume")}>继续</button>}
-              {run && ["queued", "running"].includes(run.status) && <button className="outline-button slim" type="button" disabled={runBusy} onClick={() => void controlRun("pause")}>暂停</button>}
-              {run && ["queued", "running", "pause_requested", "paused"].includes(run.status) && <button className="ghost-button slim danger" type="button" disabled={runBusy} onClick={() => void controlRun("cancel")}>取消</button>}
+              {currentRunActions.includes("resume") && <button className="outline-button slim" type="button" disabled={runBusy} onClick={() => void controlRun("resume")}>继续</button>}
+              {currentRunActions.includes("pause") && <button className="outline-button slim" type="button" disabled={runBusy} onClick={() => void controlRun("pause")}>暂停</button>}
+              {currentRunActions.includes("cancel") && <button className="ghost-button slim danger" type="button" disabled={runBusy} onClick={() => void controlRun("cancel")}>取消</button>}
               {run && <span className={`cover-run-status ${run.status}`}>{coverRunStatusLabel(run.status, run.failed_item_count)}</span>}
             </div>
           </div>
@@ -447,6 +455,9 @@ export function CoverMonitorPage() {
               <div className="section-heading">
                 <div><h2>批次 {runDetail.run.run_id.slice(0, 8)}</h2><p>{runDetail.run.status_message || "等待状态更新"}</p></div>
                 <div className="cover-run-heading-actions">
+                  {selectedRunActions.includes("resume") && <button className="outline-button slim" type="button" disabled={runBusy} onClick={() => void controlRun("resume", runDetail.run.run_id)}>继续</button>}
+                  {selectedRunActions.includes("pause") && <button className="outline-button slim" type="button" disabled={runBusy} onClick={() => void controlRun("pause", runDetail.run.run_id)}>暂停</button>}
+                  {selectedRunActions.includes("cancel") && <button className="ghost-button slim danger" type="button" disabled={runBusy} onClick={() => void controlRun("cancel", runDetail.run.run_id)}>取消</button>}
                   <button className="outline-button slim" type="button" disabled={Boolean(exportBusy)} onClick={() => void exportRun("new-findings")}>{exportBusy === "new-findings" ? "生成中..." : "导出新增报告"}</button>
                   <button className="outline-button slim" type="button" disabled={Boolean(exportBusy)} onClick={() => void exportRun("historical-rectification")}>{exportBusy === "historical-rectification" ? "生成中..." : "导出整改报告"}</button>
                   <span className={`cover-run-status ${runDetail.run.status}`}>{coverRunStatusLabel(runDetail.run.status, runDetail.run.failed_item_count)}</span>

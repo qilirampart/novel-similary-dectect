@@ -16,3 +16,12 @@ export function coverRunStatusLabel(status: string, failedItemCount: number): st
   }
   return RUN_STATUS_LABELS[status] || status || "未知";
 }
+
+export type CoverRunAction = "pause" | "resume" | "cancel";
+
+export function coverRunActions(status: string): CoverRunAction[] {
+  if (status === "paused") return ["resume", "cancel"];
+  if (status === "queued" || status === "running") return ["pause", "cancel"];
+  if (status === "pause_requested") return ["cancel"];
+  return [];
+}
