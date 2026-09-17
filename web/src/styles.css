@@ -5934,8 +5934,8 @@ button {
 
 .cover-channel-filterbar > .cover-channel-operator-filter {
   margin-left: 0;
-  display: grid;
-  gap: 4px;
+  display: flex;
+  align-items: center;
 }
 
 .cover-channel-filterbar > span {
@@ -5977,11 +5977,6 @@ button {
 
 .cover-channel-selectionbar .danger {
   margin-left: auto;
-}
-
-.cover-channel-operator-filter span {
-  color: var(--text-faint);
-  font-size: 10px;
 }
 
 .cover-channel-operator-filter select {

@@ -14,6 +14,13 @@ import {
   selectAllFiltered as buildAllFilteredSelection,
   selectFirstFiltered
 } from "../coverChannelSelection";
+import {
+  clearCoverChannelCache,
+  getCachedChannelPage,
+  getCachedFilterOptions,
+  setCachedChannelPage,
+  setCachedFilterOptions
+} from "../coverChannelCache";
 
 const PAGE_SIZE = 50;
 const EMPTY_FILTER_OPTIONS: CoverFilterOptionsResponse = { operators: [], channels: [] };
@@ -37,15 +44,16 @@ function scanLabel(channel: CoverChannelSummary): string {
 }
 
 export function CoverChannelPanel() {
-  const [channels, setChannels] = useState<CoverChannelSummary[]>([]);
-  const [total, setTotal] = useState(0);
+  const initialPageRef = useRef(getCachedChannelPage({ keyword: "", operatorPk: undefined, offset: 0 }));
+  const [channels, setChannels] = useState<CoverChannelSummary[]>(initialPageRef.current?.items ?? []);
+  const [total, setTotal] = useState(initialPageRef.current?.total ?? 0);
   const [offset, setOffset] = useState(0);
   const [keywordInput, setKeywordInput] = useState("");
   const [keyword, setKeyword] = useState("");
   const [operatorPk, setOperatorPk] = useState<number | undefined>();
-  const [filterOptions, setFilterOptions] = useState(EMPTY_FILTER_OPTIONS);
+  const [filterOptions, setFilterOptions] = useState(getCachedFilterOptions() ?? EMPTY_FILTER_OPTIONS);
   const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!initialPageRef.current);
   const [running, setRunning] = useState(false);
   const [selectionBusy, setSelectionBusy] = useState(false);
   const [firstCount, setFirstCount] = useState(50);
@@ -56,7 +64,19 @@ export function CoverChannelPanel() {
 
   async function load(nextOffset = offset) {
     const requestId = ++requestRef.current;
-    setLoading(true);
+    const query = { keyword, operatorPk, offset: nextOffset };
+    const cached = getCachedChannelPage(query);
+    if (cached) {
+      setChannels(cached.items);
+      setTotal(cached.total);
+      setOffset(cached.offset);
+      setLoading(false);
+    } else {
+      setChannels([]);
+      setTotal(0);
+      setOffset(nextOffset);
+      setLoading(true);
+    }
     setError("");
     try {
       const response = await listCoverMonitorChannels({
@@ -67,12 +87,15 @@ export function CoverChannelPanel() {
         offset: nextOffset
       });
       if (requestId !== requestRef.current) return;
+      setCachedChannelPage(query, response);
       setChannels(response.items);
       setTotal(response.total);
       setOffset(response.offset);
     } catch (loadError) {
       if (requestId !== requestRef.current) return;
-      setError(loadError instanceof Error ? loadError.message : "频道清单加载失败");
+      if (!cached) {
+        setError(loadError instanceof Error ? loadError.message : "频道清单加载失败");
+      }
     } finally {
       if (requestId === requestRef.current) setLoading(false);
     }
@@ -83,8 +106,13 @@ export function CoverChannelPanel() {
   }, [keyword, operatorPk]);
 
   useEffect(() => {
+    const cached = getCachedFilterOptions();
+    if (cached) setFilterOptions(cached);
     void getCoverMonitorFilterOptions()
-      .then(setFilterOptions)
+      .then((response) => {
+        setCachedFilterOptions(response);
+        setFilterOptions(response);
+      })
       .catch((loadError) => setError(loadError instanceof Error ? loadError.message : "代理筛选项加载失败"));
   }, []);
 
@@ -197,6 +225,7 @@ export function CoverChannelPanel() {
     setError("");
     try {
       const result = await deactivateCoverMonitorChannels(Array.from(selected));
+      clearCoverChannelCache();
       setSelected(new Set());
       setMessage(`已软删除 ${formatNumber(result.deactivated_count)} 个频道，历史数据均已保留。`);
       await load(0);
@@ -222,7 +251,6 @@ export function CoverChannelPanel() {
           <button className="outline-button slim" type="submit">搜索</button>
         </form>
         <label className="cover-channel-operator-filter">
-          <span>代理归属</span>
           <select
             aria-label="按代理归属筛选频道"
             value={operatorPk ?? ""}
