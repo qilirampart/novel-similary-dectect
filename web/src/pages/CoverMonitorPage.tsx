@@ -7,11 +7,13 @@ import {
   downloadCoverMonitorRunExport,
   getCoverMonitorOverview,
   getCoverMonitorRunDetail,
+  listCoverMonitorResults,
   listCoverMonitorRuns,
   previewCoverMonitorImport,
   type CoverImportKind,
   type CoverImportResponse,
   type CoverMonitorOverviewResponse,
+  type CoverResultListResponse,
   type CoverRunDetailResponse,
   type CoverRunSummary
 } from "../api";
@@ -28,6 +30,20 @@ const EMPTY_OVERVIEW: CoverMonitorOverviewResponse = {
   pending_review_count: 0,
   risk_distribution: { safe: 0, review: 0, risk: 0, unknown: 0 },
   latest_run: null
+};
+
+const EMPTY_RESULTS: CoverResultListResponse = {
+  items: [],
+  total: 0,
+  limit: 12,
+  offset: 0,
+  counts: { all: 0, risk: 0, review: 0, unknown: 0 }
+};
+
+const resultRiskLabels: Record<string, string> = {
+  risk: "风险",
+  review: "待复核",
+  unknown: "检测异常"
 };
 
 const tabs = ["工作台", "频道清单", "巡检批次", "风险复核", "历史整改"];
@@ -92,6 +108,9 @@ export function CoverMonitorPage() {
   const [selectedRunId, setSelectedRunId] = useState("");
   const [runDetail, setRunDetail] = useState<CoverRunDetailResponse | null>(null);
   const [runListLoading, setRunListLoading] = useState(false);
+  const [results, setResults] = useState<CoverResultListResponse>(EMPTY_RESULTS);
+  const [resultFilter, setResultFilter] = useState("");
+  const [resultLoading, setResultLoading] = useState(true);
   const [itemOffset, setItemOffset] = useState(0);
   const [importKind, setImportKind] = useState<CoverImportKind>("channels");
   const [importFile, setImportFile] = useState<File | null>(null);
@@ -133,6 +152,21 @@ export function CoverMonitorPage() {
   useEffect(() => {
     void loadOverview();
   }, []);
+
+  async function loadResults(filter = resultFilter, offset = 0) {
+    setResultLoading(true);
+    try {
+      setResults(await listCoverMonitorResults(filter, 12, offset));
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "封面检测结果加载失败");
+    } finally {
+      setResultLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (activeTab === "工作台") void loadResults(resultFilter, 0);
+  }, [activeTab, resultFilter]);
 
   useEffect(() => {
     const status = overview.latest_run?.status;
@@ -411,10 +445,56 @@ export function CoverMonitorPage() {
           <button className="outline-button slim" type="button" disabled><Icon name="file" />导出结果</button>
         </div>
         <div className="cover-results-toolbar">
-          <div className="cover-filter-chips"><button className="active" type="button">全部 0</button><button type="button" disabled>风险 0</button><button type="button" disabled>待复核 0</button><button type="button" disabled>检测异常 0</button></div>
+          <div className="cover-filter-chips">
+            {[
+              ["", "全部", results.counts.all],
+              ["risk", "风险", results.counts.risk],
+              ["review", "待复核", results.counts.review],
+              ["unknown", "检测异常", results.counts.unknown]
+            ].map(([value, label, count]) => (
+              <button
+                className={resultFilter === value ? "active" : ""}
+                type="button"
+                key={String(value)}
+                disabled={resultLoading}
+                onClick={() => setResultFilter(String(value))}
+              >{label} {formatNumber(Number(count))}</button>
+            ))}
+          </div>
           <div className="cover-toolbar-note"><Icon name="shield" />当前为独立数据空间，不读取字幕或小说任务结果</div>
         </div>
-        <div className="cover-results-empty">
+        {resultLoading ? (
+          <div className="cover-results-empty"><strong>正在加载检测结果...</strong></div>
+        ) : results.items.length > 0 ? (
+          <>
+            <div className="cover-result-grid">
+              {results.items.map((item) => (
+                <article className={`cover-result-card ${item.overall_risk}`} key={item.result_id}>
+                  <img src={item.thumbnail_url} alt="" loading="lazy" referrerPolicy="no-referrer" />
+                  <div>
+                    <div className="cover-result-card-heading">
+                      <span className={`cover-result-risk ${item.overall_risk}`}>{resultRiskLabels[item.overall_risk]}</span>
+                      <small>{item.source === "historical_import" ? "历史检测表" : "当前模型检测"}</small>
+                    </div>
+                    <strong title={item.video_title}>{item.video_title || item.video_id}</strong>
+                    <p>{item.summary || item.evidence || "原检测表未提供结果说明"}</p>
+                    <footer>
+                      <span>{item.video_id}</span>
+                      <time>{new Date(item.created_at).toLocaleString("zh-CN")}</time>
+                    </footer>
+                  </div>
+                </article>
+              ))}
+            </div>
+            <div className="cover-result-pagination">
+              <span>共 {formatNumber(results.total)} 条，第 {Math.floor(results.offset / results.limit) + 1} 页</span>
+              <div>
+                <button className="ghost-button slim" type="button" disabled={results.offset <= 0 || resultLoading} onClick={() => void loadResults(resultFilter, Math.max(0, results.offset - results.limit))}>上一页</button>
+                <button className="ghost-button slim" type="button" disabled={results.offset + results.limit >= results.total || resultLoading} onClick={() => void loadResults(resultFilter, results.offset + results.limit)}>下一页</button>
+              </div>
+            </div>
+          </>
+        ) : <div className="cover-results-empty">
           <div className="cover-results-empty-art"><Icon name="review" /></div>
           <strong>还没有封面检测结果</strong>
           <p>完成频道导入和首次巡检后，结果会按风险优先级进入这里。</p>
@@ -427,7 +507,7 @@ export function CoverMonitorPage() {
             <i />
             <span><b>4</b>人工复核</span>
           </div>
-        </div>
+        </div>}
       </section>
       </> : activeTab === "频道清单" ? (
         <CoverChannelPanel />

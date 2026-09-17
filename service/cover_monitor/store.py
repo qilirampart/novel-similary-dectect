@@ -156,7 +156,7 @@ class CoverMonitorStore:
                     (workspace_key,),
                 ).fetchone()[0]
             )
-            pending_review_count = int(
+            open_case_count = int(
                 conn.execute(
                     """
                     SELECT COUNT(*) FROM cover_risk_cases
@@ -168,14 +168,29 @@ class CoverMonitorStore:
             distribution = {"safe": 0, "review": 0, "risk": 0, "unknown": 0}
             for row in conn.execute(
                 """
-                SELECT overall_risk, COUNT(*) AS item_count
-                  FROM cover_detections
-                 WHERE workspace_key = ?
+                SELECT overall_risk, COUNT(*) AS item_count FROM (
+                    SELECT overall_risk
+                      FROM cover_detections
+                     WHERE workspace_key = ?
+                    UNION ALL
+                    SELECT overall_risk
+                      FROM cover_historical_observations
+                     WHERE workspace_key = ?
+                ) AS observations
                  GROUP BY overall_risk
                 """,
-                (workspace_key,),
+                (workspace_key, workspace_key),
             ).fetchall():
                 distribution[str(row["overall_risk"])] = int(row["item_count"])
+            historical_pending_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM cover_historical_observations
+                     WHERE workspace_key = ? AND overall_risk IN ('review', 'unknown')
+                    """,
+                    (workspace_key,),
+                ).fetchone()[0]
+            )
             latest_run = self._row(
                 conn.execute(
                     """
@@ -194,9 +209,96 @@ class CoverMonitorStore:
             "channel_count": channel_count,
             "video_count": video_count,
             "risk_count": distribution["risk"],
-            "pending_review_count": pending_review_count,
+            "pending_review_count": open_case_count + historical_pending_count,
             "risk_distribution": distribution,
             "latest_run": latest_run,
+        }
+
+    def list_results(
+        self,
+        scope: CoverAccessScope,
+        *,
+        overall_risk: str = "",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        normalized_risk = str(overall_risk or "").strip()
+        if normalized_risk and normalized_risk not in {"risk", "review", "unknown"}:
+            raise ValueError("unsupported cover result risk")
+        safe_limit = min(max(int(limit), 1), 100)
+        safe_offset = max(int(offset), 0)
+        current_query = """
+            SELECT 'detection:' || detection.detection_id AS result_id,
+                   'current_detection' AS source,
+                   video.video_pk, video.video_id, video.title AS video_title,
+                   video.video_url, video.thumbnail_url,
+                   detection.overall_risk, detection.risk_tags_json,
+                   detection.summary, detection.evidence, detection.confidence,
+                   detection.model, detection.created_at
+              FROM cover_detections AS detection
+              JOIN cover_videos AS video ON video.video_pk = detection.video_pk
+             WHERE detection.workspace_key = ? AND detection.overall_risk != 'safe'
+        """
+        historical_query = """
+            SELECT 'historical:' || observation.observation_id AS result_id,
+                   'historical_import' AS source,
+                   video.video_pk, video.video_id, video.title AS video_title,
+                   video.video_url, video.thumbnail_url,
+                   observation.overall_risk, observation.risk_tags_json,
+                   COALESCE(observation.summary, '') AS summary,
+                   COALESCE(observation.evidence, '') AS evidence,
+                   COALESCE(observation.confidence, 0.0) AS confidence,
+                   observation.model_version AS model, observation.imported_at AS created_at
+              FROM cover_historical_observations AS observation
+              JOIN cover_videos AS video ON video.video_pk = observation.video_pk
+             WHERE observation.workspace_key = ? AND observation.overall_risk != 'safe'
+        """
+        combined_query = f"{current_query} UNION ALL {historical_query}"
+        params: list[Any] = [workspace_key, workspace_key]
+        filtered_query = f"SELECT * FROM ({combined_query}) AS results"
+        if normalized_risk:
+            filtered_query += " WHERE overall_risk = ?"
+            params.append(normalized_risk)
+        with self._connect() as conn:
+            count_rows = conn.execute(
+                f"""
+                SELECT overall_risk, COUNT(*) AS item_count
+                  FROM ({combined_query}) AS results
+                 GROUP BY overall_risk
+                """,
+                (workspace_key, workspace_key),
+            ).fetchall()
+            counts = {"all": 0, "risk": 0, "review": 0, "unknown": 0}
+            for row in count_rows:
+                risk = str(row["overall_risk"])
+                if risk in counts:
+                    counts[risk] = int(row["item_count"])
+            counts["all"] = counts["risk"] + counts["review"] + counts["unknown"]
+            total = counts[normalized_risk] if normalized_risk else counts["all"]
+            rows = conn.execute(
+                f"""
+                {filtered_query}
+                 ORDER BY created_at DESC, result_id DESC
+                 LIMIT ? OFFSET ?
+                """,
+                (*params, safe_limit, safe_offset),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            raw_tags = str(item.pop("risk_tags_json", "") or "")
+            try:
+                item["risk_tags"] = list(json.loads(raw_tags)) if raw_tags else []
+            except (TypeError, ValueError):
+                item["risk_tags"] = []
+            items.append(item)
+        return {
+            "items": items,
+            "total": total,
+            "limit": safe_limit,
+            "offset": safe_offset,
+            "counts": counts,
         }
 
     def list_risk_cases(

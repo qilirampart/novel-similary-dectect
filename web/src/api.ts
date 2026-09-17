@@ -161,6 +161,31 @@ export type CoverRiskCaseListResponse = {
   offset: number;
 };
 
+export type CoverResultSummary = {
+  result_id: string;
+  source: "current_detection" | "historical_import";
+  video_pk: number;
+  video_id: string;
+  video_title: string;
+  video_url: string;
+  thumbnail_url: string;
+  overall_risk: "risk" | "review" | "unknown";
+  risk_tags: string[];
+  summary: string;
+  evidence: string;
+  confidence: number;
+  model: string;
+  created_at: string;
+};
+
+export type CoverResultListResponse = {
+  items: CoverResultSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+  counts: Record<"all" | "risk" | "review" | "unknown", number>;
+};
+
 export type CoverRiskCaseReviewAction =
   | "confirm_rectified"
   | "false_positive"
@@ -841,6 +866,17 @@ export function listCoverRiskCases(
 ): Promise<CoverRiskCaseListResponse> {
   return requestJson<CoverRiskCaseListResponse>("/api/v1/cover-monitor/risk-cases", {
     query: { status: status || undefined, limit, offset },
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+  });
+}
+
+export function listCoverMonitorResults(
+  overallRisk = "",
+  limit = 20,
+  offset = 0
+): Promise<CoverResultListResponse> {
+  return requestJson<CoverResultListResponse>("/api/v1/cover-monitor/results", {
+    query: { overall_risk: overallRisk || undefined, limit, offset },
     timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
   });
 }

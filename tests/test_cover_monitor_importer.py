@@ -215,6 +215,30 @@ def test_historical_baseline_controls_incremental_scan_reasons(tmp_path: Path) -
     assert store.list_risk_cases(scope, status="needs_review")["total"] == 0
     assert store.list_risk_cases(scope)["total"] == 1
 
+    results = store.list_results(scope, limit=10, offset=0)
+    assert results["counts"] == {
+        "all": 3,
+        "risk": 1,
+        "review": 1,
+        "unknown": 1,
+    }
+    assert {item["video_id"] for item in results["items"]} == {
+        "video-risk",
+        "video-review",
+        "video-unknown",
+    }
+    assert {item["source"] for item in results["items"]} == {"historical_import"}
+    assert store.list_results(scope, overall_risk="risk")["total"] == 1
+    overview = store.get_overview(scope)
+    assert overview["risk_distribution"] == {
+        "safe": 1,
+        "review": 1,
+        "risk": 1,
+        "unknown": 1,
+    }
+    assert overview["risk_count"] == 1
+    assert overview["pending_review_count"] == 2
+
     historical_case = store.get_risk_case_detail(
         scope,
         confirmed_risks["items"][0]["case_id"],

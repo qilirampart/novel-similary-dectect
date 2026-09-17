@@ -39,6 +39,18 @@ def test_cover_overview_uses_independent_empty_database(tmp_path: Path) -> None:
         "risk_distribution": {"safe": 0, "review": 0, "risk": 0, "unknown": 0},
         "latest_run": None,
     }
+    results = TestClient(app).get("/api/v1/cover-monitor/results")
+    assert results.status_code == 200
+    assert results.json() == {
+        "items": [],
+        "total": 0,
+        "limit": 20,
+        "offset": 0,
+        "counts": {"all": 0, "risk": 0, "review": 0, "unknown": 0},
+    }
+    assert TestClient(app).get(
+        "/api/v1/cover-monitor/results?overall_risk=safe"
+    ).status_code == 422
     assert db_path.is_file()
 
 

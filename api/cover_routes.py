@@ -160,6 +160,31 @@ class CoverRiskCaseListResponse(BaseModel):
     offset: int
 
 
+class CoverResultSummary(BaseModel):
+    result_id: str
+    source: str
+    video_pk: int
+    video_id: str
+    video_title: str
+    video_url: str
+    thumbnail_url: str
+    overall_risk: str
+    risk_tags: list[str] = Field(default_factory=list)
+    summary: str
+    evidence: str
+    confidence: float
+    model: str
+    created_at: str
+
+
+class CoverResultListResponse(BaseModel):
+    items: list[CoverResultSummary]
+    total: int
+    limit: int
+    offset: int
+    counts: dict[str, int]
+
+
 class CoverRiskCaseEvent(BaseModel):
     case_event_id: int
     detection_id: Optional[str] = None
@@ -417,6 +442,22 @@ def build_cover_monitor_router(
             store.list_risk_cases(
                 access_scope(user),
                 status=status or "",
+                limit=limit,
+                offset=offset,
+            )
+        )
+
+    @router.get("/results", response_model=CoverResultListResponse)
+    def list_results(
+        overall_risk: Optional[Literal["risk", "review", "unknown"]] = Query(default=None),
+        limit: int = Query(default=20, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverResultListResponse:
+        return CoverResultListResponse.model_validate(
+            store.list_results(
+                access_scope(user),
+                overall_risk=overall_risk or "",
                 limit=limit,
                 offset=offset,
             )
