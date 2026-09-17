@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "node scripts/clean-dist.mjs && tsc && vite build",
-    "test": "node test/workflowLinks.test.mjs && node test/cleanDist.test.mjs && node test/coverDisplay.test.mjs",
+    "test": "node test/workflowLinks.test.mjs && node test/cleanDist.test.mjs && node test/coverDisplay.test.mjs && node test/coverChannelSelection.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

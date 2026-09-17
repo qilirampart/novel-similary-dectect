@@ -5892,24 +5892,26 @@ button {
   gap: 16px;
 }
 
-.cover-channel-toolbar {
+.cover-channel-filterbar,
+.cover-channel-selectionbar {
   margin-top: 16px;
   padding: 12px 0;
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
 }
 
-.cover-channel-toolbar form {
+.cover-channel-filterbar form {
   min-width: min(420px, 100%);
   display: flex;
   gap: 8px;
 }
 
-.cover-channel-toolbar input[type="text"],
-.cover-channel-toolbar form input {
+.cover-channel-filterbar input[type="text"],
+.cover-channel-filterbar form input {
   min-width: 0;
   min-height: 38px;
   flex: 1;
@@ -5920,8 +5922,7 @@ button {
   background: #fff;
 }
 
-.cover-channel-toolbar > label {
-  margin-left: auto;
+.cover-channel-filterbar > label {
   display: flex;
   align-items: center;
   gap: 7px;
@@ -5931,10 +5932,51 @@ button {
   white-space: nowrap;
 }
 
-.cover-channel-toolbar > .cover-channel-operator-filter {
+.cover-channel-filterbar > .cover-channel-operator-filter {
   margin-left: 0;
   display: grid;
   gap: 4px;
+}
+
+.cover-channel-filterbar > span {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.cover-channel-selectionbar {
+  margin-top: 0;
+  border-top: 0;
+}
+
+.cover-channel-selectionbar > strong {
+  margin-right: 4px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.cover-channel-select-first {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.cover-channel-select-first input {
+  width: 68px;
+  min-height: 34px;
+  padding: 0 8px;
+  border: 1px solid #d5e1eb;
+  border-radius: 9px;
+  color: var(--text);
+  background: #fff;
+}
+
+.cover-channel-selectionbar .danger {
+  margin-left: auto;
 }
 
 .cover-channel-operator-filter span {
@@ -7370,18 +7412,22 @@ button {
     max-height: 260px;
   }
 
-  .cover-channel-toolbar {
+  .cover-channel-filterbar,
+  .cover-channel-selectionbar {
     align-items: stretch;
-    flex-wrap: wrap;
   }
 
-  .cover-channel-toolbar form {
+  .cover-channel-filterbar form {
     width: 100%;
   }
 
-  .cover-channel-toolbar > label {
+  .cover-channel-filterbar > span {
+    width: 100%;
     margin-left: 0;
-    margin-right: auto;
+  }
+
+  .cover-channel-selectionbar .danger {
+    margin-left: 0;
   }
 
   .cover-review-workspace {
@@ -7414,6 +7460,22 @@ button {
 
   .cover-channel-heading button {
     width: 100%;
+  }
+
+  .cover-channel-filterbar form,
+  .cover-channel-filterbar > label,
+  .cover-channel-filterbar select,
+  .cover-channel-selectionbar > button,
+  .cover-channel-select-first {
+    width: 100%;
+  }
+
+  .cover-channel-select-first input {
+    flex: 1;
+  }
+
+  .cover-channel-select-first button {
+    flex: 0 0 auto;
   }
 
   .cover-monitor-kpis article {

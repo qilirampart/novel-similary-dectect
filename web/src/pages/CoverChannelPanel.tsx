@@ -9,6 +9,11 @@ import {
   type CoverFilterOptionsResponse,
   type CoverChannelSummary
 } from "../api";
+import {
+  invertFilteredSelection,
+  selectAllFiltered as buildAllFilteredSelection,
+  selectFirstFiltered
+} from "../coverChannelSelection";
 
 const PAGE_SIZE = 50;
 const EMPTY_FILTER_OPTIONS: CoverFilterOptionsResponse = { operators: [], channels: [] };
@@ -37,13 +42,13 @@ export function CoverChannelPanel() {
   const [offset, setOffset] = useState(0);
   const [keywordInput, setKeywordInput] = useState("");
   const [keyword, setKeyword] = useState("");
-  const [activeOnly, setActiveOnly] = useState(true);
   const [operatorPk, setOperatorPk] = useState<number | undefined>();
   const [filterOptions, setFilterOptions] = useState(EMPTY_FILTER_OPTIONS);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
-  const [selectingAll, setSelectingAll] = useState(false);
+  const [selectionBusy, setSelectionBusy] = useState(false);
+  const [firstCount, setFirstCount] = useState(50);
   const [deleting, setDeleting] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -56,7 +61,7 @@ export function CoverChannelPanel() {
     try {
       const response = await listCoverMonitorChannels({
         keyword,
-        active: activeOnly ? true : undefined,
+        active: true,
         operatorPk,
         limit: PAGE_SIZE,
         offset: nextOffset
@@ -75,7 +80,7 @@ export function CoverChannelPanel() {
 
   useEffect(() => {
     void load(0);
-  }, [keyword, activeOnly, operatorPk]);
+  }, [keyword, operatorPk]);
 
   useEffect(() => {
     void getCoverMonitorFilterOptions()
@@ -104,29 +109,61 @@ export function CoverChannelPanel() {
     });
   }
 
-  async function selectAllFiltered() {
-    setSelectingAll(true);
+  async function loadFilteredIds(): Promise<number[]> {
+    const response = await listCoverMonitorChannelIds({
+      keyword,
+      active: true,
+      operatorPk
+    });
+    if (response.truncated) {
+      throw new Error(`当前筛选结果有 ${formatNumber(response.total)} 个频道，超过单批次 5,000 个频道的上限，请先缩小筛选范围。`);
+    }
+    return response.channel_pks;
+  }
+
+  async function selectAllFilteredChannels() {
+    setSelectionBusy(true);
     setMessage("");
     setError("");
     try {
-      const response = await listCoverMonitorChannelIds({
-        keyword,
-        active: activeOnly ? true : undefined,
-        operatorPk
-      });
-      if (response.truncated) {
-        throw new Error(`当前筛选结果有 ${formatNumber(response.total)} 个频道，超过单批次 5,000 个频道的上限，请先缩小筛选范围。`);
-      }
-      setSelected((previous) => {
-        const next = new Set(previous);
-        response.channel_pks.forEach((id) => next.add(id));
-        return next;
-      });
-      setMessage(`已选择当前筛选下的全部 ${formatNumber(response.total)} 个频道。`);
+      const ids = await loadFilteredIds();
+      setSelected(buildAllFilteredSelection(ids));
+      setMessage(`已选择当前筛选下的全部 ${formatNumber(ids.length)} 个频道。`);
     } catch (selectError) {
       setError(selectError instanceof Error ? selectError.message : "全选频道失败");
     } finally {
-      setSelectingAll(false);
+      setSelectionBusy(false);
+    }
+  }
+
+  async function invertAllFilteredChannels() {
+    setSelectionBusy(true);
+    setMessage("");
+    setError("");
+    try {
+      const ids = await loadFilteredIds();
+      setSelected((previous) => invertFilteredSelection(ids, previous));
+      setMessage("已反选当前筛选结果。");
+    } catch (selectError) {
+      setError(selectError instanceof Error ? selectError.message : "反选频道失败");
+    } finally {
+      setSelectionBusy(false);
+    }
+  }
+
+  async function selectFirstChannels() {
+    setSelectionBusy(true);
+    setMessage("");
+    setError("");
+    try {
+      const ids = await loadFilteredIds();
+      const next = selectFirstFiltered(ids, firstCount);
+      setSelected(next);
+      setMessage(`已选择当前筛选结果的前 ${formatNumber(next.size)} 个频道。`);
+    } catch (selectError) {
+      setError(selectError instanceof Error ? selectError.message : "选择前 N 个频道失败");
+    } finally {
+      setSelectionBusy(false);
     }
   }
 
@@ -154,7 +191,7 @@ export function CoverChannelPanel() {
   async function deactivateSelected() {
     if (selected.size === 0 || deleting) return;
     const count = selected.size;
-    if (!window.confirm(`确认清除选中的 ${formatNumber(count)} 个频道吗？\n\n该操作为软删除：频道、视频、检测结果和历史任务都会保留；取消“只看启用频道”后仍可查看。`)) return;
+    if (!window.confirm(`确认从频道清单中清除选中的 ${formatNumber(count)} 个频道吗？\n\n该操作为软删除：页面不再展示这些频道，但频道、视频、检测结果和历史任务都会保留。`)) return;
     setDeleting(true);
     setMessage("");
     setError("");
@@ -173,13 +210,13 @@ export function CoverChannelPanel() {
   return (
     <section className="card-panel cover-channel-panel">
       <div className="section-heading cover-channel-heading">
-        <div><h2>频道清单</h2><p>共 {formatNumber(total)} 个频道，勾选结果会跨分页保留。</p></div>
+        <div><h2>频道清单</h2><p>共 {formatNumber(total)} 个启用频道，勾选结果会跨分页保留。</p></div>
         <button className="primary-button" type="button" disabled={selected.size === 0 || running} onClick={() => void createSelectedRun()}>
           {running ? "正在创建..." : `巡检已选频道 (${formatNumber(selected.size)})`}
         </button>
       </div>
 
-      <div className="cover-channel-toolbar">
+      <div className="cover-channel-filterbar">
         <form onSubmit={(event) => { event.preventDefault(); setKeyword(keywordInput.trim()); }}>
           <input value={keywordInput} onChange={(event) => setKeywordInput(event.target.value)} placeholder="搜索频道名、频道 ID 或代理商" aria-label="搜索频道" />
           <button className="outline-button slim" type="submit">搜索</button>
@@ -189,20 +226,31 @@ export function CoverChannelPanel() {
           <select
             aria-label="按代理归属筛选频道"
             value={operatorPk ?? ""}
-            disabled={loading}
+            disabled={loading || selectionBusy}
             onChange={(event) => setOperatorPk(event.target.value === "" ? undefined : Number(event.target.value))}
           >
             <option value="">全部代理</option>
             {filterOptions.operators.map((item) => (
-              <option value={item.operator_pk} key={item.operator_pk}>{item.name}（{formatNumber(item.channel_count)}）</option>
+              <option value={item.operator_pk} key={item.operator_pk}>{item.name}</option>
             ))}
           </select>
         </label>
-        <label><input type="checkbox" checked={activeOnly} onChange={(event) => setActiveOnly(event.target.checked)} />只看启用频道</label>
-        <button className="ghost-button slim" type="button" onClick={togglePage} disabled={channels.length === 0}>{pageSelected ? "取消本页全选" : "全选当前页"}</button>
-        <button className="outline-button slim" type="button" onClick={() => void selectAllFiltered()} disabled={total === 0 || loading || selectingAll}>{selectingAll ? "正在全选..." : `全选所有 (${formatNumber(total)})`}</button>
-        {selected.size > 0 && <button className="ghost-button slim danger" type="button" onClick={() => void deactivateSelected()} disabled={deleting || running}>{deleting ? "正在清除..." : `清除选中 (${formatNumber(selected.size)})`}</button>}
-        {selected.size > 0 && <button className="ghost-button slim" type="button" onClick={() => setSelected(new Set())}>清空选择</button>}
+        <span>当前筛选 {formatNumber(total)} 个频道</span>
+      </div>
+
+      <div className="cover-channel-selectionbar">
+        <strong>已选 {formatNumber(selected.size)} 个</strong>
+        <button className="ghost-button slim" type="button" onClick={togglePage} disabled={channels.length === 0 || selectionBusy}>{pageSelected ? "取消本页全选" : "全选当前页"}</button>
+        <button className="outline-button slim" type="button" onClick={() => void selectAllFilteredChannels()} disabled={total === 0 || loading || selectionBusy}>全选筛选结果</button>
+        <button className="outline-button slim" type="button" onClick={() => void invertAllFilteredChannels()} disabled={total === 0 || loading || selectionBusy}>反选筛选结果</button>
+        <div className="cover-channel-select-first">
+          <span>前</span>
+          <input aria-label="选择前几个频道" type="number" min="1" max="5000" value={firstCount} onChange={(event) => setFirstCount(Math.min(Math.max(Number(event.target.value) || 1, 1), 5000))} />
+          <span>条</span>
+          <button className="outline-button slim" type="button" onClick={() => void selectFirstChannels()} disabled={total === 0 || loading || selectionBusy}>选择</button>
+        </div>
+        {selected.size > 0 && <button className="outline-button slim danger" type="button" onClick={() => void deactivateSelected()} disabled={deleting || running}>{deleting ? "正在清除..." : `清除选中频道 (${formatNumber(selected.size)})`}</button>}
+        {selected.size > 0 && <button className="ghost-button slim" type="button" onClick={() => setSelected(new Set())}>取消全部选择</button>}
       </div>
 
       {(error || message) && <div className={`cover-channel-message${error ? " error" : ""}`} role={error ? "alert" : "status"}>{error || message}</div>}
