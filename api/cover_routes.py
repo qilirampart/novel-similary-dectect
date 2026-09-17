@@ -317,15 +317,19 @@ def build_cover_monitor_router(
     def list_channels(
         keyword: str = Query(default="", max_length=200),
         active: Optional[bool] = Query(default=None),
+        operator_pk: Optional[int] = Query(default=None, ge=-1),
         limit: int = Query(default=50, ge=1, le=100),
         offset: int = Query(default=0, ge=0),
         user: dict[str, Any] = Depends(current_user_dependency),
     ) -> CoverChannelListResponse:
+        if operator_pk == 0:
+            raise HTTPException(status_code=422, detail="operator_pk is invalid")
         return CoverChannelListResponse.model_validate(
             store.search_channels(
                 access_scope(user),
                 keyword=keyword,
                 active=active,
+                operator_pk=operator_pk,
                 limit=limit,
                 offset=offset,
             )
@@ -335,13 +339,17 @@ def build_cover_monitor_router(
     def list_channel_ids(
         keyword: str = Query(default="", max_length=200),
         active: Optional[bool] = Query(default=None),
+        operator_pk: Optional[int] = Query(default=None, ge=-1),
         user: dict[str, Any] = Depends(current_user_dependency),
     ) -> CoverChannelIdListResponse:
+        if operator_pk == 0:
+            raise HTTPException(status_code=422, detail="operator_pk is invalid")
         return CoverChannelIdListResponse.model_validate(
             store.search_channel_ids(
                 access_scope(user),
                 keyword=keyword,
                 active=active,
+                operator_pk=operator_pk,
             )
         )
 

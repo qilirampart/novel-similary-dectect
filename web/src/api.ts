@@ -790,6 +790,7 @@ export function getCoverMonitorOverview(): Promise<CoverMonitorOverviewResponse>
 export function listCoverMonitorChannels(params: {
   keyword?: string;
   active?: boolean;
+  operatorPk?: number;
   limit?: number;
   offset?: number;
 } = {}): Promise<CoverChannelListResponse> {
@@ -797,6 +798,7 @@ export function listCoverMonitorChannels(params: {
     query: {
       keyword: params.keyword || undefined,
       active: params.active == null ? undefined : String(params.active),
+      operator_pk: params.operatorPk,
       limit: params.limit ?? 50,
       offset: params.offset ?? 0
     },
@@ -807,11 +809,13 @@ export function listCoverMonitorChannels(params: {
 export function listCoverMonitorChannelIds(params: {
   keyword?: string;
   active?: boolean;
+  operatorPk?: number;
 } = {}): Promise<CoverChannelIdListResponse> {
   return requestJson<CoverChannelIdListResponse>("/api/v1/cover-monitor/channels/ids", {
     query: {
       keyword: params.keyword || undefined,
-      active: params.active == null ? undefined : String(params.active)
+      active: params.active == null ? undefined : String(params.active),
+      operator_pk: params.operatorPk
     },
     timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
   });

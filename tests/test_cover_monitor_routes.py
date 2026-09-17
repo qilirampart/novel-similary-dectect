@@ -180,6 +180,27 @@ def test_cover_channel_route_filters_and_paginates_with_operational_counts(tmp_p
         "total": 1,
         "truncated": False,
     }
+    assigned = TestClient(app).get(
+        f"/api/v1/cover-monitor/channels?operator_pk={operator_pk}"
+    )
+    assert assigned.status_code == 200
+    assert assigned.json()["total"] == 1
+    assert assigned.json()["items"][0]["channel_pk"] == alpha["channel_pk"]
+    assigned_ids = TestClient(app).get(
+        f"/api/v1/cover-monitor/channels/ids?operator_pk={operator_pk}"
+    )
+    assert assigned_ids.status_code == 200
+    assert assigned_ids.json() == {
+        "channel_pks": [alpha["channel_pk"]],
+        "total": 1,
+        "truncated": False,
+    }
+    unassigned = TestClient(app).get(
+        "/api/v1/cover-monitor/channels?operator_pk=-1"
+    )
+    assert unassigned.status_code == 200
+    assert unassigned.json()["total"] == 1
+    assert unassigned.json()["items"][0]["channel_id"] == "UC-beta"
     filters = TestClient(app).get(
         f"/api/v1/cover-monitor/filter-options?operator_pk={operator_pk}"
     )
@@ -198,6 +219,9 @@ def test_cover_channel_route_filters_and_paginates_with_operational_counts(tmp_p
     ]
     assert TestClient(app).get(
         "/api/v1/cover-monitor/results?operator_pk=0"
+    ).status_code == 422
+    assert TestClient(app).get(
+        "/api/v1/cover-monitor/channels?operator_pk=0"
     ).status_code == 422
 
 

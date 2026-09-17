@@ -1385,6 +1385,7 @@ class CoverMonitorStore:
         *,
         keyword: str = "",
         active: bool | None = None,
+        operator_pk: int | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -1405,7 +1406,12 @@ class CoverMonitorStore:
         if active is not None:
             clauses.append("channel.active = ?")
             params.append(1 if active else 0)
-        where = " AND ".join(clauses)
+        scope_suffix, scope_params = _channel_scope_sql(
+            operator_pk=operator_pk,
+            channel_pk=None,
+        )
+        where = " AND ".join(clauses) + scope_suffix
+        params.extend(scope_params)
         with self._connect() as conn:
             total = int(
                 conn.execute(
@@ -1469,6 +1475,7 @@ class CoverMonitorStore:
         *,
         keyword: str = "",
         active: bool | None = None,
+        operator_pk: int | None = None,
         limit: int = 5000,
     ) -> dict[str, Any]:
         workspace_key = _required_text(scope.workspace_key, "workspace_key")
@@ -1487,7 +1494,12 @@ class CoverMonitorStore:
         if active is not None:
             clauses.append("channel.active = ?")
             params.append(1 if active else 0)
-        where = " AND ".join(clauses)
+        scope_suffix, scope_params = _channel_scope_sql(
+            operator_pk=operator_pk,
+            channel_pk=None,
+        )
+        where = " AND ".join(clauses) + scope_suffix
+        params.extend(scope_params)
         with self._connect() as conn:
             total = int(
                 conn.execute(

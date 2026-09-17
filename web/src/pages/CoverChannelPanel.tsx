@@ -2,12 +2,15 @@ import { useEffect, useRef, useState } from "react";
 
 import {
   createCoverMonitorRun,
+  getCoverMonitorFilterOptions,
   listCoverMonitorChannelIds,
   listCoverMonitorChannels,
+  type CoverFilterOptionsResponse,
   type CoverChannelSummary
 } from "../api";
 
 const PAGE_SIZE = 50;
+const EMPTY_FILTER_OPTIONS: CoverFilterOptionsResponse = { operators: [], channels: [] };
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat("zh-CN").format(Math.max(Number(value) || 0, 0));
@@ -33,6 +36,8 @@ export function CoverChannelPanel() {
   const [keywordInput, setKeywordInput] = useState("");
   const [keyword, setKeyword] = useState("");
   const [activeOnly, setActiveOnly] = useState(true);
+  const [operatorPk, setOperatorPk] = useState<number | undefined>();
+  const [filterOptions, setFilterOptions] = useState(EMPTY_FILTER_OPTIONS);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
@@ -49,6 +54,7 @@ export function CoverChannelPanel() {
       const response = await listCoverMonitorChannels({
         keyword,
         active: activeOnly ? true : undefined,
+        operatorPk,
         limit: PAGE_SIZE,
         offset: nextOffset
       });
@@ -66,7 +72,13 @@ export function CoverChannelPanel() {
 
   useEffect(() => {
     void load(0);
-  }, [keyword, activeOnly]);
+  }, [keyword, activeOnly, operatorPk]);
+
+  useEffect(() => {
+    void getCoverMonitorFilterOptions()
+      .then(setFilterOptions)
+      .catch((loadError) => setError(loadError instanceof Error ? loadError.message : "代理筛选项加载失败"));
+  }, []);
 
   const pageIds = channels.map((channel) => channel.channel_pk);
   const pageSelected = pageIds.length > 0 && pageIds.every((id) => selected.has(id));
@@ -96,7 +108,8 @@ export function CoverChannelPanel() {
     try {
       const response = await listCoverMonitorChannelIds({
         keyword,
-        active: activeOnly ? true : undefined
+        active: activeOnly ? true : undefined,
+        operatorPk
       });
       if (response.truncated) {
         throw new Error(`当前筛选结果有 ${formatNumber(response.total)} 个频道，超过单批次 5,000 个频道的上限，请先缩小筛选范围。`);
@@ -149,6 +162,20 @@ export function CoverChannelPanel() {
           <input value={keywordInput} onChange={(event) => setKeywordInput(event.target.value)} placeholder="搜索频道名、频道 ID 或代理商" aria-label="搜索频道" />
           <button className="outline-button slim" type="submit">搜索</button>
         </form>
+        <label className="cover-channel-operator-filter">
+          <span>代理归属</span>
+          <select
+            aria-label="按代理归属筛选频道"
+            value={operatorPk ?? ""}
+            disabled={loading}
+            onChange={(event) => setOperatorPk(event.target.value === "" ? undefined : Number(event.target.value))}
+          >
+            <option value="">全部代理</option>
+            {filterOptions.operators.map((item) => (
+              <option value={item.operator_pk} key={item.operator_pk}>{item.name}（{formatNumber(item.channel_count)}）</option>
+            ))}
+          </select>
+        </label>
         <label><input type="checkbox" checked={activeOnly} onChange={(event) => setActiveOnly(event.target.checked)} />只看启用频道</label>
         <button className="ghost-button slim" type="button" onClick={togglePage} disabled={channels.length === 0}>{pageSelected ? "取消本页全选" : "全选当前页"}</button>
         <button className="outline-button slim" type="button" onClick={() => void selectAllFiltered()} disabled={total === 0 || loading || selectingAll}>{selectingAll ? "正在全选..." : `全选所有 (${formatNumber(total)})`}</button>

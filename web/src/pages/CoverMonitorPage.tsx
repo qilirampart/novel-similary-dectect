@@ -114,6 +114,7 @@ export function CoverMonitorPage() {
   const [resultOperatorPk, setResultOperatorPk] = useState<number | undefined>();
   const [resultChannelPk, setResultChannelPk] = useState<number | undefined>();
   const [resultLoading, setResultLoading] = useState(true);
+  const [previewImage, setPreviewImage] = useState<{ url: string; title: string } | null>(null);
   const [itemOffset, setItemOffset] = useState(0);
   const [importKind, setImportKind] = useState<CoverImportKind>("channels");
   const [importFile, setImportFile] = useState<File | null>(null);
@@ -123,6 +124,24 @@ export function CoverMonitorPage() {
   const [isDragging, setIsDragging] = useState(false);
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const runDetailRequestRef = useRef(0);
+  const previewCloseRef = useRef<HTMLButtonElement | null>(null);
+  const previewTriggerRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (!previewImage) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    previewCloseRef.current?.focus();
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setPreviewImage(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", closeOnEscape);
+      window.requestAnimationFrame(() => previewTriggerRef.current?.focus());
+    };
+  }, [previewImage]);
 
   async function exportRun(kind: "new-findings" | "historical-rectification") {
     if (!runDetail || exportBusy) return;
@@ -486,7 +505,18 @@ export function CoverMonitorPage() {
             <div className="cover-result-grid">
               {results.items.map((item) => (
                 <article className={`cover-result-card ${item.overall_risk}`} key={item.result_id}>
-                  <img src={item.thumbnail_url} alt="" loading="lazy" referrerPolicy="no-referrer" />
+                  <button
+                    className="cover-result-image-button"
+                    type="button"
+                    aria-label={`放大查看封面：${item.video_title || item.video_id}`}
+                    onClick={(event) => {
+                      previewTriggerRef.current = event.currentTarget;
+                      setPreviewImage({ url: item.thumbnail_url, title: item.video_title || item.video_id });
+                    }}
+                  >
+                    <img src={item.thumbnail_url} alt="" loading="lazy" referrerPolicy="no-referrer" />
+                    <span aria-hidden="true">放大查看</span>
+                  </button>
                   <div>
                     <div className="cover-result-card-heading">
                       <span className={`cover-result-risk ${item.overall_risk}`}>{resultRiskLabels[item.overall_risk]}</span>
@@ -615,6 +645,19 @@ export function CoverMonitorPage() {
             </div>
             {runError && <div className="cover-import-message error" role="alert">{runError}</div>}
             <footer><button className="ghost-button" type="button" onClick={() => setIsRunOpen(false)} disabled={runBusy}>取消</button><button className="primary-button" type="button" onClick={() => void createRun()} disabled={runBusy}>{runBusy ? "正在创建..." : `开始巡检 ${formatNumber(overview.channel_count)} 个频道`}</button></footer>
+          </section>
+        </div>
+      )}
+
+      {previewImage && (
+        <div className="cover-image-preview-overlay" role="dialog" aria-modal="true" aria-label={`封面大图：${previewImage.title}`} onClick={() => setPreviewImage(null)}>
+          <section className="cover-image-preview-dialog" onClick={(event) => event.stopPropagation()}>
+            <header>
+              <strong title={previewImage.title}>{previewImage.title}</strong>
+              <button ref={previewCloseRef} className="icon-button" type="button" aria-label="关闭封面大图" onClick={() => setPreviewImage(null)}>×</button>
+            </header>
+            <div><img src={previewImage.url} alt={previewImage.title} referrerPolicy="no-referrer" /></div>
+            <p>点击空白区域或按 Esc 关闭</p>
           </section>
         </div>
       )}
