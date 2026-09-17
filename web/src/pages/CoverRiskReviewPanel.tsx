@@ -10,19 +10,12 @@ import {
   type CoverRiskCaseReviewAction,
   type CoverRiskCaseSummary
 } from "../api";
+import { coverRiskCaseStatusLabel } from "../coverDisplay";
 
 const PAGE_SIZE = 50;
 
-const STATUS_LABELS: Record<string, string> = {
-  open: "待复核",
-  needs_review: "待复核",
-  confirmed_rectified: "已确认整改",
-  false_positive: "误报",
-  unavailable: "已失联",
-  closed: "已关闭"
-};
-
 const EVENT_LABELS: Record<string, string> = {
+  historical_risk_imported: "历史表标记风险",
   risk_detected: "检测到风险",
   review_detected: "模型建议复核",
   unknown_detected: "检测异常",
@@ -158,9 +151,10 @@ export function CoverRiskReviewPanel() {
     }
   }
 
-  const openedEvent = detail?.events.find(
-    (item) => item.detection_id === detail.case.opened_detection_id
-  );
+  const isHistoricalRisk = detail?.case.current_status === "confirmed_risk";
+  const openedEvent = isHistoricalRisk
+    ? detail?.events.find((item) => item.event_type === "historical_risk_imported")
+    : detail?.events.find((item) => item.detection_id === detail.case.opened_detection_id);
   const comparisonEvent = detail
     ? [...detail.events].reverse().find(
         (item) => item.event_type === "rectification_candidate" || item.event_type === "safe_redetection"
@@ -183,6 +177,7 @@ export function CoverRiskReviewPanel() {
           <span>案件状态</span>
           <select value={status} onChange={(event) => setStatus(event.target.value)} disabled={loading}>
             <option value="needs_review">待复核</option>
+            <option value="confirmed_risk">已确认风险（含历史导入）</option>
             <option value="confirmed_rectified">已确认整改</option>
             <option value="false_positive">误报</option>
             <option value="unavailable">已失联</option>
@@ -192,7 +187,7 @@ export function CoverRiskReviewPanel() {
         <div className="cover-case-list-items">
           {cases.map((item) => (
             <button key={item.case_id} type="button" className={selectedId === item.case_id ? "active" : ""} onClick={() => void loadDetail(item.case_id)}>
-              <span><strong title={item.video_title}>{item.video_title}</strong><i className={item.current_status}>{STATUS_LABELS[item.current_status] || item.current_status}</i></span>
+              <span><strong title={item.video_title}>{item.video_title}</strong><i className={item.current_status}>{coverRiskCaseStatusLabel(item.current_status)}</i></span>
               <small>{item.video_id}</small>
               <p>{item.opened_summary}</p>
               <time>{formatTime(item.updated_at)}</time>
@@ -215,12 +210,12 @@ export function CoverRiskReviewPanel() {
         {detail ? (
           <>
             <header className="cover-case-detail-heading">
-              <div><span className="eyebrow">CASE REVIEW</span><h2>{detail.case.video_title}</h2><p>{detail.case.video_id} · 建案于 {formatTime(detail.case.opened_at)}</p></div>
-              <div><span className={`cover-case-status ${detail.case.current_status}`}>{STATUS_LABELS[detail.case.current_status] || detail.case.current_status}</span><a className="outline-button slim" href={detail.case.video_url} target="_blank" rel="noreferrer">打开视频</a></div>
+              <div><span className="eyebrow">CASE REVIEW</span><h2>{detail.case.video_title}</h2><p>{detail.case.video_id} · {isHistoricalRisk ? "导入于" : "建案于"} {formatTime(detail.case.opened_at)}</p></div>
+              <div><span className={`cover-case-status ${detail.case.current_status}`}>{coverRiskCaseStatusLabel(detail.case.current_status)}</span><a className="outline-button slim" href={detail.case.video_url} target="_blank" rel="noreferrer">打开视频</a></div>
             </header>
 
             <div className="cover-evidence-compare">
-              <EvidenceCard caseId={detail.case.case_id} title="首次风险证据" event={openedEvent} emptyText="首次风险图片缺失" />
+              <EvidenceCard caseId={detail.case.case_id} title={isHistoricalRisk ? "历史导入风险记录" : "首次风险证据"} event={openedEvent} emptyText="首次风险图片缺失" />
               <EvidenceCard caseId={detail.case.case_id} title="最新复测证据" event={comparisonEvent} emptyText="尚未形成复测证据" />
             </div>
 
@@ -237,7 +232,7 @@ export function CoverRiskReviewPanel() {
             </section>
 
             <section className="cover-case-actions">
-              <div><h3>人工处置</h3><p>{isActive ? "结论必须基于页面中的新旧封面证据。" : "该案件已关闭，如需继续处理可重新打开。"}</p></div>
+              <div><h3>人工处置</h3><p>{isHistoricalRisk ? "历史导入结论保持只读，不改写原始数据。" : isActive ? "结论必须基于页面中的新旧封面证据。" : "该案件已关闭，如需继续处理可重新打开。"}</p></div>
               <textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="填写判断依据、核查过程或后续跟进说明" maxLength={1000} disabled={busy} />
               <div>
                 {isActive ? (
@@ -247,6 +242,8 @@ export function CoverRiskReviewPanel() {
                     <button className="outline-button" type="button" disabled={busy} onClick={() => void submitReview("false_positive")}>标记误报</button>
                     <button className="ghost-button danger" type="button" disabled={busy} onClick={() => void submitReview("mark_unavailable")}>标记失联</button>
                   </>
+                ) : isHistoricalRisk ? (
+                  <p className="cover-case-readonly-note">该结论来自历史导入表，仅供查看；后续巡检会以当前模型结果建立可处置案件。</p>
                 ) : (
                   <button className="outline-button" type="button" disabled={busy} onClick={() => void submitReview("reopen")}>重新打开案件</button>
                 )}

@@ -155,6 +155,9 @@ CREATE TABLE IF NOT EXISTS cover_historical_observations (
 CREATE INDEX IF NOT EXISTS idx_cover_historical_observations_video
     ON cover_historical_observations (workspace_key, video_pk, imported_at DESC);
 
+CREATE INDEX IF NOT EXISTS idx_cover_historical_observations_risk
+    ON cover_historical_observations (workspace_key, overall_risk, imported_at DESC, observation_id DESC);
+
 CREATE TABLE IF NOT EXISTS cover_runs (
     run_id TEXT PRIMARY KEY,
     workspace_key TEXT NOT NULL,

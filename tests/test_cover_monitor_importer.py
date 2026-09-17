@@ -202,6 +202,29 @@ def test_historical_baseline_controls_incremental_scan_reasons(tmp_path: Path) -
         "video-unknown": "retry_unknown",
     }
 
+    confirmed_risks = store.list_risk_cases(
+        scope,
+        status="confirmed_risk",
+        limit=10,
+        offset=0,
+    )
+    assert confirmed_risks["total"] == 1
+    assert confirmed_risks["items"][0]["video_id"] == "video-risk"
+    assert confirmed_risks["items"][0]["current_status"] == "confirmed_risk"
+    assert confirmed_risks["items"][0]["opened_summary"] == "历史摘要"
+    assert store.list_risk_cases(scope, status="needs_review")["total"] == 0
+    assert store.list_risk_cases(scope)["total"] == 1
+
+    historical_case = store.get_risk_case_detail(
+        scope,
+        confirmed_risks["items"][0]["case_id"],
+    )
+    assert historical_case is not None
+    assert historical_case["case"]["opened_risk"] == "risk"
+    assert historical_case["events"][0]["event_type"] == "historical_risk_imported"
+    assert historical_case["events"][0]["summary"] == "历史摘要"
+    assert historical_case["reviews"] == []
+
 
 def test_same_file_hash_returns_existing_preview_without_duplicate_rows(tmp_path: Path) -> None:
     source = tmp_path / "channels.xlsx"

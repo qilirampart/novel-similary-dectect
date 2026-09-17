@@ -407,6 +407,7 @@ def build_cover_monitor_router(
             "false_positive",
             "unavailable",
             "closed",
+            "confirmed_risk",
         ]] = Query(default=None),
         limit: int = Query(default=50, ge=1, le=100),
         offset: int = Query(default=0, ge=0),

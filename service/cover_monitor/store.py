@@ -20,8 +20,9 @@ except Exception:
 
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 DEFAULT_BUSY_TIMEOUT_MS = 30_000
+HISTORICAL_RISK_CASE_PREFIX = "historical:"
 
 
 def _now() -> str:
@@ -215,42 +216,77 @@ class CoverMonitorStore:
             "false_positive",
             "unavailable",
             "closed",
+            "confirmed_risk",
         }
         if normalized_status and normalized_status not in allowed_statuses:
             raise ValueError("unsupported risk case status")
         safe_limit = min(max(int(limit), 1), 100)
         safe_offset = max(int(offset), 0)
-        where = "risk_case.workspace_key = ?"
-        params: list[Any] = [workspace_key]
-        if normalized_status:
-            where += " AND risk_case.current_status = ?"
-            params.append(normalized_status)
+        current_where = "risk_case.workspace_key = ?"
+        current_params: list[Any] = [workspace_key]
+        if normalized_status and normalized_status != "confirmed_risk":
+            current_where += " AND risk_case.current_status = ?"
+            current_params.append(normalized_status)
+        current_query = f"""
+            SELECT risk_case.case_id, risk_case.video_pk,
+                   video.video_id, video.title AS video_title,
+                   video.video_url, video.thumbnail_url,
+                   risk_case.current_status, risk_case.opened_detection_id,
+                   opened.overall_risk AS opened_risk,
+                   opened.summary AS opened_summary,
+                   opened.evidence AS opened_evidence,
+                   opened.confidence AS opened_confidence,
+                   opened.asset_id AS opened_asset_id,
+                   (
+                       SELECT event.event_type FROM cover_case_events AS event
+                        WHERE event.case_id = risk_case.case_id
+                        ORDER BY event.created_at DESC, event.case_event_id DESC LIMIT 1
+                   ) AS latest_event_type,
+                   risk_case.opened_at, risk_case.updated_at, risk_case.closed_at
+              FROM cover_risk_cases AS risk_case
+              JOIN cover_videos AS video ON video.video_pk = risk_case.video_pk
+              JOIN cover_detections AS opened ON opened.detection_id = risk_case.opened_detection_id
+             WHERE {current_where}
+        """
+        historical_query = """
+            SELECT 'historical:' || observation.observation_id AS case_id,
+                   observation.video_pk, video.video_id,
+                   video.title AS video_title, video.video_url, video.thumbnail_url,
+                   'confirmed_risk' AS current_status,
+                   '' AS opened_detection_id,
+                   observation.overall_risk AS opened_risk,
+                   COALESCE(observation.summary, '') AS opened_summary,
+                   COALESCE(observation.evidence, '') AS opened_evidence,
+                   COALESCE(observation.confidence, 0.0) AS opened_confidence,
+                   '' AS opened_asset_id,
+                   'historical_risk_imported' AS latest_event_type,
+                   observation.imported_at AS opened_at,
+                   observation.imported_at AS updated_at,
+                   observation.imported_at AS closed_at
+              FROM cover_historical_observations AS observation
+              JOIN cover_videos AS video ON video.video_pk = observation.video_pk
+             WHERE observation.workspace_key = ? AND observation.overall_risk = 'risk'
+        """
+        if normalized_status == "confirmed_risk":
+            selected_query = historical_query
+            params = [workspace_key]
+        elif normalized_status:
+            selected_query = current_query
+            params = current_params
+        else:
+            selected_query = f"{current_query} UNION ALL {historical_query}"
+            params = [*current_params, workspace_key]
         with self._connect() as conn:
             total = int(
                 conn.execute(
-                    f"SELECT COUNT(*) FROM cover_risk_cases AS risk_case WHERE {where}",
+                    f"SELECT COUNT(*) FROM ({selected_query}) AS cases",
                     params,
                 ).fetchone()[0]
             )
             rows = conn.execute(
                 f"""
-                SELECT risk_case.*, video.video_id, video.title AS video_title,
-                       video.video_url, video.thumbnail_url,
-                       opened.overall_risk AS opened_risk,
-                       opened.summary AS opened_summary,
-                       opened.evidence AS opened_evidence,
-                       opened.confidence AS opened_confidence,
-                       opened.asset_id AS opened_asset_id,
-                       (
-                           SELECT event.event_type FROM cover_case_events AS event
-                            WHERE event.case_id = risk_case.case_id
-                            ORDER BY event.created_at DESC, event.case_event_id DESC LIMIT 1
-                       ) AS latest_event_type
-                  FROM cover_risk_cases AS risk_case
-                  JOIN cover_videos AS video ON video.video_pk = risk_case.video_pk
-                  JOIN cover_detections AS opened ON opened.detection_id = risk_case.opened_detection_id
-                 WHERE {where}
-                 ORDER BY risk_case.updated_at DESC, risk_case.case_id DESC
+                SELECT * FROM ({selected_query}) AS cases
+                 ORDER BY updated_at DESC, case_id DESC
                  LIMIT ? OFFSET ?
                 """,
                 (*params, safe_limit, safe_offset),
@@ -377,6 +413,8 @@ class CoverMonitorStore:
     ) -> dict[str, Any] | None:
         workspace_key = _required_text(scope.workspace_key, "workspace_key")
         case_id = _required_text(case_id, "case_id")
+        if case_id.startswith(HISTORICAL_RISK_CASE_PREFIX):
+            return self._get_historical_risk_case_detail(scope, case_id)
         with self._connect() as conn:
             risk_case = conn.execute(
                 """
@@ -439,6 +477,86 @@ class CoverMonitorStore:
             "events": event_items,
             "reviews": [dict(row) for row in reviews],
         }
+
+    def _get_historical_risk_case_detail(
+        self,
+        scope: CoverAccessScope,
+        case_id: str,
+    ) -> dict[str, Any] | None:
+        raw_id = case_id.removeprefix(HISTORICAL_RISK_CASE_PREFIX)
+        if not raw_id.isdigit():
+            return None
+        observation_id = int(raw_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT observation.*, video.video_id, video.title AS video_title,
+                       video.video_url, video.thumbnail_url
+                  FROM cover_historical_observations AS observation
+                  JOIN cover_videos AS video ON video.video_pk = observation.video_pk
+                 WHERE observation.observation_id = ?
+                   AND observation.workspace_key = ?
+                   AND observation.overall_risk = 'risk'
+                """,
+                (observation_id, scope.workspace_key.strip()),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        raw_tags = str(item.get("risk_tags_json") or "")
+        try:
+            risk_tags = list(json.loads(raw_tags)) if raw_tags else []
+        except (TypeError, ValueError):
+            risk_tags = []
+        imported_at = str(item["imported_at"])
+        summary = str(item.get("summary") or "")
+        evidence = str(item.get("evidence") or "")
+        confidence = float(item.get("confidence") or 0.0)
+        case = {
+            "case_id": case_id,
+            "video_pk": int(item["video_pk"]),
+            "video_id": str(item["video_id"]),
+            "video_title": str(item["video_title"]),
+            "video_url": str(item["video_url"]),
+            "thumbnail_url": str(item["thumbnail_url"]),
+            "current_status": "confirmed_risk",
+            "opened_detection_id": "",
+            "opened_risk": "risk",
+            "opened_summary": summary,
+            "opened_evidence": evidence,
+            "opened_confidence": confidence,
+            "opened_asset_id": "",
+            "latest_event_type": "historical_risk_imported",
+            "opened_at": imported_at,
+            "updated_at": imported_at,
+            "closed_at": imported_at,
+        }
+        event = {
+            "case_event_id": -observation_id,
+            "detection_id": None,
+            "event_type": "historical_risk_imported",
+            "actor_type": "system",
+            "actor_user_id": None,
+            "reason": "历史检测基线导入：源表标记为风险",
+            "created_at": imported_at,
+            "overall_risk": "risk",
+            "risk_tags": risk_tags,
+            "summary": summary,
+            "evidence": evidence,
+            "confidence": confidence,
+            "provider": None,
+            "model": str(item.get("model_version") or "legacy_unknown"),
+            "duration_seconds": None,
+            "asset_id": None,
+            "content_sha256": None,
+            "storage_key": None,
+            "original_url": str(item["thumbnail_url"]),
+            "fetched_url": None,
+            "width": None,
+            "height": None,
+            "fetched_at": None,
+        }
+        return {"case": case, "events": [event], "reviews": []}
 
     def get_risk_case_asset(
         self,

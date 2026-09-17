@@ -6465,6 +6465,19 @@ button {
   background: rgba(55, 192, 143, 0.12);
 }
 
+.cover-case-list-items i.confirmed_risk,
+.cover-case-status.confirmed_risk {
+  color: #a52f27;
+  background: rgba(228, 95, 82, 0.14);
+}
+
+.cover-case-readonly-note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
 .cover-case-list-items i.false_positive,
 .cover-case-status.false_positive,
 .cover-case-list-items i.unavailable,

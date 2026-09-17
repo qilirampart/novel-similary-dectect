@@ -452,6 +452,9 @@ def test_cover_risk_case_routes_list_detail_and_confirm_rectification(tmp_path: 
     )
 
     assert listed.status_code == 200
+    assert client.get(
+        "/api/v1/cover-monitor/risk-cases?status=confirmed_risk"
+    ).status_code == 200
     assert listed.json()["total"] == 1
     assert listed.json()["items"][0]["video_id"] == "video-route-risk"
     assert detail.status_code == 200

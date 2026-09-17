@@ -19,6 +19,20 @@ export function coverRunStatusLabel(status: string, failedItemCount: number): st
 
 export type CoverRunAction = "pause" | "resume" | "cancel";
 
+const RISK_CASE_STATUS_LABELS: Record<string, string> = {
+  open: "待复核",
+  needs_review: "待复核",
+  confirmed_risk: "已确认风险",
+  confirmed_rectified: "已确认整改",
+  false_positive: "误报",
+  unavailable: "已失联",
+  closed: "已关闭"
+};
+
+export function coverRiskCaseStatusLabel(status: string): string {
+  return RISK_CASE_STATUS_LABELS[status] || status || "未知";
+}
+
 export function coverRunActions(status: string): CoverRunAction[] {
   if (status === "paused") return ["resume", "cancel"];
   if (status === "queued" || status === "running") return ["pause", "cancel"];
