@@ -1358,6 +1358,49 @@ class CoverMonitorStore:
             ).fetchone()
         return self._row(row)
 
+    def deactivate_channels(
+        self,
+        scope: CoverAccessScope,
+        channel_pks: list[int],
+    ) -> dict[str, int]:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        normalized = sorted({int(value) for value in channel_pks})
+        if not normalized:
+            raise ValueError("channel_pks is required")
+        if len(normalized) > 5000 or any(value <= 0 for value in normalized):
+            raise ValueError("channel_pks is invalid")
+
+        found: dict[int, bool] = {}
+        now = _now()
+        with self._connect() as conn:
+            for start in range(0, len(normalized), 500):
+                chunk = normalized[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT channel_pk, active
+                      FROM cover_channels
+                     WHERE workspace_key = ? AND channel_pk IN ({placeholders})
+                    """,
+                    (workspace_key, *chunk),
+                ).fetchall()
+                found.update({int(row["channel_pk"]): bool(row["active"]) for row in rows})
+            active_ids = [channel_pk for channel_pk, active in found.items() if active]
+            conn.executemany(
+                """
+                UPDATE cover_channels
+                   SET active = 0, updated_at = ?
+                 WHERE workspace_key = ? AND channel_pk = ? AND active = 1
+                """,
+                [(now, workspace_key, channel_pk) for channel_pk in active_ids],
+            )
+        return {
+            "requested_count": len(normalized),
+            "deactivated_count": len(active_ids),
+            "already_inactive_count": sum(1 for active in found.values() if not active),
+            "not_found_count": len(normalized) - len(found),
+        }
+
     def list_channels(
         self,
         scope: CoverAccessScope,

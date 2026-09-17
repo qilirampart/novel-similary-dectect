@@ -71,6 +71,13 @@ export type CoverChannelIdListResponse = {
   truncated: boolean;
 };
 
+export type CoverChannelDeactivateResponse = {
+  requested_count: number;
+  deactivated_count: number;
+  already_inactive_count: number;
+  not_found_count: number;
+};
+
 export type CoverFilterOptionsResponse = {
   operators: Array<{
     operator_pk: number;
@@ -817,6 +824,16 @@ export function listCoverMonitorChannelIds(params: {
       active: params.active == null ? undefined : String(params.active),
       operator_pk: params.operatorPk
     },
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+  });
+}
+
+export function deactivateCoverMonitorChannels(
+  channelPks: number[]
+): Promise<CoverChannelDeactivateResponse> {
+  return requestJson<CoverChannelDeactivateResponse>("/api/v1/cover-monitor/channels/deactivate", {
+    method: "POST",
+    body: JSON.stringify({ channel_pks: channelPks }),
     timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
   });
 }

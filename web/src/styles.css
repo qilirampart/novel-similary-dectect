@@ -6043,6 +6043,11 @@ button {
   background: rgba(255, 107, 92, 0.12);
 }
 
+.cover-channel-row i.inactive {
+  color: #6b7280;
+  background: #e5e7eb;
+}
+
 .cover-channel-empty {
   min-height: 220px;
   display: grid;

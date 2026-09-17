@@ -224,6 +224,33 @@ def test_cover_channel_route_filters_and_paginates_with_operational_counts(tmp_p
         "/api/v1/cover-monitor/channels?operator_pk=0"
     ).status_code == 422
 
+    deactivated = TestClient(app).post(
+        "/api/v1/cover-monitor/channels/deactivate",
+        json={"channel_pks": [alpha["channel_pk"], alpha["channel_pk"], 999999]},
+    )
+    assert deactivated.status_code == 200
+    assert deactivated.json() == {
+        "requested_count": 2,
+        "deactivated_count": 1,
+        "already_inactive_count": 0,
+        "not_found_count": 1,
+    }
+    assert TestClient(app).get(
+        "/api/v1/cover-monitor/channels?active=true"
+    ).json()["total"] == 1
+    assert TestClient(app).get(
+        "/api/v1/cover-monitor/channels?active=false"
+    ).json()["items"][0]["channel_pk"] == alpha["channel_pk"]
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT active FROM cover_channels WHERE channel_pk = ?",
+            (alpha["channel_pk"],),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM cover_videos WHERE channel_pk = ?",
+            (alpha["channel_pk"],),
+        ).fetchone()[0] == 1
+
 
 def test_cover_import_rejects_non_xlsx_and_oversized_files(tmp_path: Path) -> None:
     app = FastAPI()

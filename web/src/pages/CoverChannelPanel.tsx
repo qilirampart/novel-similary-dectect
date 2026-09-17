@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 
 import {
   createCoverMonitorRun,
+  deactivateCoverMonitorChannels,
   getCoverMonitorFilterOptions,
   listCoverMonitorChannelIds,
   listCoverMonitorChannels,
@@ -23,6 +24,7 @@ function formatTime(value?: string | null): string {
 }
 
 function scanLabel(channel: CoverChannelSummary): string {
+  if (!channel.active) return "已停用";
   if (channel.latest_scan_completeness === "complete") return "扫描完整";
   if (channel.latest_scan_completeness === "partial") return "部分完成";
   if (channel.latest_scan_completeness === "failed") return "扫描失败";
@@ -42,6 +44,7 @@ export function CoverChannelPanel() {
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [selectingAll, setSelectingAll] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const requestRef = useRef(0);
@@ -148,6 +151,25 @@ export function CoverChannelPanel() {
     }
   }
 
+  async function deactivateSelected() {
+    if (selected.size === 0 || deleting) return;
+    const count = selected.size;
+    if (!window.confirm(`确认清除选中的 ${formatNumber(count)} 个频道吗？\n\n该操作为软删除：频道、视频、检测结果和历史任务都会保留；取消“只看启用频道”后仍可查看。`)) return;
+    setDeleting(true);
+    setMessage("");
+    setError("");
+    try {
+      const result = await deactivateCoverMonitorChannels(Array.from(selected));
+      setSelected(new Set());
+      setMessage(`已软删除 ${formatNumber(result.deactivated_count)} 个频道，历史数据均已保留。`);
+      await load(0);
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "软删除频道失败");
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   return (
     <section className="card-panel cover-channel-panel">
       <div className="section-heading cover-channel-heading">
@@ -179,6 +201,7 @@ export function CoverChannelPanel() {
         <label><input type="checkbox" checked={activeOnly} onChange={(event) => setActiveOnly(event.target.checked)} />只看启用频道</label>
         <button className="ghost-button slim" type="button" onClick={togglePage} disabled={channels.length === 0}>{pageSelected ? "取消本页全选" : "全选当前页"}</button>
         <button className="outline-button slim" type="button" onClick={() => void selectAllFiltered()} disabled={total === 0 || loading || selectingAll}>{selectingAll ? "正在全选..." : `全选所有 (${formatNumber(total)})`}</button>
+        {selected.size > 0 && <button className="ghost-button slim danger" type="button" onClick={() => void deactivateSelected()} disabled={deleting || running}>{deleting ? "正在清除..." : `清除选中 (${formatNumber(selected.size)})`}</button>}
         {selected.size > 0 && <button className="ghost-button slim" type="button" onClick={() => setSelected(new Set())}>清空选择</button>}
       </div>
 
@@ -193,7 +216,7 @@ export function CoverChannelPanel() {
             <span>{channel.operator_name || "未分配"}</span>
             <span><strong>{formatNumber(channel.video_count)}</strong><small>{formatNumber(channel.open_case_count)} 个开放案件</small></span>
             <span><strong>{formatTime(channel.last_scan_at)}</strong><small>{channel.latest_scan_status || "无批次记录"}</small></span>
-            <span><i className={channel.latest_scan_completeness || "pending"}>{scanLabel(channel)}</i></span>
+            <span><i className={!channel.active ? "inactive" : channel.latest_scan_completeness || "pending"}>{scanLabel(channel)}</i></span>
           </label>
         ))}
         {!loading && channels.length === 0 && <div className="cover-channel-empty">没有符合当前条件的频道</div>}

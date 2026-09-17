@@ -98,6 +98,17 @@ class CoverChannelIdListResponse(BaseModel):
     truncated: bool
 
 
+class CoverChannelDeactivateRequest(BaseModel):
+    channel_pks: list[PositiveInt] = Field(min_length=1, max_length=5000)
+
+
+class CoverChannelDeactivateResponse(BaseModel):
+    requested_count: int
+    deactivated_count: int
+    already_inactive_count: int
+    not_found_count: int
+
+
 class CoverFilterOperator(BaseModel):
     operator_pk: int
     name: str
@@ -351,6 +362,15 @@ def build_cover_monitor_router(
                 active=active,
                 operator_pk=operator_pk,
             )
+        )
+
+    @router.post("/channels/deactivate", response_model=CoverChannelDeactivateResponse)
+    def deactivate_channels(
+        body: CoverChannelDeactivateRequest,
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverChannelDeactivateResponse:
+        return CoverChannelDeactivateResponse.model_validate(
+            store.deactivate_channels(access_scope(user), body.channel_pks)
         )
 
     @router.get("/filter-options", response_model=CoverFilterOptionsResponse)
