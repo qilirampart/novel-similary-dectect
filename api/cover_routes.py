@@ -92,6 +92,12 @@ class CoverChannelListResponse(BaseModel):
     offset: int
 
 
+class CoverChannelIdListResponse(BaseModel):
+    channel_pks: list[int]
+    total: int
+    truncated: bool
+
+
 class CoverRunChannelSummary(BaseModel):
     run_channel_id: int
     channel_pk: int
@@ -304,6 +310,20 @@ def build_cover_monitor_router(
                 active=active,
                 limit=limit,
                 offset=offset,
+            )
+        )
+
+    @router.get("/channels/ids", response_model=CoverChannelIdListResponse)
+    def list_channel_ids(
+        keyword: str = Query(default="", max_length=200),
+        active: Optional[bool] = Query(default=None),
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverChannelIdListResponse:
+        return CoverChannelIdListResponse.model_validate(
+            store.search_channel_ids(
+                access_scope(user),
+                keyword=keyword,
+                active=active,
             )
         )
 

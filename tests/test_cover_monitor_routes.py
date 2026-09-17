@@ -171,6 +171,15 @@ def test_cover_channel_route_filters_and_paginates_with_operational_counts(tmp_p
         "latest_scan_completeness": None,
         "updated_at": alpha["updated_at"],
     }
+    selected = TestClient(app).get(
+        "/api/v1/cover-monitor/channels/ids?keyword=alpha&active=true"
+    )
+    assert selected.status_code == 200
+    assert selected.json() == {
+        "channel_pks": [alpha["channel_pk"]],
+        "total": 1,
+        "truncated": False,
+    }
 
 
 def test_cover_import_rejects_non_xlsx_and_oversized_files(tmp_path: Path) -> None:

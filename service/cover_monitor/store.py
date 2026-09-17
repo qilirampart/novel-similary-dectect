@@ -1369,6 +1369,63 @@ class CoverMonitorStore:
             item["active"] = bool(item["active"])
         return {"items": items, "total": total, "limit": safe_limit, "offset": safe_offset}
 
+    def search_channel_ids(
+        self,
+        scope: CoverAccessScope,
+        *,
+        keyword: str = "",
+        active: bool | None = None,
+        limit: int = 5000,
+    ) -> dict[str, Any]:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        safe_limit = min(max(int(limit), 1), 5000)
+        clauses = ["channel.workspace_key = ?"]
+        params: list[Any] = [workspace_key]
+        normalized_keyword = str(keyword or "").strip()
+        if normalized_keyword:
+            escaped = normalized_keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            clauses.append(
+                "(channel.name LIKE ? ESCAPE '\\' OR channel.channel_id LIKE ? ESCAPE '\\' "
+                "OR operator.name LIKE ? ESCAPE '\\')"
+            )
+            params.extend((pattern, pattern, pattern))
+        if active is not None:
+            clauses.append("channel.active = ?")
+            params.append(1 if active else 0)
+        where = " AND ".join(clauses)
+        with self._connect() as conn:
+            total = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                      FROM cover_channels AS channel
+                      LEFT JOIN cover_operators AS operator
+                        ON operator.operator_pk = channel.operator_pk
+                     WHERE {where}
+                    """,
+                    params,
+                ).fetchone()[0]
+            )
+            rows = conn.execute(
+                f"""
+                SELECT channel.channel_pk
+                  FROM cover_channels AS channel
+                  LEFT JOIN cover_operators AS operator
+                    ON operator.operator_pk = channel.operator_pk
+                 WHERE {where}
+                 ORDER BY channel.updated_at DESC, channel.channel_pk DESC
+                 LIMIT ?
+                """,
+                (*params, safe_limit),
+            ).fetchall()
+        channel_pks = [int(row["channel_pk"]) for row in rows]
+        return {
+            "channel_pks": channel_pks,
+            "total": total,
+            "truncated": len(channel_pks) < total,
+        }
+
     def upsert_video(
         self,
         scope: CoverAccessScope,

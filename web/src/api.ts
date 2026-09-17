@@ -65,6 +65,12 @@ export type CoverChannelListResponse = {
   offset: number;
 };
 
+export type CoverChannelIdListResponse = {
+  channel_pks: number[];
+  total: number;
+  truncated: boolean;
+};
+
 export type CoverRunDetailResponse = {
   run: CoverRunSummary;
   channels: Array<{
@@ -777,6 +783,19 @@ export function listCoverMonitorChannels(params: {
       active: params.active == null ? undefined : String(params.active),
       limit: params.limit ?? 50,
       offset: params.offset ?? 0
+    },
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+  });
+}
+
+export function listCoverMonitorChannelIds(params: {
+  keyword?: string;
+  active?: boolean;
+} = {}): Promise<CoverChannelIdListResponse> {
+  return requestJson<CoverChannelIdListResponse>("/api/v1/cover-monitor/channels/ids", {
+    query: {
+      keyword: params.keyword || undefined,
+      active: params.active == null ? undefined : String(params.active)
     },
     timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
   });

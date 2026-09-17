@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 
 import {
   createCoverMonitorRun,
+  listCoverMonitorChannelIds,
   listCoverMonitorChannels,
   type CoverChannelSummary
 } from "../api";
@@ -35,6 +36,7 @@ export function CoverChannelPanel() {
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
+  const [selectingAll, setSelectingAll] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const requestRef = useRef(0);
@@ -87,6 +89,31 @@ export function CoverChannelPanel() {
     });
   }
 
+  async function selectAllFiltered() {
+    setSelectingAll(true);
+    setMessage("");
+    setError("");
+    try {
+      const response = await listCoverMonitorChannelIds({
+        keyword,
+        active: activeOnly ? true : undefined
+      });
+      if (response.truncated) {
+        throw new Error(`当前筛选结果有 ${formatNumber(response.total)} 个频道，超过单批次 5,000 个频道的上限，请先缩小筛选范围。`);
+      }
+      setSelected((previous) => {
+        const next = new Set(previous);
+        response.channel_pks.forEach((id) => next.add(id));
+        return next;
+      });
+      setMessage(`已选择当前筛选下的全部 ${formatNumber(response.total)} 个频道。`);
+    } catch (selectError) {
+      setError(selectError instanceof Error ? selectError.message : "全选频道失败");
+    } finally {
+      setSelectingAll(false);
+    }
+  }
+
   async function createSelectedRun() {
     if (selected.size === 0) return;
     setRunning(true);
@@ -124,6 +151,7 @@ export function CoverChannelPanel() {
         </form>
         <label><input type="checkbox" checked={activeOnly} onChange={(event) => setActiveOnly(event.target.checked)} />只看启用频道</label>
         <button className="ghost-button slim" type="button" onClick={togglePage} disabled={channels.length === 0}>{pageSelected ? "取消本页全选" : "全选当前页"}</button>
+        <button className="outline-button slim" type="button" onClick={() => void selectAllFiltered()} disabled={total === 0 || loading || selectingAll}>{selectingAll ? "正在全选..." : `全选所有 (${formatNumber(total)})`}</button>
         {selected.size > 0 && <button className="ghost-button slim" type="button" onClick={() => setSelected(new Set())}>清空选择</button>}
       </div>
 
