@@ -11,6 +11,7 @@ import {
   type CoverRiskCaseSummary
 } from "../api";
 import { coverRiskCaseStatusLabel } from "../coverDisplay";
+import { CoverScopeFilters } from "./CoverScopeFilters";
 
 const PAGE_SIZE = 50;
 
@@ -45,6 +46,9 @@ function EvidenceCard({
   event?: CoverRiskCaseEvent;
   emptyText: string;
 }) {
+  const imageUrl = event?.asset_id
+    ? coverRiskCaseAssetUrl(caseId, event.asset_id)
+    : event?.original_url || event?.fetched_url || "";
   return (
     <article className="cover-evidence-card">
       <header>
@@ -52,8 +56,8 @@ function EvidenceCard({
         {event?.confidence != null && <b>{Math.round(event.confidence * 100)}%</b>}
       </header>
       <div className="cover-evidence-image">
-        {event?.asset_id ? (
-          <img src={coverRiskCaseAssetUrl(caseId, event.asset_id)} alt={`${title}封面证据`} />
+        {imageUrl ? (
+          <img src={imageUrl} alt={`${title}封面证据`} loading="lazy" referrerPolicy="no-referrer" />
         ) : (
           <span>{emptyText}</span>
         )}
@@ -69,6 +73,8 @@ function EvidenceCard({
 
 export function CoverRiskReviewPanel() {
   const [status, setStatus] = useState("needs_review");
+  const [operatorPk, setOperatorPk] = useState<number | undefined>();
+  const [channelPk, setChannelPk] = useState<number | undefined>();
   const [cases, setCases] = useState<CoverRiskCaseSummary[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
@@ -105,7 +111,13 @@ export function CoverRiskReviewPanel() {
     setLoading(true);
     setError("");
     try {
-      const response = await listCoverRiskCases(status, PAGE_SIZE, nextOffset);
+      const response = await listCoverRiskCases(
+        status,
+        PAGE_SIZE,
+        nextOffset,
+        operatorPk,
+        channelPk
+      );
       if (requestId !== listRequestRef.current) return;
       setCases(response.items);
       setTotal(response.total);
@@ -129,7 +141,7 @@ export function CoverRiskReviewPanel() {
 
   useEffect(() => {
     void loadCases(0, "");
-  }, [status]);
+  }, [status, operatorPk, channelPk]);
 
   async function submitReview(action: CoverRiskCaseReviewAction) {
     if (!detail || note.trim().length < 2) {
@@ -184,6 +196,13 @@ export function CoverRiskReviewPanel() {
             <option value="">全部</option>
           </select>
         </label>
+        <CoverScopeFilters
+          operatorPk={operatorPk}
+          channelPk={channelPk}
+          disabled={loading}
+          onOperatorChange={setOperatorPk}
+          onChannelChange={setChannelPk}
+        />
         <div className="cover-case-list-items">
           {cases.map((item) => (
             <button key={item.case_id} type="button" className={selectedId === item.case_id ? "active" : ""} onClick={() => void loadDetail(item.case_id)}>

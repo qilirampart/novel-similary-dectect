@@ -21,6 +21,7 @@ import { Icon } from "../icons";
 import { coverRunActions, coverRunStatusLabel, type CoverRunAction } from "../coverDisplay";
 import { CoverChannelPanel } from "./CoverChannelPanel";
 import { CoverRiskReviewPanel } from "./CoverRiskReviewPanel";
+import { CoverScopeFilters } from "./CoverScopeFilters";
 
 
 const EMPTY_OVERVIEW: CoverMonitorOverviewResponse = {
@@ -110,6 +111,8 @@ export function CoverMonitorPage() {
   const [runListLoading, setRunListLoading] = useState(false);
   const [results, setResults] = useState<CoverResultListResponse>(EMPTY_RESULTS);
   const [resultFilter, setResultFilter] = useState("");
+  const [resultOperatorPk, setResultOperatorPk] = useState<number | undefined>();
+  const [resultChannelPk, setResultChannelPk] = useState<number | undefined>();
   const [resultLoading, setResultLoading] = useState(true);
   const [itemOffset, setItemOffset] = useState(0);
   const [importKind, setImportKind] = useState<CoverImportKind>("channels");
@@ -156,7 +159,13 @@ export function CoverMonitorPage() {
   async function loadResults(filter = resultFilter, offset = 0) {
     setResultLoading(true);
     try {
-      setResults(await listCoverMonitorResults(filter, 12, offset));
+      setResults(await listCoverMonitorResults(
+        filter,
+        12,
+        offset,
+        resultOperatorPk,
+        resultChannelPk
+      ));
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "封面检测结果加载失败");
     } finally {
@@ -166,7 +175,7 @@ export function CoverMonitorPage() {
 
   useEffect(() => {
     if (activeTab === "工作台") void loadResults(resultFilter, 0);
-  }, [activeTab, resultFilter]);
+  }, [activeTab, resultFilter, resultOperatorPk, resultChannelPk]);
 
   useEffect(() => {
     const status = overview.latest_run?.status;
@@ -463,6 +472,13 @@ export function CoverMonitorPage() {
           </div>
           <div className="cover-toolbar-note"><Icon name="shield" />当前为独立数据空间，不读取字幕或小说任务结果</div>
         </div>
+        <CoverScopeFilters
+          operatorPk={resultOperatorPk}
+          channelPk={resultChannelPk}
+          disabled={resultLoading}
+          onOperatorChange={setResultOperatorPk}
+          onChannelChange={setResultChannelPk}
+        />
         {resultLoading ? (
           <div className="cover-results-empty"><strong>正在加载检测结果...</strong></div>
         ) : results.items.length > 0 ? (

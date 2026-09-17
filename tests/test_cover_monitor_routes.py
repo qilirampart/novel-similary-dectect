@@ -180,6 +180,25 @@ def test_cover_channel_route_filters_and_paginates_with_operational_counts(tmp_p
         "total": 1,
         "truncated": False,
     }
+    filters = TestClient(app).get(
+        f"/api/v1/cover-monitor/filter-options?operator_pk={operator_pk}"
+    )
+    assert filters.status_code == 200
+    assert filters.json()["operators"] == [
+        {"operator_pk": operator_pk, "name": "代理甲", "channel_count": 1},
+        {"operator_pk": -1, "name": "未分配", "channel_count": 1},
+    ]
+    assert filters.json()["channels"] == [
+        {
+            "channel_pk": alpha["channel_pk"],
+            "channel_id": "UC-alpha",
+            "name": "Alpha 剧场",
+            "operator_pk": operator_pk,
+        }
+    ]
+    assert TestClient(app).get(
+        "/api/v1/cover-monitor/results?operator_pk=0"
+    ).status_code == 422
 
 
 def test_cover_import_rejects_non_xlsx_and_oversized_files(tmp_path: Path) -> None:

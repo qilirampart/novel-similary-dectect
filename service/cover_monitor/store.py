@@ -20,7 +20,7 @@ except Exception:
 
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 DEFAULT_BUSY_TIMEOUT_MS = 30_000
 HISTORICAL_RISK_CASE_PREFIX = "historical:"
 
@@ -34,6 +34,33 @@ def _required_text(value: str, field: str) -> str:
     if not normalized:
         raise ValueError(f"{field} is required")
     return normalized
+
+
+def _channel_scope_sql(
+    *,
+    operator_pk: int | None,
+    channel_pk: int | None,
+    alias: str = "channel",
+) -> tuple[str, list[int]]:
+    clauses: list[str] = []
+    params: list[int] = []
+    if operator_pk is not None:
+        normalized_operator = int(operator_pk)
+        if normalized_operator < -1 or normalized_operator == 0:
+            raise ValueError("operator_pk is invalid")
+        if normalized_operator == -1:
+            clauses.append(f"{alias}.operator_pk IS NULL")
+        else:
+            clauses.append(f"{alias}.operator_pk = ?")
+            params.append(normalized_operator)
+    if channel_pk is not None:
+        normalized_channel = int(channel_pk)
+        if normalized_channel <= 0:
+            raise ValueError("channel_pk is invalid")
+        clauses.append(f"{alias}.channel_pk = ?")
+        params.append(normalized_channel)
+    suffix = "" if not clauses else " AND " + " AND ".join(clauses)
+    return suffix, params
 
 
 def _parse_aware_datetime(value: str, field: str) -> datetime:
@@ -219,6 +246,8 @@ class CoverMonitorStore:
         scope: CoverAccessScope,
         *,
         overall_risk: str = "",
+        operator_pk: int | None = None,
+        channel_pk: int | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -228,7 +257,11 @@ class CoverMonitorStore:
             raise ValueError("unsupported cover result risk")
         safe_limit = min(max(int(limit), 1), 100)
         safe_offset = max(int(offset), 0)
-        current_query = """
+        scope_sql, scope_params = _channel_scope_sql(
+            operator_pk=operator_pk,
+            channel_pk=channel_pk,
+        )
+        current_query = f"""
             SELECT 'detection:' || detection.detection_id AS result_id,
                    'current_detection' AS source,
                    video.video_pk, video.video_id, video.title AS video_title,
@@ -238,9 +271,10 @@ class CoverMonitorStore:
                    detection.model, detection.created_at
               FROM cover_detections AS detection
               JOIN cover_videos AS video ON video.video_pk = detection.video_pk
-             WHERE detection.workspace_key = ? AND detection.overall_risk != 'safe'
+              JOIN cover_channels AS channel ON channel.channel_pk = video.channel_pk
+             WHERE detection.workspace_key = ? AND detection.overall_risk != 'safe'{scope_sql}
         """
-        historical_query = """
+        historical_query = f"""
             SELECT 'historical:' || observation.observation_id AS result_id,
                    'historical_import' AS source,
                    video.video_pk, video.video_id, video.title AS video_title,
@@ -252,10 +286,17 @@ class CoverMonitorStore:
                    observation.model_version AS model, observation.imported_at AS created_at
               FROM cover_historical_observations AS observation
               JOIN cover_videos AS video ON video.video_pk = observation.video_pk
-             WHERE observation.workspace_key = ? AND observation.overall_risk != 'safe'
+              JOIN cover_channels AS channel ON channel.channel_pk = video.channel_pk
+             WHERE observation.workspace_key = ? AND observation.overall_risk != 'safe'{scope_sql}
         """
         combined_query = f"{current_query} UNION ALL {historical_query}"
-        params: list[Any] = [workspace_key, workspace_key]
+        base_params: list[Any] = [
+            workspace_key,
+            *scope_params,
+            workspace_key,
+            *scope_params,
+        ]
+        params = list(base_params)
         filtered_query = f"SELECT * FROM ({combined_query}) AS results"
         if normalized_risk:
             filtered_query += " WHERE overall_risk = ?"
@@ -267,7 +308,7 @@ class CoverMonitorStore:
                   FROM ({combined_query}) AS results
                  GROUP BY overall_risk
                 """,
-                (workspace_key, workspace_key),
+                base_params,
             ).fetchall()
             counts = {"all": 0, "risk": 0, "review": 0, "unknown": 0}
             for row in count_rows:
@@ -306,6 +347,8 @@ class CoverMonitorStore:
         scope: CoverAccessScope,
         *,
         status: str = "",
+        operator_pk: int | None = None,
+        channel_pk: int | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -324,8 +367,12 @@ class CoverMonitorStore:
             raise ValueError("unsupported risk case status")
         safe_limit = min(max(int(limit), 1), 100)
         safe_offset = max(int(offset), 0)
-        current_where = "risk_case.workspace_key = ?"
-        current_params: list[Any] = [workspace_key]
+        scope_sql, scope_params = _channel_scope_sql(
+            operator_pk=operator_pk,
+            channel_pk=channel_pk,
+        )
+        current_where = f"risk_case.workspace_key = ?{scope_sql}"
+        current_params: list[Any] = [workspace_key, *scope_params]
         if normalized_status and normalized_status != "confirmed_risk":
             current_where += " AND risk_case.current_status = ?"
             current_params.append(normalized_status)
@@ -347,10 +394,11 @@ class CoverMonitorStore:
                    risk_case.opened_at, risk_case.updated_at, risk_case.closed_at
               FROM cover_risk_cases AS risk_case
               JOIN cover_videos AS video ON video.video_pk = risk_case.video_pk
+              JOIN cover_channels AS channel ON channel.channel_pk = video.channel_pk
               JOIN cover_detections AS opened ON opened.detection_id = risk_case.opened_detection_id
              WHERE {current_where}
         """
-        historical_query = """
+        historical_query = f"""
             SELECT 'historical:' || observation.observation_id AS case_id,
                    observation.video_pk, video.video_id,
                    video.title AS video_title, video.video_url, video.thumbnail_url,
@@ -367,17 +415,18 @@ class CoverMonitorStore:
                    observation.imported_at AS closed_at
               FROM cover_historical_observations AS observation
               JOIN cover_videos AS video ON video.video_pk = observation.video_pk
-             WHERE observation.workspace_key = ? AND observation.overall_risk = 'risk'
+              JOIN cover_channels AS channel ON channel.channel_pk = video.channel_pk
+             WHERE observation.workspace_key = ? AND observation.overall_risk = 'risk'{scope_sql}
         """
         if normalized_status == "confirmed_risk":
             selected_query = historical_query
-            params = [workspace_key]
+            params = [workspace_key, *scope_params]
         elif normalized_status:
             selected_query = current_query
             params = current_params
         else:
             selected_query = f"{current_query} UNION ALL {historical_query}"
-            params = [*current_params, workspace_key]
+            params = [*current_params, workspace_key, *scope_params]
         with self._connect() as conn:
             total = int(
                 conn.execute(
@@ -398,6 +447,51 @@ class CoverMonitorStore:
             "total": total,
             "limit": safe_limit,
             "offset": safe_offset,
+        }
+
+    def list_filter_options(
+        self,
+        scope: CoverAccessScope,
+        *,
+        operator_pk: int | None = None,
+    ) -> dict[str, Any]:
+        workspace_key = _required_text(scope.workspace_key, "workspace_key")
+        if operator_pk is not None:
+            _channel_scope_sql(operator_pk=operator_pk, channel_pk=None)
+        with self._connect() as conn:
+            operator_rows = conn.execute(
+                """
+                SELECT COALESCE(operator.operator_pk, -1) AS operator_pk,
+                       COALESCE(operator.name, '未分配') AS name,
+                       COUNT(*) AS channel_count
+                  FROM cover_channels AS channel
+                  LEFT JOIN cover_operators AS operator
+                    ON operator.operator_pk = channel.operator_pk
+                 WHERE channel.workspace_key = ?
+                 GROUP BY COALESCE(operator.operator_pk, -1), COALESCE(operator.name, '未分配')
+                 ORDER BY name, operator_pk
+                """,
+                (workspace_key,),
+            ).fetchall()
+            channel_rows: list[Any] = []
+            if operator_pk is not None:
+                scope_sql, scope_params = _channel_scope_sql(
+                    operator_pk=operator_pk,
+                    channel_pk=None,
+                )
+                channel_rows = conn.execute(
+                    f"""
+                    SELECT channel.channel_pk, channel.channel_id, channel.name,
+                           COALESCE(channel.operator_pk, -1) AS operator_pk
+                      FROM cover_channels AS channel
+                     WHERE channel.workspace_key = ?{scope_sql}
+                     ORDER BY channel.name, channel.channel_id, channel.channel_pk
+                    """,
+                    (workspace_key, *scope_params),
+                ).fetchall()
+        return {
+            "operators": [dict(row) for row in operator_rows],
+            "channels": [dict(row) for row in channel_rows],
         }
 
     def review_risk_case(

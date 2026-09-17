@@ -45,6 +45,9 @@ CREATE TABLE IF NOT EXISTS cover_channels (
 CREATE INDEX IF NOT EXISTS idx_cover_channels_workspace_active
     ON cover_channels (workspace_key, active, updated_at DESC);
 
+CREATE INDEX IF NOT EXISTS idx_cover_channels_workspace_operator
+    ON cover_channels (workspace_key, operator_pk, name, channel_pk);
+
 CREATE TABLE IF NOT EXISTS cover_channel_operator_history (
     history_id INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_pk INTEGER NOT NULL,

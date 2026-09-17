@@ -98,6 +98,24 @@ class CoverChannelIdListResponse(BaseModel):
     truncated: bool
 
 
+class CoverFilterOperator(BaseModel):
+    operator_pk: int
+    name: str
+    channel_count: int
+
+
+class CoverFilterChannel(BaseModel):
+    channel_pk: int
+    channel_id: str
+    name: str
+    operator_pk: int
+
+
+class CoverFilterOptionsResponse(BaseModel):
+    operators: list[CoverFilterOperator]
+    channels: list[CoverFilterChannel]
+
+
 class CoverRunChannelSummary(BaseModel):
     run_channel_id: int
     channel_pk: int
@@ -327,6 +345,20 @@ def build_cover_monitor_router(
             )
         )
 
+    @router.get("/filter-options", response_model=CoverFilterOptionsResponse)
+    def list_filter_options(
+        operator_pk: Optional[int] = Query(default=None, ge=-1),
+        user: dict[str, Any] = Depends(current_user_dependency),
+    ) -> CoverFilterOptionsResponse:
+        if operator_pk == 0:
+            raise HTTPException(status_code=422, detail="operator_pk is invalid")
+        return CoverFilterOptionsResponse.model_validate(
+            store.list_filter_options(
+                access_scope(user),
+                operator_pk=operator_pk,
+            )
+        )
+
     @router.post("/runs", response_model=CoverRunSummary)
     def create_run(
         body: CoverRunCreateRequest,
@@ -454,14 +486,20 @@ def build_cover_monitor_router(
             "closed",
             "confirmed_risk",
         ]] = Query(default=None),
+        operator_pk: Optional[int] = Query(default=None, ge=-1),
+        channel_pk: Optional[int] = Query(default=None, ge=1),
         limit: int = Query(default=50, ge=1, le=100),
         offset: int = Query(default=0, ge=0),
         user: dict[str, Any] = Depends(current_user_dependency),
     ) -> CoverRiskCaseListResponse:
+        if operator_pk == 0:
+            raise HTTPException(status_code=422, detail="operator_pk is invalid")
         return CoverRiskCaseListResponse.model_validate(
             store.list_risk_cases(
                 access_scope(user),
                 status=status or "",
+                operator_pk=operator_pk,
+                channel_pk=channel_pk,
                 limit=limit,
                 offset=offset,
             )
@@ -470,14 +508,20 @@ def build_cover_monitor_router(
     @router.get("/results", response_model=CoverResultListResponse)
     def list_results(
         overall_risk: Optional[Literal["risk", "review", "unknown"]] = Query(default=None),
+        operator_pk: Optional[int] = Query(default=None, ge=-1),
+        channel_pk: Optional[int] = Query(default=None, ge=1),
         limit: int = Query(default=20, ge=1, le=100),
         offset: int = Query(default=0, ge=0),
         user: dict[str, Any] = Depends(current_user_dependency),
     ) -> CoverResultListResponse:
+        if operator_pk == 0:
+            raise HTTPException(status_code=422, detail="operator_pk is invalid")
         return CoverResultListResponse.model_validate(
             store.list_results(
                 access_scope(user),
                 overall_risk=overall_risk or "",
+                operator_pk=operator_pk,
+                channel_pk=channel_pk,
                 limit=limit,
                 offset=offset,
             )

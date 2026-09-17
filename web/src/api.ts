@@ -71,6 +71,20 @@ export type CoverChannelIdListResponse = {
   truncated: boolean;
 };
 
+export type CoverFilterOptionsResponse = {
+  operators: Array<{
+    operator_pk: number;
+    name: string;
+    channel_count: number;
+  }>;
+  channels: Array<{
+    channel_pk: number;
+    channel_id: string;
+    name: string;
+    operator_pk: number;
+  }>;
+};
+
 export type CoverRunDetailResponse = {
   run: CoverRunSummary;
   channels: Array<{
@@ -143,6 +157,8 @@ export type CoverRiskCaseEvent = {
   duration_seconds?: number | null;
   asset_id?: string | null;
   content_sha256?: string | null;
+  original_url?: string | null;
+  fetched_url?: string | null;
   width?: number | null;
   height?: number | null;
 };
@@ -801,6 +817,15 @@ export function listCoverMonitorChannelIds(params: {
   });
 }
 
+export function getCoverMonitorFilterOptions(
+  operatorPk?: number
+): Promise<CoverFilterOptionsResponse> {
+  return requestJson<CoverFilterOptionsResponse>("/api/v1/cover-monitor/filter-options", {
+    query: { operator_pk: operatorPk },
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+  });
+}
+
 export function createCoverMonitorRun(params: {
   intensity: "conservative" | "standard" | "strict";
   includeShorts: boolean;
@@ -881,10 +906,18 @@ export async function downloadCoverMonitorRunExport(
 export function listCoverRiskCases(
   status = "needs_review",
   limit = 50,
-  offset = 0
+  offset = 0,
+  operatorPk?: number,
+  channelPk?: number
 ): Promise<CoverRiskCaseListResponse> {
   return requestJson<CoverRiskCaseListResponse>("/api/v1/cover-monitor/risk-cases", {
-    query: { status: status || undefined, limit, offset },
+    query: {
+      status: status || undefined,
+      operator_pk: operatorPk,
+      channel_pk: channelPk,
+      limit,
+      offset
+    },
     timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
   });
 }
@@ -892,10 +925,18 @@ export function listCoverRiskCases(
 export function listCoverMonitorResults(
   overallRisk = "",
   limit = 20,
-  offset = 0
+  offset = 0,
+  operatorPk?: number,
+  channelPk?: number
 ): Promise<CoverResultListResponse> {
   return requestJson<CoverResultListResponse>("/api/v1/cover-monitor/results", {
-    query: { overall_risk: overallRisk || undefined, limit, offset },
+    query: {
+      overall_risk: overallRisk || undefined,
+      operator_pk: operatorPk,
+      channel_pk: channelPk,
+      limit,
+      offset
+    },
     timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
   });
 }

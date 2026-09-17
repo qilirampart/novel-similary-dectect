@@ -247,7 +247,77 @@ def test_historical_baseline_controls_incremental_scan_reasons(tmp_path: Path) -
     assert historical_case["case"]["opened_risk"] == "risk"
     assert historical_case["events"][0]["event_type"] == "historical_risk_imported"
     assert historical_case["events"][0]["summary"] == "历史摘要"
+    assert historical_case["events"][0]["original_url"].endswith(
+        "/video-risk/hqdefault.jpg"
+    )
     assert historical_case["reviews"] == []
+
+
+def test_historical_results_and_cases_filter_by_operator_then_channel(tmp_path: Path) -> None:
+    source = tmp_path / "baseline-scope.xlsx"
+    _write_workbook(
+        source,
+        [
+            _row("代理甲", "UC-A1", "video-a1", "risk"),
+            _row("代理甲", "UC-A2", "video-a2", "review"),
+            _row("代理乙", "UC-B1", "video-b1", "risk"),
+        ],
+    )
+    store = CoverMonitorStore(tmp_path / "cover.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    preview = store.create_import_preview(
+        scope,
+        import_kind="baseline",
+        source_file_name=source.name,
+        source_file_sha256="sha-result-scope",
+        source_file_path=str(source),
+    )
+    store.confirm_import(scope, preview["import_id"])
+
+    options = store.list_filter_options(scope)
+    operator_by_name = {item["name"]: item for item in options["operators"]}
+    operator_a = operator_by_name["代理甲"]
+    operator_b = operator_by_name["代理乙"]
+    assert operator_a["channel_count"] == 2
+    assert operator_b["channel_count"] == 1
+    assert options["channels"] == []
+
+    operator_options = store.list_filter_options(
+        scope,
+        operator_pk=operator_a["operator_pk"],
+    )
+    assert {item["channel_id"] for item in operator_options["channels"]} == {
+        "UC-A1",
+        "UC-A2",
+    }
+    channel_a1 = next(
+        item for item in operator_options["channels"] if item["channel_id"] == "UC-A1"
+    )
+
+    operator_results = store.list_results(
+        scope,
+        operator_pk=operator_a["operator_pk"],
+    )
+    assert operator_results["counts"] == {
+        "all": 2,
+        "risk": 1,
+        "review": 1,
+        "unknown": 0,
+    }
+    channel_results = store.list_results(
+        scope,
+        operator_pk=operator_a["operator_pk"],
+        channel_pk=channel_a1["channel_pk"],
+    )
+    assert channel_results["total"] == 1
+    assert channel_results["items"][0]["video_id"] == "video-a1"
+    operator_cases = store.list_risk_cases(
+        scope,
+        status="confirmed_risk",
+        operator_pk=operator_b["operator_pk"],
+    )
+    assert operator_cases["total"] == 1
+    assert operator_cases["items"][0]["video_id"] == "video-b1"
 
 
 def test_same_file_hash_returns_existing_preview_without_duplicate_rows(tmp_path: Path) -> None:

@@ -36,7 +36,7 @@ def test_init_cover_db_is_idempotent_and_enables_required_tables(tmp_path: Path)
             ).fetchall()
         }
 
-    assert version == 12
+    assert version == 13
     assert "idx_cover_runs_claim" in indexes
     assert "idx_cover_task_items_run_claim" in indexes
     assert "uq_cover_detections_task_item" in indexes
@@ -45,6 +45,7 @@ def test_init_cover_db_is_idempotent_and_enables_required_tables(tmp_path: Path)
     assert "idx_cover_detections_asset_risk" in indexes
     assert "idx_cover_case_events_detection" in indexes
     assert "idx_cover_historical_observations_risk" in indexes
+    assert "idx_cover_channels_workspace_operator" in indexes
     assert {
         "cover_channels",
         "cover_videos",
@@ -99,7 +100,7 @@ def test_init_cover_db_migrates_existing_assets_to_local_storage_backend(tmp_pat
         ).fetchone()[0]
         version = conn.execute("SELECT MAX(version) FROM cover_schema_versions").fetchone()[0]
     assert backend == "local"
-    assert version == 12
+    assert version == 13
 
 
 def test_init_cover_db_adds_cleanup_execution_columns_to_v9_database(tmp_path: Path) -> None:
@@ -132,7 +133,7 @@ def test_init_cover_db_adds_cleanup_execution_columns_to_v9_database(tmp_path: P
         "worker_name",
         "last_heartbeat_at",
     }.issubset(columns)
-    assert version == 12
+    assert version == 13
 
 
 def test_cleanup_plan_registration_is_workspace_scoped_and_auditable(tmp_path: Path) -> None:
