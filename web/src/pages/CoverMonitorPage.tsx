@@ -685,10 +685,10 @@ export function CoverMonitorPage() {
                 <div className="cover-import-preview-title"><div><strong>{importPreview.status === "completed" ? "导入已完成" : "预检完成"}</strong><span>工作表：{importPreview.sheet_name || "默认首个工作表"}</span></div><code>{importPreview.import_id.slice(0, 8)}</code></div>
                 <div className="cover-import-stats">
                   <div><span>来源行</span><strong>{formatNumber(importPreview.stats.total_rows || 0)}</strong></div>
-                  <div><span>有效行</span><strong>{formatNumber(importPreview.stats.valid_rows || 0)}</strong></div>
+                  <div><span>{importPreview.import_kind === "channels" ? "新增频道" : "有效行"}</span><strong>{formatNumber(importPreview.stats.valid_rows || 0)}</strong></div>
                   <div><span>唯一频道</span><strong>{formatNumber(importPreview.stats.unique_channels || 0)}</strong></div>
                   <div><span>唯一视频</span><strong>{formatNumber(importPreview.stats.unique_videos || 0)}</strong></div>
-                  <div className="muted"><span>重复</span><strong>{formatNumber(importPreview.stats.duplicate_rows || 0)}</strong></div>
+                  <div className="muted"><span>{importPreview.import_kind === "channels" ? "已存在或重复" : "重复"}</span><strong>{formatNumber(importPreview.stats.duplicate_rows || 0)}</strong></div>
                   <div className={(importPreview.stats.conflict_rows || 0) > 0 ? "danger" : "muted"}><span>冲突</span><strong>{formatNumber(importPreview.stats.conflict_rows || 0)}</strong></div>
                   <div className={(importPreview.stats.missing_rows || 0) > 0 ? "warning" : "muted"}><span>缺字段</span><strong>{formatNumber(importPreview.stats.missing_rows || 0)}</strong></div>
                   {importPreview.status === "completed" && <div className="success"><span>已落库视频</span><strong>{formatNumber(importPreview.stats.applied_videos || 0)}</strong></div>}

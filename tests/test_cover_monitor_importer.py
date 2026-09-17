@@ -125,6 +125,67 @@ def test_headerless_single_column_channel_urls_are_imported_without_dropping_fir
     }
 
 
+def test_standard_channel_workbook_prefers_sheet2_and_only_imports_new_channels(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "standard-channels.xlsx"
+    workbook = Workbook()
+    url_sheet = workbook.active
+    url_sheet.title = "Sheet1"
+    url_sheet.append(["https://www.youtube.com/channel/UC-existing"])
+    detail_sheet = workbook.create_sheet("Sheet2")
+    detail_sheet.append([
+        1, "山茶文化", "已有频道新名称", "英语", "配音", "真人", None,
+        "已开通", None, "未知", "owner@example.com",
+        "https://www.youtube.com/channel/UC-existing", "UC-existing", "已授权", None,
+    ])
+    detail_sheet.append([
+        2, "未来电视", "新增完整频道", "越南语", "配音", "真人", None,
+        "已开通", None, "未知", "owner2@example.com",
+        "https://www.youtube.com/channel/UC-new", "UC-new", "已授权", None,
+    ])
+    workbook.save(source)
+
+    store = CoverMonitorStore(tmp_path / "cover.sqlite3")
+    scope = CoverAccessScope(workspace_key="internal", user_id=7)
+    store.upsert_channel(
+        scope,
+        platform="youtube",
+        channel_id="UC-existing",
+        name="已有频道原名称",
+        source_url="https://www.youtube.com/channel/UC-existing",
+    )
+
+    preview = store.create_import_preview(
+        scope,
+        import_kind="channels",
+        source_file_name=source.name,
+        source_file_sha256="standard-channel-sheet2",
+        source_file_path=str(source),
+    )
+
+    assert preview["sheet_name"] == "Sheet2"
+    assert preview["mapping"] == {
+        "operator_name": "代理商简称",
+        "channel_id": "频道 ID",
+        "channel_name": "频道名",
+        "channel_url": "频道链接",
+    }
+    assert preview["stats"]["total_rows"] == 2
+    assert preview["stats"]["valid_rows"] == 1
+    assert preview["stats"]["duplicate_rows"] == 1
+    assert preview["stats"]["unique_channels"] == 2
+
+    confirmed = store.confirm_import(scope, preview["import_id"])
+    assert confirmed["stats"]["applied_channels"] == 1
+    channels = store.search_channels(scope, limit=10, offset=0)["items"]
+    assert {item["channel_id"] for item in channels} == {"UC-existing", "UC-new"}
+    assert next(item for item in channels if item["channel_id"] == "UC-existing")["name"] == "已有频道原名称"
+    imported = next(item for item in channels if item["channel_id"] == "UC-new")
+    assert imported["name"] == "新增完整频道"
+    assert imported["operator_name"] == "未来电视"
+
+
 def test_confirm_import_is_idempotent_and_preserves_legacy_observation(tmp_path: Path) -> None:
     source = tmp_path / "baseline.xlsx"
     _write_workbook(source, [_row("代理甲", "UC-1", "video-1", "risk")])

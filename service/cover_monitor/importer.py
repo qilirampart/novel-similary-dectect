@@ -29,6 +29,24 @@ HEADER_ALIASES = {
 
 RISK_VALUES = {"safe", "review", "risk", "unknown"}
 
+STANDARD_CHANNEL_DETAIL_HEADERS = [
+    "序号",
+    "代理商简称",
+    "频道名",
+    "语言",
+    "配音类型",
+    "内容类型",
+    "创建日期",
+    "开通状态",
+    "状态日期",
+    "账号状态",
+    "账号邮箱",
+    "频道链接",
+    "频道 ID",
+    "授权状态",
+    "备注",
+]
+
 
 def _text(value: Any) -> str:
     if value is None:
@@ -51,6 +69,23 @@ def _extract_channel_id(channel_url: str) -> str:
 def _is_headerless_channel_url_row(values: tuple[Any, ...]) -> bool:
     nonempty = [_text(value) for value in values if _text(value)]
     return len(nonempty) == 1 and bool(_extract_channel_id(nonempty[0]))
+
+
+def _is_standard_channel_detail_row(values: tuple[Any, ...]) -> bool:
+    if len(values) < 13:
+        return False
+    sequence = _text(values[0])
+    operator_name = _text(values[1])
+    channel_name = _text(values[2])
+    channel_url = _text(values[11])
+    channel_id = _text(values[12])
+    return (
+        sequence.isdigit()
+        and bool(operator_name)
+        and bool(channel_name)
+        and bool(channel_id)
+        and _extract_channel_id(channel_url) == channel_id
+    )
 
 
 def _extract_video_id(video_url: str) -> str:
@@ -130,13 +165,26 @@ class WorkbookImportParser:
                 worksheet = workbook[self.requested_sheet]
             else:
                 worksheet = workbook.worksheets[0]
+                if self.import_kind == "channels":
+                    for candidate in workbook.worksheets:
+                        first_row = next(
+                            candidate.iter_rows(min_row=1, max_row=1, values_only=True),
+                            (),
+                        )
+                        if _is_standard_channel_detail_row(tuple(first_row)):
+                            worksheet = candidate
+                            break
             self.sheet_name = worksheet.title
             row_iter = worksheet.iter_rows(values_only=True)
             try:
                 first_values = tuple(next(row_iter))
             except StopIteration as exc:
                 raise ValueError("workbook has no header row") from exc
-            if self.import_kind == "channels" and _is_headerless_channel_url_row(first_values):
+            if self.import_kind == "channels" and _is_standard_channel_detail_row(first_values):
+                headers = STANDARD_CHANNEL_DETAIL_HEADERS
+                data_rows = chain([first_values], row_iter)
+                first_data_row = 1
+            elif self.import_kind == "channels" and _is_headerless_channel_url_row(first_values):
                 headers = ["频道链接"]
                 data_rows = chain([first_values], row_iter)
                 first_data_row = 1
@@ -199,7 +247,9 @@ class WorkbookImportParser:
                     self.stats["conflict_rows"] += 1
                 elif parsed.status == "valid" and identity_key:
                     previous_identity = (
-                        file_channel if self.import_kind == "channels" else file_video
+                        (file_channel or self.existing_channels.get(channel_key))
+                        if self.import_kind == "channels"
+                        else file_video
                     )
                     if previous_identity is not None:
                         parsed.status = "duplicate"
